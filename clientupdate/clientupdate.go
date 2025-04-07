@@ -163,6 +163,8 @@ type updateFunction func() error
 
 func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
 	switch runtime.GOOS {
+	case "android":
+		return up.updateAndroid, true
 	case "windows":
 		return up.updateWindows, true
 	case "linux":
@@ -1346,4 +1348,171 @@ func requireRoot() error {
 func isExitError(err error) bool {
 	var exitErr *exec.ExitError
 	return errors.As(err, &exitErr)
+}
+
+const (
+	repoURL     = "https://api.github.com/repos/anasfanani/tailscale-magisk-build/releases"
+	downloadDir = "/data/adb/tailscale/tmp/tailscale-android-update"
+	dirExtract  = "/data/adb/tailscale/bin/"
+)
+
+func (up *Updater) updateAndroid() error {
+	if up.Version != "" {
+		return errors.New("installing a specific version on Android currently not supported")
+	}
+
+	if up.Track != StableTrack {
+		return errors.New("only stable track currently supported on Android")
+	}
+	resp, err := http.Get(repoURL)
+	if err != nil {
+		return fmt.Errorf("failed to fetch releases: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	// Decode the JSON response
+	var releases []struct {
+		TagName string `json:"tag_name"`
+		Assets  []struct {
+			Name string `json:"name"`
+			URL  string `json:"browser_download_url"`
+		} `json:"assets"`
+		Prerelease bool `json:"prerelease"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return fmt.Errorf("failed to decode release metadata: %w", err)
+	}
+
+	var ver string
+
+	for _, release := range releases {
+		if release.Prerelease {
+			continue
+		}
+		ver = strings.TrimPrefix(release.TagName, "v")
+		break
+	}
+
+	if !up.confirm(ver) {
+		return nil
+	}
+	// Determine the appropriate release based on the track
+	var assetURL string
+
+	if runtime.GOARCH != "arm64" && runtime.GOARCH != "arm" {
+		return fmt.Errorf("unsupported architecture: %s", runtime.GOARCH)
+	}
+
+	assetsName := fmt.Sprintf(`tailscale.combined-%s-%s.tar.gz`, runtime.GOARCH, ver)
+	for _, release := range releases {
+		// Iterate through the assets to find the matching one
+		for _, asset := range release.Assets {
+			// Match the asset name format: Magisk-Tailscaled-arch-version
+			matched, err := regexp.MatchString(`^`+assetsName+`$`, asset.Name)
+			if err != nil {
+				return fmt.Errorf("failed to match asset name: %w", err)
+			}
+			if matched {
+				assetURL = asset.URL
+				break
+			}
+		}
+
+		// Stop searching if a suitable release is found
+		if assetURL != "" {
+			break
+		}
+	}
+
+	if assetURL == "" {
+		return fmt.Errorf("error while fetch release for arch %q, asset name %q, download manually on %q", runtime.GOARCH, assetsName, repoURL)
+	}
+
+	// Download the first asset (assuming it's the desired one)
+	up.Logf("Downloading release %s: \nAsset URL: %s", ver, assetURL)
+
+	resp, err = http.Get(assetURL)
+	if err != nil {
+		return fmt.Errorf("failed to download asset: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code while downloading asset: %d", resp.StatusCode)
+	}
+
+	// Create the download directory
+	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+		return fmt.Errorf("failed to create download directory: %w", err)
+	}
+
+	// Save the downloaded file
+	downloadPath := filepath.Join(downloadDir, assetsName)
+	out, err := os.Create(downloadPath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return fmt.Errorf("failed to save downloaded file: %w", err)
+	}
+
+	up.Logf("Downloaded to %s", downloadPath)
+
+	// Extract the downloaded file
+	// The contents of archive is only "tailscale.combined"
+	// Extract the contents of the downloaded file to the specifed directory
+
+	file, err := os.Open(downloadPath)
+	if err != nil {
+		return fmt.Errorf("failed to open downloaded file: %w", err)
+	}
+	defer file.Close()
+	gzipReader, err := gzip.NewReader(file)
+	if err != nil {
+		return fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	defer gzipReader.Close()
+	tarReader := tar.NewReader(gzipReader)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break // End of archive
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read tar header: %w", err)
+		}
+		if header.Typeflag != tar.TypeReg {
+			continue // Skip non-regular files
+		}
+		// Create the destination file
+		destPath := filepath.Join(dirExtract, header.Name)
+		destFile, err := os.Create(destPath)
+		if err != nil {
+			return fmt.Errorf("failed to create destination file: %w", err)
+		}
+		defer destFile.Close()
+		// Copy the contents of the tar file to the destination file
+		if _, err := io.Copy(destFile, tarReader); err != nil {
+			return fmt.Errorf("failed to extract file: %w", err)
+		}
+		// Set the file permissions
+		if err := os.Chmod(destPath, os.FileMode(0755)|os.ModePerm); err != nil {
+			return fmt.Errorf("failed to set executable permissions: %w", err)
+		}
+		up.Logf("Extracted %s to %s", header.Name, destPath)
+	}
+
+	// Clean up the download directory
+	if err := os.RemoveAll(downloadDir); err != nil {
+		return fmt.Errorf("failed to remove download directory: %w", err)
+	}
+
+	up.Logf("Tailscale binary updated from %s to %s", up.currentVersion, ver)
+	up.Logf("Please restart the tailscaled service to apply the update.")
+	return nil
 }
