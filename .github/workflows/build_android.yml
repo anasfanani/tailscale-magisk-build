@@ -49,7 +49,7 @@ jobs:
           id: compress_artifacts
           run: |
             eval "$(./build_dist.sh shellvars)"
-            VERSION_SHORT=$VERSION_SHORT >> $GITHUB_OUTPUT
+            echo "VERSION_SHORT=$VERSION_SHORT" >> $GITHUB_OUTPUT
             tar -czf dist/tailscale.combined.arm64.${VERSION_SHORT}.tar.gz -C dist --transform='s/tailscale.combined.arm64/tailscale.combined/' tailscale.combined.arm64
             tar -czf dist/tailscale.combined.arm.${VERSION_SHORT}.tar.gz -C dist --transform='s/tailscale.combined.arm/tailscale.combined/' tailscale.combined.arm
             ls -lh dist
