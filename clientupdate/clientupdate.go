@@ -1512,7 +1512,7 @@ func (up *Updater) updateAndroid() error {
 		return fmt.Errorf("failed to remove download directory: %w", err)
 	}
 
-	up.Logf("Tailscale binary updated from %s to %s", up.currentVersion, ver)
+	// up.Logf("Tailscale binary updated from %s to %s", up.currentVersion, ver)
 	up.Logf("Please restart the tailscaled service to apply the update.")
 	return nil
 }
