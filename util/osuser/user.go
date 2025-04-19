@@ -76,6 +76,25 @@ func lookup(usernameOrUID string, std lookupStd, wantShell bool) (*user.User, st
 		return u, shell, nil
 	}
 
+	// No getent on Android. So hard-code the login shell.
+	if runtime.GOOS == "android" {
+		var shell string
+		if wantShell {
+			shell = "/system/bin/sh"
+		}
+		u, err := std(usernameOrUID)
+		if err != nil {
+			return &user.User{
+				Uid:      "0",
+				Gid:      "0",
+				Username: "root",
+				Name:     "Android",
+				HomeDir:  "/",
+			}, shell, nil
+		}
+		return u, shell, nil
+	}
+
 	// Start with getent if caller wants to get the user shell.
 	if wantShell {
 		return userLookupGetent(usernameOrUID, std)

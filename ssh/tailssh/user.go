@@ -34,6 +34,9 @@ type userMeta struct {
 
 // GroupIds returns the list of group IDs that the user is a member of.
 func (u *userMeta) GroupIds() ([]string, error) {
+	if runtime.GOOS == "android" {
+		return []string{"0"}, nil
+	}
 	if runtime.GOOS == "linux" && distro.Get() == distro.Gokrazy {
 		// Gokrazy is a single-user appliance with ~no userspace.
 		// There aren't users to look up (no /etc/passwd, etc)
