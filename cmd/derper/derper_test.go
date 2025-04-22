@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"tailscale.com/derp/derphttp"
 	"tailscale.com/tstest/deptest"
 )
 
@@ -76,20 +77,20 @@ func TestNoContent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req, _ := http.NewRequest("GET", "https://localhost/generate_204", nil)
 			if tt.input != "" {
-				req.Header.Set(noContentChallengeHeader, tt.input)
+				req.Header.Set(derphttp.NoContentChallengeHeader, tt.input)
 			}
 			w := httptest.NewRecorder()
-			serveNoContent(w, req)
+			derphttp.ServeNoContent(w, req)
 			resp := w.Result()
 
 			if tt.want == "" {
-				if h, found := resp.Header[noContentResponseHeader]; found {
+				if h, found := resp.Header[derphttp.NoContentResponseHeader]; found {
 					t.Errorf("got %+v; expected no response header", h)
 				}
 				return
 			}
 
-			if got := resp.Header.Get(noContentResponseHeader); got != tt.want {
+			if got := resp.Header.Get(derphttp.NoContentResponseHeader); got != tt.want {
 				t.Errorf("got %q; want %q", got, tt.want)
 			}
 		})
@@ -99,10 +100,13 @@ func TestNoContent(t *testing.T) {
 func TestDeps(t *testing.T) {
 	deptest.DepChecker{
 		BadDeps: map[string]string{
+			"testing":                            "do not use testing package in production code",
 			"gvisor.dev/gvisor/pkg/buffer":       "https://github.com/tailscale/tailscale/issues/9756",
 			"gvisor.dev/gvisor/pkg/cpuid":        "https://github.com/tailscale/tailscale/issues/9756",
 			"gvisor.dev/gvisor/pkg/tcpip":        "https://github.com/tailscale/tailscale/issues/9756",
 			"gvisor.dev/gvisor/pkg/tcpip/header": "https://github.com/tailscale/tailscale/issues/9756",
+			"tailscale.com/net/packet":           "not needed in derper",
+			"github.com/gaissmai/bart":           "not needed in derper",
 		},
 	}.Check(t)
 }

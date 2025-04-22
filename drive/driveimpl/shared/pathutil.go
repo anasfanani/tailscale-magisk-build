@@ -4,6 +4,7 @@
 package shared
 
 import (
+	"net/url"
 	"path"
 	"strings"
 )
@@ -25,12 +26,33 @@ func CleanAndSplit(p string) []string {
 	return strings.Split(strings.Trim(path.Clean(p), sepStringAndDot), sepString)
 }
 
+// Normalize normalizes the given path (e.g. dropping trailing slashes).
+func Normalize(p string) string {
+	return Join(CleanAndSplit(p)...)
+}
+
+// Parent extracts the parent of the given path.
+func Parent(p string) string {
+	parts := CleanAndSplit(p)
+	return Join(parts[:len(parts)-1]...)
+}
+
 // Join behaves like path.Join() but also includes a leading slash.
 func Join(parts ...string) string {
 	fullParts := make([]string, 0, len(parts))
 	fullParts = append(fullParts, sepString)
 	for _, part := range parts {
 		fullParts = append(fullParts, part)
+	}
+	return path.Join(fullParts...)
+}
+
+// JoinEscaped is like Join but path escapes each part.
+func JoinEscaped(parts ...string) string {
+	fullParts := make([]string, 0, len(parts))
+	fullParts = append(fullParts, sepString)
+	for _, part := range parts {
+		fullParts = append(fullParts, url.PathEscape(part))
 	}
 	return path.Join(fullParts...)
 }

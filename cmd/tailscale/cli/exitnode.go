@@ -13,6 +13,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	xmaps "golang.org/x/exp/maps"
 	"tailscale.com/envknob"
@@ -25,10 +26,6 @@ func exitNodeCmd() *ffcli.Command {
 		Name:       "exit-node",
 		ShortUsage: "tailscale exit-node [flags]",
 		ShortHelp:  "Show machines on your tailnet configured as exit nodes",
-		LongHelp:   "Show machines on your tailnet configured as exit nodes",
-		Exec: func(context.Context, []string) error {
-			return errors.New("exit-node subcommand required; run 'tailscale exit-node -h' for details")
-		},
 		Subcommands: append([]*ffcli.Command{
 			{
 				Name:       "list",
@@ -40,6 +37,12 @@ func exitNodeCmd() *ffcli.Command {
 					fs.StringVar(&exitNodeArgs.filter, "filter", "", "filter exit nodes by country")
 					return fs
 				})(),
+			},
+			{
+				Name:       "suggest",
+				ShortUsage: "tailscale exit-node suggest",
+				ShortHelp:  "Suggests the best available exit node",
+				Exec:       runExitNodeSuggest,
 			}},
 			(func() []*ffcli.Command {
 				if !envknob.UseWIPCode() {
@@ -49,13 +52,13 @@ func exitNodeCmd() *ffcli.Command {
 					{
 						Name:       "connect",
 						ShortUsage: "tailscale exit-node connect",
-						ShortHelp:  "connect to most recently used exit node",
+						ShortHelp:  "Connect to most recently used exit node",
 						Exec:       exitNodeSetUse(true),
 					},
 					{
 						Name:       "disconnect",
 						ShortUsage: "tailscale exit-node disconnect",
-						ShortHelp:  "disconnect from current exit node, if any",
+						ShortHelp:  "Disconnect from current exit node, if any",
 						Exec:       exitNodeSetUse(false),
 					},
 				}
@@ -134,9 +137,36 @@ func runExitNodeList(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "# To use an exit node, use `tailscale set --exit-node=` followed by the hostname or IP")
-
+	fmt.Fprintln(w, "# To view the complete list of exit nodes for a country, use `tailscale exit-node list --filter=` followed by the country name.")
+	fmt.Fprintln(w, "# To use an exit node, use `tailscale set --exit-node=` followed by the hostname or IP.")
+	if hasAnyExitNodeSuggestions(peers) {
+		fmt.Fprintln(w, "# To have Tailscale suggest an exit node, use `tailscale exit-node suggest`.")
+	}
 	return nil
+}
+
+// runExitNodeSuggest returns a suggested exit node ID to connect to and shows the chosen exit node tailcfg.StableNodeID.
+// If there are no derp based exit nodes to choose from or there is a failure in finding a suggestion, the command will return an error indicating so.
+func runExitNodeSuggest(ctx context.Context, args []string) error {
+	res, err := localClient.SuggestExitNode(ctx)
+	if err != nil {
+		return fmt.Errorf("suggest exit node: %w", err)
+	}
+	if res.ID == "" {
+		fmt.Println("No exit node suggestion is available.")
+		return nil
+	}
+	fmt.Printf("Suggested exit node: %v\nTo accept this suggestion, use `tailscale set --exit-node=%v`.\n", res.Name, shellquote.Join(res.Name))
+	return nil
+}
+
+func hasAnyExitNodeSuggestions(peers []*ipnstate.PeerStatus) bool {
+	for _, peer := range peers {
+		if peer.HasCap(tailcfg.NodeAttrSuggestExitNode) {
+			return true
+		}
+	}
+	return false
 }
 
 // peerStatus returns a string representing the current state of
@@ -201,7 +231,7 @@ func filterFormatAndSortExitNodes(peers []*ipnstate.PeerStatus, filterBy string)
 	for _, ps := range peers {
 		loc := cmp.Or(ps.Location, noLocation)
 
-		if filterBy != "" && loc.Country != filterBy {
+		if filterBy != "" && !strings.EqualFold(loc.Country, filterBy) {
 			continue
 		}
 
@@ -241,9 +271,14 @@ func filterFormatAndSortExitNodes(peers []*ipnstate.PeerStatus, filterBy string)
 			countryAnyPeer = append(countryAnyPeer, city.Peers...)
 			var reducedCityPeers []*ipnstate.PeerStatus
 			for i, peer := range city.Peers {
+				if filterBy != "" {
+					// If the peers are being filtered, we return all peers to the user.
+					reducedCityPeers = append(reducedCityPeers, city.Peers...)
+					break
+				}
+				// If the peers are not being filtered, we only return the highest priority peer and any peer that
+				// is currently the active exit node.
 				if i == 0 || peer.ExitNode {
-					// We only return the highest priority peer and any peer that
-					// is currently the active exit node.
 					reducedCityPeers = append(reducedCityPeers, peer)
 				}
 			}

@@ -18,7 +18,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/set"
-	"tailscale.com/wgengine/filter"
+	"tailscale.com/wgengine/filter/filtertype"
 )
 
 // NetworkMap is the current state of the world.
@@ -40,7 +40,7 @@ type NetworkMap struct {
 	Peers []tailcfg.NodeView // sorted by Node.ID
 	DNS   tailcfg.DNSConfig
 
-	PacketFilter      []filter.Match
+	PacketFilter      []filtertype.Match
 	PacketFilterRules views.Slice[tailcfg.FilterRule]
 	SSHPolicy         *tailcfg.SSHPolicy // or nil, if not enabled/allowed
 
@@ -137,7 +137,7 @@ func (nm *NetworkMap) PeerByTailscaleIP(ip netip.Addr) (peer tailcfg.NodeView, o
 	}
 	for _, n := range nm.Peers {
 		ad := n.Addresses()
-		for i := 0; i < ad.Len(); i++ {
+		for i := range ad.Len() {
 			a := ad.At(i)
 			if a.Addr() == ip {
 				return n, true
@@ -388,6 +388,6 @@ func (nm *NetworkMap) JSON() string {
 type WGConfigFlags int
 
 const (
-	AllowSingleHosts WGConfigFlags = 1 << iota
+	_ WGConfigFlags = 1 << iota
 	AllowSubnetRoutes
 )

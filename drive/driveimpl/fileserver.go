@@ -4,6 +4,10 @@
 package driveimpl
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"fmt"
 	"net"
 	"net/http"
 	"sync"
@@ -17,6 +21,7 @@ import (
 // serve up files as an unprivileged user.
 type FileServer struct {
 	l             net.Listener
+	secretToken   string
 	shareHandlers map[string]http.Handler
 	sharesMu      sync.RWMutex
 }
@@ -41,18 +46,35 @@ func NewFileServer() (*FileServer, error) {
 	// TODO(oxtoacart): actually get safesocket working in more environments (MacOS Sandboxed, Windows, ???)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		return nil, fmt.Errorf("listen: %w", err)
+	}
+
+	secretToken, err := generateSecretToken()
+	if err != nil {
 		return nil, err
 	}
-	// }
+
 	return &FileServer{
 		l:             l,
+		secretToken:   secretToken,
 		shareHandlers: make(map[string]http.Handler),
 	}, nil
 }
 
-// Addr returns the address at which this FileServer is listening.
+// generateSecretToken generates a hex-encoded 256 bit secet.
+func generateSecretToken() (string, error) {
+	tokenBytes := make([]byte, 32)
+	_, err := rand.Read(tokenBytes)
+	if err != nil {
+		return "", fmt.Errorf("generateSecretToken: %w", err)
+	}
+	return hex.EncodeToString(tokenBytes), nil
+}
+
+// Addr returns the address at which this FileServer is listening. This
+// includes the secret token in front of the address, delimited by a pipe |.
 func (s *FileServer) Addr() string {
-	return s.l.Addr().String()
+	return fmt.Sprintf("%s|%s", s.secretToken, s.l.Addr().String())
 }
 
 // Serve() starts serving files and blocks until it encounters a fatal error.
@@ -95,11 +117,33 @@ func (s *FileServer) SetShares(shares map[string]string) {
 	}
 }
 
-// ServeHTTP implements the http.Handler interface.
+// ServeHTTP implements the http.Handler interface. This requires a secret
+// token in the path in order to prevent Mark-of-the-Web (MOTW) bypass attacks
+// of the below sort:
+//
+//  1. Attacker with write access to the share puts a malicious file via
+//     http://100.100.100.100:8080/<tailnet>/<machine>/</share>/bad.exe
+//  2. Attacker then induces victim to visit
+//     http://localhost:[PORT]/<share>/bad.exe
+//  3. Because that is loaded from localhost, it does not get the MOTW
+//     thereby bypasses some OS-level security.
+//
+// The path on this file server is actually not as above, but rather
+// http://localhost:[PORT]/<secretToken>/<share>/bad.exe. Unless the attacker
+// can discover the secretToken, the attacker cannot craft a localhost URL that
+// will work.
 func (s *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	parts := shared.CleanAndSplit(r.URL.Path)
-	r.URL.Path = shared.Join(parts[1:]...)
-	share := parts[0]
+
+	token := parts[0]
+	a, b := []byte(token), []byte(s.secretToken)
+	if subtle.ConstantTimeCompare(a, b) != 1 {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	r.URL.Path = shared.Join(parts[2:]...)
+	share := parts[1]
 	s.sharesMu.RLock()
 	h, found := s.shareHandlers[share]
 	s.sharesMu.RUnlock()
@@ -107,6 +151,9 @@ func (s *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+	// WebDAV's locking code compares the lock resources with the request's
+	// host header, set this to empty to avoid mismatches.
+	r.Host = ""
 	h.ServeHTTP(w, r)
 }
 

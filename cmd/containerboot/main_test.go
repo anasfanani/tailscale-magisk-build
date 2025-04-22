@@ -52,7 +52,7 @@ func TestContainerBoot(t *testing.T) {
 	}
 	defer kube.Close()
 
-	tailscaledConf := &ipn.ConfigVAlpha{AuthKey: func(s string) *string { return &s }("foo"), Version: "alpha0"}
+	tailscaledConf := &ipn.ConfigVAlpha{AuthKey: ptr.To("foo"), Version: "alpha0"}
 	tailscaledConfBytes, err := json.Marshal(tailscaledConf)
 	if err != nil {
 		t.Fatalf("error unmarshaling tailscaled config: %v", err)
@@ -65,7 +65,7 @@ func TestContainerBoot(t *testing.T) {
 		"dev/net",
 		"proc/sys/net/ipv4",
 		"proc/sys/net/ipv6/conf/all",
-		"etc",
+		"etc/tailscaled",
 	}
 	for _, path := range dirs {
 		if err := os.MkdirAll(filepath.Join(d, path), 0700); err != nil {
@@ -80,7 +80,7 @@ func TestContainerBoot(t *testing.T) {
 		"dev/net/tun":                           []byte(""),
 		"proc/sys/net/ipv4/ip_forward":          []byte("0"),
 		"proc/sys/net/ipv6/conf/all/forwarding": []byte("0"),
-		"etc/tailscaled":                        tailscaledConfBytes,
+		"etc/tailscaled/cap-95.hujson":          tailscaledConfBytes,
 	}
 	resetFiles := func() {
 		for path, content := range files {
@@ -116,6 +116,9 @@ func TestContainerBoot(t *testing.T) {
 		// WantFiles files that should exist in the container and their
 		// contents.
 		WantFiles map[string]string
+		// WantFatalLog is the fatal log message we expect from containerboot.
+		// If set for a phase, the test will finish on that phase.
+		WantFatalLog string
 	}
 	runningNotify := &ipn.Notify{
 		State: ptr.To(ipn.Running),
@@ -349,9 +352,54 @@ func TestContainerBoot(t *testing.T) {
 						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
 						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
 					},
+					WantFiles: map[string]string{
+						"proc/sys/net/ipv4/ip_forward":          "1",
+						"proc/sys/net/ipv6/conf/all/forwarding": "0",
+					},
 				},
 				{
 					Notify: runningNotify,
+				},
+			},
+		},
+		{
+			Name: "egress_proxy_fqdn_ipv6_target_on_ipv4_host",
+			Env: map[string]string{
+				"TS_AUTHKEY":               "tskey-key",
+				"TS_TAILNET_TARGET_FQDN":   "ipv6-node.test.ts.net", // resolves to IPv6 address
+				"TS_USERSPACE":             "false",
+				"TS_TEST_FAKE_NETFILTER_6": "false",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
+					},
+					WantFiles: map[string]string{
+						"proc/sys/net/ipv4/ip_forward":          "1",
+						"proc/sys/net/ipv6/conf/all/forwarding": "0",
+					},
+				},
+				{
+					Notify: &ipn.Notify{
+						State: ptr.To(ipn.Running),
+						NetMap: &netmap.NetworkMap{
+							SelfNode: (&tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("myID"),
+								Name:      "test-node.test.ts.net",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							}).View(),
+							Peers: []tailcfg.NodeView{
+								(&tailcfg.Node{
+									StableID:  tailcfg.StableNodeID("ipv6ID"),
+									Name:      "ipv6-node.test.ts.net",
+									Addresses: []netip.Prefix{netip.MustParsePrefix("::1/128")},
+								}).View(),
+							},
+						},
+					},
+					WantFatalLog: "no forwarding rules for egress addresses [::1/128], host supports IPv6: false",
 				},
 			},
 		},
@@ -638,14 +686,14 @@ func TestContainerBoot(t *testing.T) {
 			},
 		},
 		{
-			Name: "experimental tailscaled configfile",
+			Name: "experimental tailscaled config path",
 			Env: map[string]string{
-				"EXPERIMENTAL_TS_CONFIGFILE_PATH": filepath.Join(d, "etc/tailscaled"),
+				"TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR": filepath.Join(d, "etc/tailscaled/"),
 			},
 			Phases: []phase{
 				{
 					WantCmds: []string{
-						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking --config=/etc/tailscaled",
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking --config=/etc/tailscaled/cap-95.hujson",
 					},
 				}, {
 					Notify: runningNotify,
@@ -697,6 +745,25 @@ func TestContainerBoot(t *testing.T) {
 			var wantCmds []string
 			for i, p := range test.Phases {
 				lapi.Notify(p.Notify)
+				if p.WantFatalLog != "" {
+					err := tstest.WaitFor(2*time.Second, func() error {
+						state, err := cmd.Process.Wait()
+						if err != nil {
+							return err
+						}
+						if state.ExitCode() != 1 {
+							return fmt.Errorf("process exited with code %d but wanted %d", state.ExitCode(), 1)
+						}
+						waitLogLine(t, time.Second, cbOut, p.WantFatalLog)
+						return nil
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					// Early test return, we don't expect the successful startup log message.
+					return
+				}
 				wantCmds = append(wantCmds, p.WantCmds...)
 				waitArgs(t, 2*time.Second, d, argFile, strings.Join(wantCmds, "\n"))
 				err := tstest.WaitFor(2*time.Second, func() error {

@@ -15,6 +15,7 @@ import (
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/tstun"
@@ -24,6 +25,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/opt"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 )
@@ -98,7 +100,9 @@ func nodeViews(v []*tailcfg.Node) []tailcfg.NodeView {
 }
 
 func TestUserspaceEngineReconfig(t *testing.T) {
-	e, err := NewFakeUserspaceEngine(t.Logf, 0)
+	ht := new(health.Tracker)
+	reg := new(usermetric.Registry)
+	e, err := NewFakeUserspaceEngine(t.Logf, 0, ht, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,9 +168,11 @@ func TestUserspaceEnginePortReconfig(t *testing.T) {
 
 	// Keep making a wgengine until we find an unused port
 	var ue *userspaceEngine
-	for i := 0; i < 100; i++ {
+	ht := new(health.Tracker)
+	reg := new(usermetric.Registry)
+	for i := range 100 {
 		attempt := uint16(defaultPort + i)
-		e, err := NewFakeUserspaceEngine(t.Logf, attempt, &knobs)
+		e, err := NewFakeUserspaceEngine(t.Logf, attempt, &knobs, ht, reg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -245,7 +251,9 @@ func TestUserspaceEnginePeerMTUReconfig(t *testing.T) {
 
 	var knobs controlknobs.Knobs
 
-	e, err := NewFakeUserspaceEngine(t.Logf, 0, &knobs)
+	ht := new(health.Tracker)
+	reg := new(usermetric.Registry)
+	e, err := NewFakeUserspaceEngine(t.Logf, 0, &knobs, ht, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +343,7 @@ func BenchmarkGenLocalAddrFunc(b *testing.B) {
 		m := map[netip.Addr]bool{
 			la1: true,
 		}
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			x = m[la1]
 			x = m[lanot]
 		}
@@ -347,7 +355,7 @@ func BenchmarkGenLocalAddrFunc(b *testing.B) {
 			la1: true,
 			la2: true,
 		}
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			x = m[la1]
 			x = m[lanot]
 		}
@@ -358,7 +366,7 @@ func BenchmarkGenLocalAddrFunc(b *testing.B) {
 		f := func(t netip.Addr) bool {
 			return t == la1
 		}
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			x = f(la1)
 			x = f(lanot)
 		}
@@ -369,7 +377,7 @@ func BenchmarkGenLocalAddrFunc(b *testing.B) {
 		f := func(t netip.Addr) bool {
 			return t == la1 || t == la2
 		}
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			x = f(la1)
 			x = f(lanot)
 		}

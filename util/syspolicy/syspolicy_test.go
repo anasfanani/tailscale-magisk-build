@@ -5,8 +5,11 @@ package syspolicy
 
 import (
 	"errors"
+	"slices"
 	"testing"
 	"time"
+
+	"tailscale.com/util/syspolicy/setting"
 )
 
 // testHandler encompasses all data types returned when testing any of the syspolicy
@@ -18,6 +21,7 @@ type testHandler struct {
 	s     string
 	u64   uint64
 	b     bool
+	sArr  []string
 	err   error
 	calls int // used for testing reads from cache vs. handler
 }
@@ -46,6 +50,14 @@ func (th *testHandler) ReadBoolean(key string) (bool, error) {
 	}
 	th.calls++
 	return th.b, th.err
+}
+
+func (th *testHandler) ReadStringArray(key string) ([]string, error) {
+	if key != string(th.key) {
+		th.t.Errorf("ReadStringArray(%q) want %q", key, th.key)
+	}
+	th.calls++
+	return th.sArr, th.err
 }
 
 func TestGetString(t *testing.T) {
@@ -220,38 +232,38 @@ func TestGetPreferenceOption(t *testing.T) {
 		key          Key
 		handlerValue string
 		handlerError error
-		wantValue    PreferenceOption
+		wantValue    setting.PreferenceOption
 		wantError    error
 	}{
 		{
 			name:         "always by policy",
 			key:          EnableIncomingConnections,
 			handlerValue: "always",
-			wantValue:    alwaysByPolicy,
+			wantValue:    setting.AlwaysByPolicy,
 		},
 		{
 			name:         "never by policy",
 			key:          EnableIncomingConnections,
 			handlerValue: "never",
-			wantValue:    neverByPolicy,
+			wantValue:    setting.NeverByPolicy,
 		},
 		{
 			name:         "use default",
 			key:          EnableIncomingConnections,
 			handlerValue: "",
-			wantValue:    showChoiceByPolicy,
+			wantValue:    setting.ShowChoiceByPolicy,
 		},
 		{
 			name:         "read non-existing value",
 			key:          EnableIncomingConnections,
 			handlerError: ErrNoSuchKey,
-			wantValue:    showChoiceByPolicy,
+			wantValue:    setting.ShowChoiceByPolicy,
 		},
 		{
 			name:         "other error is returned",
 			key:          EnableIncomingConnections,
 			handlerError: someOtherError,
-			wantValue:    showChoiceByPolicy,
+			wantValue:    setting.ShowChoiceByPolicy,
 			wantError:    someOtherError,
 		},
 	}
@@ -281,34 +293,34 @@ func TestGetVisibility(t *testing.T) {
 		key          Key
 		handlerValue string
 		handlerError error
-		wantValue    Visibility
+		wantValue    setting.Visibility
 		wantError    error
 	}{
 		{
 			name:         "hidden by policy",
 			key:          AdminConsoleVisibility,
 			handlerValue: "hide",
-			wantValue:    hiddenByPolicy,
+			wantValue:    setting.HiddenByPolicy,
 		},
 		{
 			name:         "visibility default",
 			key:          AdminConsoleVisibility,
 			handlerValue: "show",
-			wantValue:    visibleByPolicy,
+			wantValue:    setting.VisibleByPolicy,
 		},
 		{
 			name:         "read non-existing value",
 			key:          AdminConsoleVisibility,
 			handlerValue: "show",
 			handlerError: ErrNoSuchKey,
-			wantValue:    visibleByPolicy,
+			wantValue:    setting.VisibleByPolicy,
 		},
 		{
 			name:         "other error is returned",
 			key:          AdminConsoleVisibility,
 			handlerValue: "show",
 			handlerError: someOtherError,
-			wantValue:    visibleByPolicy,
+			wantValue:    setting.VisibleByPolicy,
 			wantError:    someOtherError,
 		},
 	}
@@ -394,6 +406,63 @@ func TestGetDuration(t *testing.T) {
 			}
 			if duration != tt.wantValue {
 				t.Errorf("duration=%v, want %v", duration, tt.wantValue)
+			}
+		})
+	}
+}
+
+func TestGetStringArray(t *testing.T) {
+	tests := []struct {
+		name         string
+		key          Key
+		handlerValue []string
+		handlerError error
+		defaultValue []string
+		wantValue    []string
+		wantError    error
+	}{
+		{
+			name:         "read existing value",
+			key:          AllowedSuggestedExitNodes,
+			handlerValue: []string{"foo", "bar"},
+			wantValue:    []string{"foo", "bar"},
+		},
+		{
+			name:         "read non-existing value",
+			key:          AllowedSuggestedExitNodes,
+			handlerError: ErrNoSuchKey,
+			wantError:    nil,
+		},
+		{
+			name:         "read non-existing value, non nil default",
+			key:          AllowedSuggestedExitNodes,
+			handlerError: ErrNoSuchKey,
+			defaultValue: []string{"foo", "bar"},
+			wantValue:    []string{"foo", "bar"},
+			wantError:    nil,
+		},
+		{
+			name:         "reading value returns other error",
+			key:          AllowedSuggestedExitNodes,
+			handlerError: someOtherError,
+			wantError:    someOtherError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			SetHandlerForTest(t, &testHandler{
+				t:    t,
+				key:  tt.key,
+				sArr: tt.handlerValue,
+				err:  tt.handlerError,
+			})
+			value, err := GetStringArray(tt.key, tt.defaultValue)
+			if err != tt.wantError {
+				t.Errorf("err=%q, want %q", err, tt.wantError)
+			}
+			if !slices.Equal(tt.wantValue, value) {
+				t.Errorf("value=%v, want %v", value, tt.wantValue)
 			}
 		})
 	}

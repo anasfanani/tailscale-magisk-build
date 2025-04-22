@@ -4,7 +4,6 @@
 package ipnlocal
 
 import (
-	"bytes"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -300,60 +299,18 @@ func handleC2NUpdatePost(b *LocalBackend, w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Check if update was already started, and mark as started.
-	if !b.trySetC2NUpdateStarted() {
-		res.Err = "update already started"
-		return
-	}
-	defer func() {
-		// Clear the started flag if something failed.
-		if res.Err != "" {
-			b.setC2NUpdateStarted(false)
-		}
-	}()
-
-	cmdTS, err := findCmdTailscale()
-	if err != nil {
-		res.Err = fmt.Sprintf("failed to find cmd/tailscale binary: %v", err)
-		return
-	}
-	var ver struct {
-		Long string `json:"long"`
-	}
-	out, err := exec.Command(cmdTS, "version", "--json").Output()
-	if err != nil {
-		res.Err = fmt.Sprintf("failed to find cmd/tailscale binary: %v", err)
-		return
-	}
-	if err := json.Unmarshal(out, &ver); err != nil {
-		res.Err = "invalid JSON from cmd/tailscale version --json"
-		return
-	}
-	if ver.Long != version.Long() {
-		res.Err = "cmd/tailscale version mismatch"
+	// Do not update if we have active inbound SSH connections. Control can set
+	// force=true query parameter to override this.
+	if r.FormValue("force") != "true" && b.sshServer != nil && b.sshServer.NumActiveConns() > 0 {
+		res.Err = "not updating due to active SSH connections"
 		return
 	}
 
-	cmd := tailscaleUpdateCmd(cmdTS)
-	buf := new(bytes.Buffer)
-	cmd.Stdout = buf
-	cmd.Stderr = buf
-	b.logf("c2n: running %q", strings.Join(cmd.Args, " "))
-	if err := cmd.Start(); err != nil {
-		res.Err = fmt.Sprintf("failed to start cmd/tailscale update: %v", err)
+	if err := b.startAutoUpdate("c2n"); err != nil {
+		res.Err = err.Error()
 		return
 	}
 	res.Started = true
-
-	// Run update asynchronously and respond that it started.
-	go func() {
-		if err := cmd.Wait(); err != nil {
-			b.logf("c2n: update command failed: %v, output: %s", err, buf)
-		} else {
-			b.logf("c2n: update complete")
-		}
-		b.setC2NUpdateStarted(false)
-	}()
 }
 
 func handleC2NPostureIdentityGet(b *LocalBackend, w http.ResponseWriter, r *http.Request) {
@@ -361,7 +318,7 @@ func handleC2NPostureIdentityGet(b *LocalBackend, w http.ResponseWriter, r *http
 
 	res := tailcfg.C2NPostureIdentityResponse{}
 
-	// Only collect serial numbers if enabled on the client,
+	// Only collect posture identity if enabled on the client,
 	// this will first check syspolicy, MDM settings like Registry
 	// on Windows or defaults on macOS. If they are not set, it falls
 	// back to the cli-flag, `--posture-checking`.
@@ -380,8 +337,17 @@ func handleC2NPostureIdentityGet(b *LocalBackend, w http.ResponseWriter, r *http
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
 		res.SerialNumbers = sns
+
+		// TODO(tailscale/corp#21371, 2024-07-10): once this has landed in a stable release
+		// and looks good in client metrics, remove this parameter and always report MAC
+		// addresses.
+		if r.FormValue("hwaddrs") == "true" {
+			res.IfaceHardwareAddrs, err = posture.GetHardwareAddrs()
+			if err != nil {
+				b.logf("c2n: GetHardwareAddrs returned error: %v", err)
+			}
+		}
 	} else {
 		res.PostureDisabled = true
 	}
@@ -398,7 +364,7 @@ func (b *LocalBackend) newC2NUpdateResponse() tailcfg.C2NUpdateResponse {
 	prefs := b.Prefs().AutoUpdate()
 	return tailcfg.C2NUpdateResponse{
 		Enabled:   envknob.AllowsRemoteUpdate() || prefs.Apply.EqualBool(true),
-		Supported: clientupdate.CanAutoUpdate(),
+		Supported: clientupdate.CanAutoUpdate() && !version.IsMacSysExt(),
 	}
 }
 
@@ -471,17 +437,52 @@ func findCmdTailscale() (string, error) {
 }
 
 func tailscaleUpdateCmd(cmdTS string) *exec.Cmd {
+	defaultCmd := exec.Command(cmdTS, "update", "--yes")
 	if runtime.GOOS != "linux" {
-		return exec.Command(cmdTS, "update", "--yes")
+		return defaultCmd
 	}
 	if _, err := exec.LookPath("systemd-run"); err != nil {
-		return exec.Command(cmdTS, "update", "--yes")
+		return defaultCmd
 	}
+
 	// When systemd-run is available, use it to run the update command. This
 	// creates a new temporary unit separate from the tailscaled unit. When
 	// tailscaled is restarted during the update, systemd won't kill this
 	// temporary update unit, which could cause unexpected breakage.
-	return exec.Command("systemd-run", "--wait", "--pipe", "--collect", cmdTS, "update", "--yes")
+	//
+	// We want to use a few optional flags:
+	//  * --wait, to block the update command until completion (added in systemd 232)
+	//  * --pipe, to collect stdout/stderr (added in systemd 235)
+	//  * --collect, to clean up failed runs from memory (added in systemd 236)
+	//
+	// We need to check the version of systemd to figure out if those flags are
+	// available.
+	//
+	// The output will look like:
+	//
+	//   systemd 255 (255.7-1-arch)
+	//   +PAM +AUDIT ... other feature flags ...
+	systemdVerOut, err := exec.Command("systemd-run", "--version").Output()
+	if err != nil {
+		return defaultCmd
+	}
+	parts := strings.Fields(string(systemdVerOut))
+	if len(parts) < 2 || parts[0] != "systemd" {
+		return defaultCmd
+	}
+	systemdVer, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return defaultCmd
+	}
+	if systemdVer >= 236 {
+		return exec.Command("systemd-run", "--wait", "--pipe", "--collect", cmdTS, "update", "--yes")
+	} else if systemdVer >= 235 {
+		return exec.Command("systemd-run", "--wait", "--pipe", cmdTS, "update", "--yes")
+	} else if systemdVer >= 232 {
+		return exec.Command("systemd-run", "--wait", cmdTS, "update", "--yes")
+	} else {
+		return exec.Command("systemd-run", cmdTS, "update", "--yes")
+	}
 }
 
 func regularFileExists(path string) bool {

@@ -15,6 +15,7 @@ import (
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/set"
 	"tailscale.com/util/winutil"
+	"tailscale.com/util/winutil/gp"
 )
 
 const (
@@ -49,20 +50,11 @@ const (
 	nrptRuleFlagsName = `ConfigOptions`
 )
 
-var (
-	libUserenv                   = windows.NewLazySystemDLL("userenv.dll")
-	procRefreshPolicyEx          = libUserenv.NewProc("RefreshPolicyEx")
-	procRegisterGPNotification   = libUserenv.NewProc("RegisterGPNotification")
-	procUnregisterGPNotification = libUserenv.NewProc("UnregisterGPNotification")
-)
-
-const _RP_FORCE = 1 // Flag for RefreshPolicyEx
-
 // nrptRuleDatabase encapsulates access to the Windows Name Resolution Policy
 // Table (NRPT).
 type nrptRuleDatabase struct {
 	logf               logger.Logf
-	watcher            *gpNotificationWatcher
+	watcher            *gp.ChangeWatcher
 	isGPRefreshPending atomic.Bool
 	mu                 sync.Mutex // protects the fields below
 	ruleIDs            []string
@@ -86,12 +78,8 @@ func newNRPTRuleDatabase(logf logger.Logf) *nrptRuleDatabase {
 }
 
 func (db *nrptRuleDatabase) loadRuleSubkeyNames() {
-	result := winutil.GetRegStrings(nrptRuleIDValueName, nil)
-	if result == nil {
-		// Use the legacy rule ID if none are specified in our registry key
-		result = []string{nrptSingleRuleID}
-	}
-	db.ruleIDs = result
+	// Use the legacy rule ID if none are specified in our registry key
+	db.ruleIDs = winutil.GetRegStrings(nrptRuleIDValueName, []string{nrptSingleRuleID})
 }
 
 // detectWriteAsGP determines which registry path should be used for writing
@@ -113,41 +101,20 @@ func (db *nrptRuleDatabase) detectWriteAsGP() {
 		db.writeAsGP = writeAsGP
 		db.logf("nrptRuleDatabase using group policy: %v, was %v\n", writeAsGP, prev)
 		// When db.watcher == nil, prev != writeAsGP because we're initializing, not
-		// because anything has changed. We do not invoke db.movePolicies in that case.
+		// because anything has changed. We do not invoke
+		// db.updateGroupPoliciesLocked in that case.
 		if db.watcher != nil && prev != writeAsGP {
-			db.movePolicies(writeAsGP)
+			db.updateGroupPoliciesLocked(writeAsGP)
 		}
 	}()
-
-	dnsKey, err := registry.OpenKey(registry.LOCAL_MACHINE, dnsBaseGP, registry.READ)
-	if err != nil {
-		db.logf("Failed to open key %q with error: %v\n", dnsBaseGP, err)
-		return
-	}
-	defer dnsKey.Close()
-
-	ki, err := dnsKey.Stat()
-	if err != nil {
-		db.logf("Failed to stat key %q with error: %v\n", dnsBaseGP, err)
-		return
-	}
-
-	// If the dnsKey contains any values, then we need to use the GP key.
-	if ki.ValueCount > 0 {
-		writeAsGP = true
-		return
-	}
-
-	if ki.SubKeyCount == 0 {
-		// If dnsKey contains no values and no subkeys, then we definitely don't
-		// need to use the GP key.
-		return
-	}
 
 	// Get a list of all the NRPT rules under the GP subkey.
 	nrptKey, err := registry.OpenKey(registry.LOCAL_MACHINE, nrptBaseGP, registry.READ)
 	if err != nil {
-		db.logf("Failed to open key %q with error: %v\n", nrptBaseGP, err)
+		if err != registry.ErrNotExist {
+			db.logf("Failed to open key %q with error: %v\n", nrptBaseGP, err)
+		}
+		// If this subkey does not exist then we definitely don't need to use the GP key.
 		return
 	}
 	defer nrptKey.Close()
@@ -253,14 +220,7 @@ func (db *nrptRuleDatabase) WriteSplitDNSConfig(servers []string, domains []dnsn
 	// NRPT has an undocumented restriction that each rule may only be associated
 	// with a maximum of 50 domains. If we are setting rules for more domains
 	// than that, we need to split domains into chunks and write out a rule per chunk.
-	dq := len(domains) / nrptMaxDomainsPerRule
-	dr := len(domains) % nrptMaxDomainsPerRule
-
-	domainRulesLen := dq
-	if dr > 0 {
-		domainRulesLen++
-	}
-
+	domainRulesLen := (len(domains) + nrptMaxDomainsPerRule - 1) / nrptMaxDomainsPerRule
 	db.loadRuleSubkeyNames()
 
 	for len(db.ruleIDs) < domainRulesLen {
@@ -335,12 +295,8 @@ func (db *nrptRuleDatabase) refreshLocked() {
 	// positives.
 	db.isGPRefreshPending.Store(true)
 
-	ok, _, err := procRefreshPolicyEx.Call(
-		uintptr(1), // Win32 TRUE: Refresh computer policy, not user policy.
-		uintptr(_RP_FORCE),
-	)
-	if ok == 0 {
-		db.logf("RefreshPolicyEx failed: %v", err)
+	if err := gp.RefreshMachinePolicy(true); err != nil {
+		db.logf("RefreshMachinePolicy failed: %v", err)
 		return
 	}
 
@@ -348,28 +304,26 @@ func (db *nrptRuleDatabase) refreshLocked() {
 }
 
 func (db *nrptRuleDatabase) writeNRPTRule(ruleID string, servers, doms []string) error {
-	var nrptBase string
-	if db.writeAsGP {
-		nrptBase = nrptBaseGP
-	} else {
-		nrptBase = nrptBaseLocal
+	subKeys := []string{nrptBaseLocal, nrptBaseGP}
+	if !db.writeAsGP {
+		// We don't want to write to the GP key, so chop nrptBaseGP off of subKeys.
+		subKeys = subKeys[:1]
 	}
 
-	keyStr := nrptBase + `\` + ruleID
+	for _, subKeyBase := range subKeys {
+		subKey := strings.Join([]string{subKeyBase, ruleID}, `\`)
+		key, _, err := registry.CreateKey(registry.LOCAL_MACHINE, subKey, registry.SET_VALUE)
+		if err != nil {
+			return fmt.Errorf("opening %q: %w", subKey, err)
+		}
+		defer key.Close()
 
-	// CreateKey is actually open-or-create, which suits us fine.
-	key, _, err := registry.CreateKey(registry.LOCAL_MACHINE, keyStr, registry.SET_VALUE)
-	if err != nil {
-		return fmt.Errorf("opening %s: %w", keyStr, err)
-	}
-	defer key.Close()
-
-	if err := writeNRPTValues(key, strings.Join(servers, "; "), doms); err != nil {
-		return err
+		if err := writeNRPTValues(key, strings.Join(servers, "; "), doms); err != nil {
+			return err
+		}
 	}
 
 	db.isGPDirty = db.writeAsGP
-
 	return nil
 }
 
@@ -400,8 +354,6 @@ func writeNRPTValues(key registry.Key, servers string, doms []string) error {
 }
 
 func (db *nrptRuleDatabase) watchForGPChanges() {
-	db.isGPRefreshPending.Store(false)
-
 	watchHandler := func() {
 		// Do not invoke detectWriteAsGP when we ourselves were responsible for
 		// initiating the group policy refresh.
@@ -412,7 +364,7 @@ func (db *nrptRuleDatabase) watchForGPChanges() {
 		db.detectWriteAsGP()
 	}
 
-	watcher, err := newGPNotificationWatcher(watchHandler)
+	watcher, err := gp.NewChangeWatcher(gp.MachinePolicy, watchHandler)
 	if err != nil {
 		return
 	}
@@ -420,34 +372,29 @@ func (db *nrptRuleDatabase) watchForGPChanges() {
 	db.watcher = watcher
 }
 
-// movePolicies moves each NRPT rule depending on the value of writeAsGP.
-// When writeAsGP is true, each NRPT rule is moved from the local NRPT table
-// to the group policy NRPT table. When writeAsGP is false, the move is
-// executed in the opposite direction. db.mu should already be locked.
-func (db *nrptRuleDatabase) movePolicies(writeAsGP bool) {
-	// Since we're moving either in or out of the group policy NRPT table, we need
-	// to refresh once this movePolicies is done.
+// updateGroupPoliciesLocked updates the NRPT group policy table depending on
+// the value of writeAsGP. When writeAsGP is true, each NRPT rule is copied from
+// the local NRPT table to the group policy NRPT table. When writeAsGP is false,
+// we remove any Tailscale NRPT rules from the group policy table and, if no
+// non-Tailscale rules remain, we also delete the entire DnsPolicyConfig subkey.
+// db.mu must already be locked.
+func (db *nrptRuleDatabase) updateGroupPoliciesLocked(writeAsGP bool) {
+	// Since we're updating the group policy NRPT table, we need
+	// to refresh once this updateGroupPoliciesLocked is done.
 	defer db.refreshLocked()
 
-	var fromBase string
-	var toBase string
-	if writeAsGP {
-		fromBase = nrptBaseLocal
-		toBase = nrptBaseGP
-	} else {
-		fromBase = nrptBaseGP
-		toBase = nrptBaseLocal
-	}
-	fromBase += `\`
-	toBase += `\`
-
 	for _, id := range db.ruleIDs {
-		fromStr := fromBase + id
-		toStr := toBase + id
-
-		if err := executeMove(fromStr, toStr); err != nil {
-			db.logf("movePolicies: executeMove(\"%s\", \"%s\") failed with error %v", fromStr, toStr, err)
-			return
+		if writeAsGP {
+			if err := copyNRPTRule(id); err != nil {
+				db.logf("updateGroupPoliciesLocked: copyNRPTRule(%q) failed with error %v", id, err)
+				return
+			}
+		} else {
+			subKeyFrom := strings.Join([]string{nrptBaseGP, id}, `\`)
+			if err := registry.DeleteKey(registry.LOCAL_MACHINE, subKeyFrom); err != nil && err != registry.ErrNotExist {
+				db.logf("updateGroupPoliciesLocked: DeleteKey for rule %q failed with error %v", id, err)
+				return
+			}
 		}
 
 		db.isGPDirty = true
@@ -457,55 +404,49 @@ func (db *nrptRuleDatabase) movePolicies(writeAsGP bool) {
 		return
 	}
 
-	// Now that we have moved our rules out of the group policy subkey, it should
+	// Now that we have removed our rules from group policy subkey, it should
 	// now be empty. Let's verify that.
 	isEmpty, err := isPolicyConfigSubkeyEmpty()
 	if err != nil {
-		db.logf("movePolicies: isPolicyConfigSubkeyEmpty error %v", err)
+		db.logf("updateGroupPoliciesLocked: isPolicyConfigSubkeyEmpty error %v", err)
 		return
 	}
 	if !isEmpty {
-		db.logf("movePolicies: policy config subkey should be empty, but isn't!")
+		db.logf("updateGroupPoliciesLocked: policy config subkey should be empty, but isn't!")
 		return
 	}
 
 	// Delete the subkey itself. Group policy will continue to override local
 	// settings unless we do so.
 	if err := registry.DeleteKey(registry.LOCAL_MACHINE, nrptBaseGP); err != nil {
-		db.logf("movePolicies DeleteKey error %v", err)
+		db.logf("updateGroupPoliciesLocked DeleteKey error %v", err)
 	}
 
 	db.isGPDirty = true
 }
 
-func executeMove(subKeyFrom, subKeyTo string) error {
-	err := func() error {
-		// Move the NRPT registry values from subKeyFrom to subKeyTo.
-		fromKey, err := registry.OpenKey(registry.LOCAL_MACHINE, subKeyFrom, registry.QUERY_VALUE)
-		if err != nil {
-			return err
-		}
-		defer fromKey.Close()
+func copyNRPTRule(ruleID string) error {
+	subKeyFrom := strings.Join([]string{nrptBaseLocal, ruleID}, `\`)
+	subKeyTo := strings.Join([]string{nrptBaseGP, ruleID}, `\`)
 
-		toKey, _, err := registry.CreateKey(registry.LOCAL_MACHINE, subKeyTo, registry.WRITE)
-		if err != nil {
-			return err
-		}
-		defer toKey.Close()
+	fromKey, err := registry.OpenKey(registry.LOCAL_MACHINE, subKeyFrom, registry.QUERY_VALUE)
+	if err != nil {
+		return err
+	}
+	defer fromKey.Close()
 
-		servers, doms, err := readNRPTValues(fromKey)
-		if err != nil {
-			return err
-		}
+	toKey, _, err := registry.CreateKey(registry.LOCAL_MACHINE, subKeyTo, registry.WRITE)
+	if err != nil {
+		return err
+	}
+	defer toKey.Close()
 
-		return writeNRPTValues(toKey, servers, doms)
-	}()
+	servers, doms, err := readNRPTValues(fromKey)
 	if err != nil {
 		return err
 	}
 
-	// This is a move operation, so we must delete subKeyFrom.
-	return registry.DeleteKey(registry.LOCAL_MACHINE, subKeyFrom)
+	return writeNRPTValues(toKey, servers, doms)
 }
 
 func (db *nrptRuleDatabase) Close() error {
@@ -515,104 +456,4 @@ func (db *nrptRuleDatabase) Close() error {
 	err := db.watcher.Close()
 	db.watcher = nil
 	return err
-}
-
-type gpNotificationWatcher struct {
-	gpWaitEvents [2]windows.Handle
-	handler      func()
-	done         chan struct{}
-}
-
-// newGPNotificationWatcher creates an instance of gpNotificationWatcher that
-// invokes handler every time Windows notifies it of a group policy change.
-func newGPNotificationWatcher(handler func()) (*gpNotificationWatcher, error) {
-	var err error
-
-	// evtDone is signaled by (*gpNotificationWatcher).Close() to indicate that
-	// the doWatch goroutine should exit.
-	evtDone, err := windows.CreateEvent(nil, 0, 0, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			windows.CloseHandle(evtDone)
-		}
-	}()
-
-	// evtChanged is registered with the Windows policy engine to become
-	// signalled any time group policy has been refreshed.
-	evtChanged, err := windows.CreateEvent(nil, 0, 0, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			windows.CloseHandle(evtChanged)
-		}
-	}()
-
-	// Tell Windows to signal evtChanged whenever group policies are refreshed.
-	ok, _, e := procRegisterGPNotification.Call(
-		uintptr(evtChanged),
-		uintptr(1), // Win32 TRUE: We want to monitor computer policy changes, not user policy changes.
-	)
-	if ok == 0 {
-		err = e
-		return nil, err
-	}
-
-	result := &gpNotificationWatcher{
-		// Ordering of the event handles in gpWaitEvents is important:
-		// When calling windows.WaitForMultipleObjects and multiple objects are
-		// signalled simultaneously, it always returns the wait code for the
-		// lowest-indexed handle in its input array. evtDone is higher priority for
-		// us than evtChanged, so the former must be placed into the array ahead of
-		// the latter.
-		gpWaitEvents: [2]windows.Handle{
-			evtDone,
-			evtChanged,
-		},
-		handler: handler,
-		done:    make(chan struct{}),
-	}
-
-	go result.doWatch()
-
-	return result, nil
-}
-
-func (w *gpNotificationWatcher) doWatch() {
-	// The wait code corresponding to the event that is signalled when a group
-	// policy change occurs.
-	const expectedWaitCode = windows.WAIT_OBJECT_0 + 1
-	for {
-		if waitCode, _ := windows.WaitForMultipleObjects(w.gpWaitEvents[:], false, windows.INFINITE); waitCode != expectedWaitCode {
-			break
-		}
-		w.handler()
-	}
-	close(w.done)
-}
-
-func (w *gpNotificationWatcher) Close() error {
-	// Notify doWatch that we're done and it should exit.
-	if err := windows.SetEvent(w.gpWaitEvents[0]); err != nil {
-		return err
-	}
-
-	procUnregisterGPNotification.Call(uintptr(w.gpWaitEvents[1]))
-
-	// Wait for doWatch to complete.
-	<-w.done
-
-	// Now we may safely clean up all the things.
-	for i, evt := range w.gpWaitEvents {
-		windows.CloseHandle(evt)
-		w.gpWaitEvents[i] = 0
-	}
-
-	w.handler = nil
-
-	return nil
 }

@@ -4,6 +4,7 @@
 package safesocket
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -57,7 +58,7 @@ func TestBasics(t *testing.T) {
 	}()
 
 	go func() {
-		c, err := Connect(sock)
+		c, err := ConnectContext(context.Background(), sock)
 		if err != nil {
 			errs <- err
 			return
@@ -76,7 +77,7 @@ func TestBasics(t *testing.T) {
 		errs <- nil
 	}()
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}

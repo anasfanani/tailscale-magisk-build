@@ -10,8 +10,10 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 )
 
 var ncCmd = &ffcli.Command{
@@ -19,6 +21,27 @@ var ncCmd = &ffcli.Command{
 	ShortUsage: "tailscale nc <hostname-or-IP> <port>",
 	ShortHelp:  "Connect to a port on a host, connected to stdin/stdout",
 	Exec:       runNC,
+}
+
+func init() {
+	ffcomplete.Args(ncCmd, func(args []string) ([]string, ffcomplete.ShellCompDirective, error) {
+		if len(args) > 1 {
+			return nil, ffcomplete.ShellCompDirectiveNoFileComp, nil
+		}
+		return completeHostOrIP(ffcomplete.LastArg(args))
+	})
+}
+
+func completeHostOrIP(arg string) ([]string, ffcomplete.ShellCompDirective, error) {
+	st, err := localClient.Status(context.Background())
+	if err != nil {
+		return nil, 0, err
+	}
+	nodes := make([]string, 0, len(st.Peer))
+	for _, node := range st.Peer {
+		nodes = append(nodes, strings.TrimSuffix(node.DNSName, "."))
+	}
+	return nodes, ffcomplete.ShellCompDirectiveNoFileComp, nil
 }
 
 func runNC(ctx context.Context, args []string) error {
@@ -33,7 +56,7 @@ func runNC(ctx context.Context, args []string) error {
 	}
 
 	if len(args) != 2 {
-		return errors.New("usage: nc <hostname-or-IP> <port>")
+		return errors.New("usage: tailscale nc <hostname-or-IP> <port>")
 	}
 
 	hostOrIP, portStr := args[0], args[1]

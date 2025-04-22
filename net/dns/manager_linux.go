@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+	"tailscale.com/control/controlknobs"
 	"tailscale.com/health"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/types/logger"
@@ -31,7 +32,10 @@ func (kv kv) String() string {
 
 var publishOnce sync.Once
 
-func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurator, err error) {
+// NewOSConfigurator created a new OS configurator.
+//
+// The health tracker may be nil; the knobs may be nil and are ignored on this platform.
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, _ *controlknobs.Knobs, interfaceName string) (ret OSConfigurator, err error) {
 	env := newOSConfigEnv{
 		fs:                directFS{},
 		dbusPing:          dbusPing,
@@ -40,7 +44,7 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurat
 		nmVersionBetween:  nmVersionBetween,
 		resolvconfStyle:   resolvconfStyle,
 	}
-	mode, err := dnsMode(logf, env)
+	mode, err := dnsMode(logf, health, env)
 	if err != nil {
 		return nil, err
 	}
@@ -52,9 +56,9 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurat
 	logf("dns: using %q mode", mode)
 	switch mode {
 	case "direct":
-		return newDirectManagerOnFS(logf, env.fs), nil
+		return newDirectManagerOnFS(logf, health, env.fs), nil
 	case "systemd-resolved":
-		return newResolvedManager(logf, interfaceName)
+		return newResolvedManager(logf, health, interfaceName)
 	case "network-manager":
 		return newNMManager(interfaceName)
 	case "debian-resolvconf":
@@ -63,7 +67,7 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurat
 		return newOpenresolvManager(logf)
 	default:
 		logf("[unexpected] detected unknown DNS mode %q, using direct manager as last resort", mode)
-		return newDirectManagerOnFS(logf, env.fs), nil
+		return newDirectManagerOnFS(logf, health, env.fs), nil
 	}
 }
 
@@ -77,7 +81,7 @@ type newOSConfigEnv struct {
 	resolvconfStyle   func() string
 }
 
-func dnsMode(logf logger.Logf, env newOSConfigEnv) (ret string, err error) {
+func dnsMode(logf logger.Logf, health *health.Tracker, env newOSConfigEnv) (ret string, err error) {
 	var debug []kv
 	dbg := func(k, v string) {
 		debug = append(debug, kv{k, v})

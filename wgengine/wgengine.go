@@ -1,6 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+// Package wgengine provides the Tailscale WireGuard engine interface.
 package wgengine
 
 import (
@@ -77,6 +78,13 @@ type Engine interface {
 
 	// SetFilter updates the packet filter.
 	SetFilter(*filter.Filter)
+
+	// GetJailedFilter returns the current packet filter for jailed nodes,
+	// if any.
+	GetJailedFilter() *filter.Filter
+
+	// SetJailedFilter updates the packet filter for jailed nodes.
+	SetJailedFilter(*filter.Filter)
 
 	// SetStatusCallback sets the function to call when the
 	// WireGuard status changes.

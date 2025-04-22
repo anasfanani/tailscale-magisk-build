@@ -131,7 +131,7 @@ var syslogf logger.Logf = logger.Discard
 // Windows started.
 func runWindowsService(pol *logpolicy.Policy) error {
 	go func() {
-		osdiag.LogSupportInfo(logger.WithPrefix(log.Printf, "Support Info: "), osdiag.LogSupportInfoReasonStartup)
+		logger.Logf(log.Printf).JSON(1, "SupportInfo", osdiag.SupportInfo(osdiag.LogSupportInfoReasonStartup))
 	}()
 
 	if logSCMInteractions, _ := syspolicy.GetBoolean(syspolicy.LogSCMInteractions, false); logSCMInteractions {
@@ -435,6 +435,9 @@ func babysitProc(ctx context.Context, args []string, logf logger.Logf) {
 		startTime := time.Now()
 		log.Printf("exec: %#v %v", executable, args)
 		cmd := exec.Command(executable, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			CreationFlags: windows.DETACHED_PROCESS,
+		}
 
 		// Create a pipe object to use as the subproc's stdin.
 		// When the writer goes away, the reader gets EOF.

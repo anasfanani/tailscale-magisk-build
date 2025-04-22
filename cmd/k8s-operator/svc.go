@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -15,15 +16,31 @@ import (
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
+	"tailscale.com/net/dns/resolvconffile"
+	"tailscale.com/tstime"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/util/set"
+)
+
+const (
+	resolvConfPath       = "/etc/resolv.conf"
+	defaultClusterDomain = "cluster.local"
+
+	reasonProxyCreated = "ProxyCreated"
+	reasonProxyInvalid = "ProxyInvalid"
+	reasonProxyFailed  = "ProxyFailed"
+	reasonProxyPending = "ProxyPending"
 )
 
 type ServiceReconciler struct {
@@ -42,15 +59,21 @@ type ServiceReconciler struct {
 	managedEgressProxies set.Slice[types.UID]
 
 	recorder record.EventRecorder
+
+	tsNamespace string
+
+	clock tstime.Clock
+
+	defaultProxyClass string
 }
 
 var (
 	// gaugeEgressProxies tracks the number of egress proxies that we're
 	// currently managing.
-	gaugeEgressProxies = clientmetric.NewGauge("k8s_egress_proxies")
+	gaugeEgressProxies = clientmetric.NewGauge(kubetypes.MetricEgressProxyCount)
 	// gaugeIngressProxies tracks the number of ingress proxies that we're
 	// currently managing.
-	gaugeIngressProxies = clientmetric.NewGauge("k8s_ingress_proxies")
+	gaugeIngressProxies = clientmetric.NewGauge(kubetypes.MetricIngressProxyCount)
 )
 
 func childResourceLabels(name, ns, typ string) map[string]string {
@@ -68,6 +91,12 @@ func childResourceLabels(name, ns, typ string) map[string]string {
 	}
 }
 
+func (a *ServiceReconciler) isTailscaleService(svc *corev1.Service) bool {
+	targetIP := tailnetTargetAnnotation(svc)
+	targetFQDN := svc.Annotations[AnnotationTailnetTargetFQDN]
+	return a.shouldExpose(svc) || targetIP != "" || targetFQDN != ""
+}
+
 func (a *ServiceReconciler) Reconcile(ctx context.Context, req reconcile.Request) (_ reconcile.Result, err error) {
 	logger := a.logger.With("service-ns", req.Namespace, "service-name", req.Name)
 	logger.Debugf("starting reconcile")
@@ -82,9 +111,12 @@ func (a *ServiceReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	} else if err != nil {
 		return reconcile.Result{}, fmt.Errorf("failed to get svc: %w", err)
 	}
-	targetIP := a.tailnetTargetAnnotation(svc)
-	targetFQDN := svc.Annotations[AnnotationTailnetTargetFQDN]
-	if !svc.DeletionTimestamp.IsZero() || !a.shouldExpose(svc) && targetIP == "" && targetFQDN == "" {
+
+	if _, ok := svc.Annotations[AnnotationProxyGroup]; ok {
+		return reconcile.Result{}, nil // this reconciler should not look at Services for ProxyGroup
+	}
+
+	if !svc.DeletionTimestamp.IsZero() || !a.isTailscaleService(svc) {
 		logger.Debugf("service is being deleted or is (no longer) referring to Tailscale ingress/egress, ensuring any created resources are cleaned up")
 		return reconcile.Result{}, a.maybeCleanup(ctx, logger, svc)
 	}
@@ -96,7 +128,14 @@ func (a *ServiceReconciler) Reconcile(ctx context.Context, req reconcile.Request
 //
 // This function is responsible for removing the finalizer from the service,
 // once all associated resources are gone.
-func (a *ServiceReconciler) maybeCleanup(ctx context.Context, logger *zap.SugaredLogger, svc *corev1.Service) error {
+func (a *ServiceReconciler) maybeCleanup(ctx context.Context, logger *zap.SugaredLogger, svc *corev1.Service) (err error) {
+	oldSvcStatus := svc.Status.DeepCopy()
+	defer func() {
+		if !apiequality.Semantic.DeepEqual(oldSvcStatus, svc.Status) {
+			// An error encountered here should get returned by the Reconcile function.
+			err = errors.Join(err, a.Client.Status().Update(ctx, svc))
+		}
+	}()
 	ix := slices.Index(svc.Finalizers, FinalizerName)
 	if ix < 0 {
 		logger.Debugf("no finalizer, nothing to do")
@@ -106,6 +145,10 @@ func (a *ServiceReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 		a.managedEgressProxies.Remove(svc.UID)
 		gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
 		gaugeEgressProxies.Set(int64(a.managedEgressProxies.Len()))
+
+		if !a.isTailscaleService(svc) {
+			tsoperator.RemoveServiceCondition(svc, tsapi.ProxyReady)
+		}
 		return nil
 	}
 
@@ -125,7 +168,7 @@ func (a *ServiceReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 	// exactly once at the very end of cleanup, because the final step of
 	// cleanup removes the tailscale finalizer, which will make all future
 	// reconciles exit early.
-	logger.Infof("unexposed service from tailnet")
+	logger.Infof("unexposed Service from tailnet")
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -133,6 +176,10 @@ func (a *ServiceReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 	a.managedEgressProxies.Remove(svc.UID)
 	gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
 	gaugeEgressProxies.Set(int64(a.managedEgressProxies.Len()))
+
+	if !a.isTailscaleService(svc) {
+		tsoperator.RemoveServiceCondition(svc, tsapi.ProxyReady)
+	}
 	return nil
 }
 
@@ -141,7 +188,15 @@ func (a *ServiceReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 //
 // This function adds a finalizer to svc, ensuring that we can handle orderly
 // deprovisioning later.
-func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.SugaredLogger, svc *corev1.Service) error {
+func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.SugaredLogger, svc *corev1.Service) (err error) {
+	oldSvcStatus := svc.Status.DeepCopy()
+	defer func() {
+		if !apiequality.Semantic.DeepEqual(oldSvcStatus, svc.Status) {
+			// An error encountered here should get returned by the Reconcile function.
+			err = errors.Join(err, a.Client.Status().Update(ctx, svc))
+		}
+	}()
+
 	// Run for proxy config related validations here as opposed to running
 	// them earlier. This is to prevent cleanup being blocked on a
 	// misconfigured proxy param.
@@ -149,28 +204,29 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		msg := fmt.Sprintf("unable to provision proxy resources: invalid config: %v", err)
 		a.recorder.Event(svc, corev1.EventTypeWarning, "INVALIDCONFIG", msg)
 		a.logger.Error(msg)
+		tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyInvalid, msg, a.clock, logger)
 		return nil
 	}
 	if violations := validateService(svc); len(violations) > 0 {
 		msg := fmt.Sprintf("unable to provision proxy resources: invalid Service: %s", strings.Join(violations, ", "))
-		a.recorder.Event(svc, corev1.EventTypeWarning, "INVALIDSERVCICE", msg)
+		a.recorder.Event(svc, corev1.EventTypeWarning, "INVALIDSERVICE", msg)
 		a.logger.Error(msg)
+		tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyInvalid, msg, a.clock, logger)
 		return nil
 	}
 
-	proxyClass := proxyClassForObject(svc)
+	proxyClass := proxyClassForObject(svc, a.defaultProxyClass)
 	if proxyClass != "" {
 		if ready, err := proxyClassIsReady(ctx, proxyClass, a.Client); err != nil {
-			return fmt.Errorf("error verifying ProxyClass for Service: %w", err)
+			errMsg := fmt.Errorf("error verifying ProxyClass for Service: %w", err)
+			tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyFailed, errMsg.Error(), a.clock, logger)
+			return errMsg
 		} else if !ready {
-			logger.Infof("ProxyClass %s specified for the Service, but is not (yet) Ready, waiting..", proxyClass)
+			msg := fmt.Sprintf("ProxyClass %s specified for the Service, but is not (yet) Ready, waiting..", proxyClass)
+			tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyPending, msg, a.clock, logger)
+			logger.Info(msg)
 			return nil
 		}
-	}
-
-	hostname, err := nameForService(svc)
-	if err != nil {
-		return err
 	}
 
 	if !slices.Contains(svc.Finalizers, FinalizerName) {
@@ -181,7 +237,9 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		logger.Infof("exposing service over tailscale")
 		svc.Finalizers = append(svc.Finalizers, FinalizerName)
 		if err := a.Update(ctx, svc); err != nil {
-			return fmt.Errorf("failed to add finalizer: %w", err)
+			errMsg := fmt.Errorf("failed to add finalizer: %w", err)
+			tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyFailed, errMsg.Error(), a.clock, logger)
+			return errMsg
 		}
 	}
 	crl := childResourceLabels(svc.Name, svc.Namespace, "svc")
@@ -193,18 +251,22 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	sts := &tailscaleSTSConfig{
 		ParentResourceName:  svc.Name,
 		ParentResourceUID:   string(svc.UID),
-		Hostname:            hostname,
+		Hostname:            nameForService(svc),
 		Tags:                tags,
 		ChildResourceLabels: crl,
-		ProxyClass:          proxyClass,
+		ProxyClassName:      proxyClass,
 	}
 
 	a.mu.Lock()
-	if a.shouldExpose(svc) {
+	if a.shouldExposeClusterIP(svc) {
 		sts.ClusterTargetIP = svc.Spec.ClusterIP
 		a.managedIngressProxies.Add(svc.UID)
 		gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
-	} else if ip := a.tailnetTargetAnnotation(svc); ip != "" {
+	} else if a.shouldExposeDNSName(svc) {
+		sts.ClusterTargetDNSName = svc.Spec.ExternalName
+		a.managedIngressProxies.Add(svc.UID)
+		gaugeIngressProxies.Set(int64(a.managedIngressProxies.Len()))
+	} else if ip := tailnetTargetAnnotation(svc); ip != "" {
 		sts.TailnetTargetIP = ip
 		a.managedEgressProxies.Add(svc.UID)
 		gaugeEgressProxies.Set(int64(a.managedEgressProxies.Len()))
@@ -221,27 +283,31 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 
 	var hsvc *corev1.Service
 	if hsvc, err = a.ssr.Provision(ctx, logger, sts); err != nil {
-		return fmt.Errorf("failed to provision: %w", err)
+		errMsg := fmt.Errorf("failed to provision: %w", err)
+		tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyFailed, errMsg.Error(), a.clock, logger)
+		return errMsg
 	}
 
-	if sts.TailnetTargetIP != "" || sts.TailnetTargetFQDN != "" {
-		// TODO (irbekrm): cluster.local is the default DNS name, but
-		// can be changed by users. Make this configurable or figure out
-		// how to discover the DNS name from within operator
-		headlessSvcName := hsvc.Name + "." + hsvc.Namespace + ".svc.cluster.local"
+	if sts.TailnetTargetIP != "" || sts.TailnetTargetFQDN != "" { // if an egress proxy
+		clusterDomain := retrieveClusterDomain(a.tsNamespace, logger)
+		headlessSvcName := hsvc.Name + "." + hsvc.Namespace + ".svc." + clusterDomain
 		if svc.Spec.ExternalName != headlessSvcName || svc.Spec.Type != corev1.ServiceTypeExternalName {
 			svc.Spec.ExternalName = headlessSvcName
 			svc.Spec.Selector = nil
 			svc.Spec.Type = corev1.ServiceTypeExternalName
 			if err := a.Update(ctx, svc); err != nil {
-				return fmt.Errorf("failed to update service: %w", err)
+				errMsg := fmt.Errorf("failed to update service: %w", err)
+				tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyFailed, errMsg.Error(), a.clock, logger)
+				return errMsg
 			}
 		}
+		tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionTrue, reasonProxyCreated, reasonProxyCreated, a.clock, logger)
 		return nil
 	}
 
-	if !a.hasLoadBalancerClass(svc) {
+	if !isTailscaleLoadBalancerService(svc, a.isDefaultLoadBalancer) {
 		logger.Debugf("service is not a LoadBalancer, so not updating ingress")
+		tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionTrue, reasonProxyCreated, reasonProxyCreated, a.clock, logger)
 		return nil
 	}
 
@@ -250,22 +316,23 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return fmt.Errorf("failed to get device ID: %w", err)
 	}
 	if tsHost == "" {
-		logger.Debugf("no Tailscale hostname known yet, waiting for proxy pod to finish auth")
+		msg := "no Tailscale hostname known yet, waiting for proxy pod to finish auth"
+		logger.Debug(msg)
 		// No hostname yet. Wait for the proxy pod to auth.
 		svc.Status.LoadBalancer.Ingress = nil
-		if err := a.Status().Update(ctx, svc); err != nil {
-			return fmt.Errorf("failed to update service status: %w", err)
-		}
+		tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyPending, msg, a.clock, logger)
 		return nil
 	}
 
-	logger.Debugf("setting ingress to %q, %s", tsHost, strings.Join(tsIPs, ", "))
+	logger.Debugf("setting Service LoadBalancer status to %q, %s", tsHost, strings.Join(tsIPs, ", "))
 	ingress := []corev1.LoadBalancerIngress{
 		{Hostname: tsHost},
 	}
 	clusterIPAddr, err := netip.ParseAddr(svc.Spec.ClusterIP)
 	if err != nil {
-		return fmt.Errorf("failed to parse cluster IP: %w", err)
+		msg := fmt.Sprintf("failed to parse cluster IP: %v", err)
+		tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyFailed, msg, a.clock, logger)
+		return errors.New(msg)
 	}
 	for _, ip := range tsIPs {
 		addr, err := netip.ParseAddr(ip)
@@ -277,53 +344,68 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		}
 	}
 	svc.Status.LoadBalancer.Ingress = ingress
-	if err := a.Status().Update(ctx, svc); err != nil {
-		return fmt.Errorf("failed to update service status: %w", err)
-	}
+	tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionTrue, reasonProxyCreated, reasonProxyCreated, a.clock, logger)
 	return nil
 }
 
 func validateService(svc *corev1.Service) []string {
 	violations := make([]string, 0)
 	if svc.Annotations[AnnotationTailnetTargetFQDN] != "" && svc.Annotations[AnnotationTailnetTargetIP] != "" {
-		violations = append(violations, "only one of annotations %s and %s can be set", AnnotationTailnetTargetIP, AnnotationTailnetTargetFQDN)
+		violations = append(violations, fmt.Sprintf("only one of annotations %s and %s can be set", AnnotationTailnetTargetIP, AnnotationTailnetTargetFQDN))
 	}
 	if fqdn := svc.Annotations[AnnotationTailnetTargetFQDN]; fqdn != "" {
 		if !isMagicDNSName(fqdn) {
 			violations = append(violations, fmt.Sprintf("invalid value of annotation %s: %q does not appear to be a valid MagicDNS name", AnnotationTailnetTargetFQDN, fqdn))
 		}
 	}
+
+	// TODO(irbekrm): validate that tailscale.com/tailnet-ip annotation is a
+	// valid IP address (tailscale/tailscale#13671).
+
+	svcName := nameForService(svc)
+	if err := dnsname.ValidLabel(svcName); err != nil {
+		if _, ok := svc.Annotations[AnnotationHostname]; ok {
+			violations = append(violations, fmt.Sprintf("invalid Tailscale hostname specified %q: %s", svcName, err))
+		} else {
+			violations = append(violations, fmt.Sprintf("invalid Tailscale hostname %q, use %q annotation to override: %s", svcName, AnnotationHostname, err))
+		}
+	}
 	return violations
 }
 
 func (a *ServiceReconciler) shouldExpose(svc *corev1.Service) bool {
-	// Headless services can't be exposed, since there is no ClusterIP to
-	// forward to.
+	return a.shouldExposeClusterIP(svc) || a.shouldExposeDNSName(svc)
+}
+
+func (a *ServiceReconciler) shouldExposeDNSName(svc *corev1.Service) bool {
+	return hasExposeAnnotation(svc) && svc.Spec.Type == corev1.ServiceTypeExternalName && svc.Spec.ExternalName != ""
+}
+
+func (a *ServiceReconciler) shouldExposeClusterIP(svc *corev1.Service) bool {
 	if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
 		return false
 	}
-
-	return a.hasLoadBalancerClass(svc) || a.hasExposeAnnotation(svc)
+	return isTailscaleLoadBalancerService(svc, a.isDefaultLoadBalancer) || hasExposeAnnotation(svc)
 }
 
-func (a *ServiceReconciler) hasLoadBalancerClass(svc *corev1.Service) bool {
+func isTailscaleLoadBalancerService(svc *corev1.Service, isDefaultLoadBalancer bool) bool {
 	return svc != nil &&
 		svc.Spec.Type == corev1.ServiceTypeLoadBalancer &&
 		(svc.Spec.LoadBalancerClass != nil && *svc.Spec.LoadBalancerClass == "tailscale" ||
-			svc.Spec.LoadBalancerClass == nil && a.isDefaultLoadBalancer)
+			svc.Spec.LoadBalancerClass == nil && isDefaultLoadBalancer)
 }
 
 // hasExposeAnnotation reports whether Service has the tailscale.com/expose
 // annotation set
-func (a *ServiceReconciler) hasExposeAnnotation(svc *corev1.Service) bool {
+func hasExposeAnnotation(svc *corev1.Service) bool {
 	return svc != nil && svc.Annotations[AnnotationExpose] == "true"
 }
 
-// hasTailnetTargetAnnotation returns the value of tailscale.com/tailnet-ip
+// tailnetTargetAnnotation returns the value of tailscale.com/tailnet-ip
 // annotation or of the deprecated tailscale.com/ts-tailnet-target-ip
 // annotation. If neither is set, it returns an empty string. If both are set,
 // it returns the value of the new annotation.
-func (a *ServiceReconciler) tailnetTargetAnnotation(svc *corev1.Service) string {
+func tailnetTargetAnnotation(svc *corev1.Service) string {
 	if svc == nil {
 		return ""
 	}
@@ -333,8 +415,14 @@ func (a *ServiceReconciler) tailnetTargetAnnotation(svc *corev1.Service) string 
 	return svc.Annotations[annotationTailnetTargetIPOld]
 }
 
-func proxyClassForObject(o client.Object) string {
-	return o.GetLabels()[LabelProxyClass]
+// proxyClassForObject returns the proxy class for the given object. If the
+// object does not have a proxy class label, it returns the default proxy class
+func proxyClassForObject(o client.Object, proxyDefaultClass string) string {
+	proxyClass, exists := o.GetLabels()[LabelProxyClass]
+	if !exists {
+		proxyClass = proxyDefaultClass
+	}
+	return proxyClass
 }
 
 func proxyClassIsReady(ctx context.Context, name string, cl client.Client) (bool, error) {
@@ -343,4 +431,52 @@ func proxyClassIsReady(ctx context.Context, name string, cl client.Client) (bool
 		return false, fmt.Errorf("error getting ProxyClass %s: %w", name, err)
 	}
 	return tsoperator.ProxyClassIsReady(proxyClass), nil
+}
+
+// retrieveClusterDomain determines and retrieves cluster domain i.e
+// (cluster.local) in which this Pod is running by parsing search domains in
+// /etc/resolv.conf. If an error is encountered at any point during the process,
+// defaults cluster domain to 'cluster.local'.
+func retrieveClusterDomain(namespace string, logger *zap.SugaredLogger) string {
+	logger.Infof("attempting to retrieve cluster domain..")
+	conf, err := resolvconffile.ParseFile(resolvConfPath)
+	if err != nil {
+		// Vast majority of clusters use the cluster.local domain, so it
+		// is probably better to fall back to that than error out.
+		logger.Infof("[unexpected] error parsing /etc/resolv.conf to determine cluster domain, defaulting to 'cluster.local'.")
+		return defaultClusterDomain
+	}
+	return clusterDomainFromResolverConf(conf, namespace, logger)
+}
+
+// clusterDomainFromResolverConf attempts to retrieve cluster domain from the provided resolver config.
+// It expects the first three search domains in the resolver config to be be ['<namespace>.svc.<cluster-domain>, svc.<cluster-domain>, <cluster-domain>, ...]
+// If the first three domains match the expected structure, it returns the third.
+// If the domains don't match the expected structure or an error is encountered, it defaults to 'cluster.local' domain.
+func clusterDomainFromResolverConf(conf *resolvconffile.Config, namespace string, logger *zap.SugaredLogger) string {
+	if len(conf.SearchDomains) < 3 {
+		logger.Infof("[unexpected] resolver config contains only %d search domains, at least three expected.\nDefaulting cluster domain to 'cluster.local'.")
+		return defaultClusterDomain
+	}
+	first := conf.SearchDomains[0]
+	if !strings.HasPrefix(string(first), namespace+".svc") {
+		logger.Infof("[unexpected] first search domain in resolver config is %s; expected %s.\nDefaulting cluster domain to 'cluster.local'.", first, namespace+".svc.<cluster-domain>")
+		return defaultClusterDomain
+	}
+	second := conf.SearchDomains[1]
+	if !strings.HasPrefix(string(second), "svc") {
+		logger.Infof("[unexpected] second search domain in resolver config is %s; expected 'svc.<cluster-domain>'.\nDefaulting cluster domain to 'cluster.local'.", second)
+		return defaultClusterDomain
+	}
+	// Trim the trailing dot for backwards compatibility purposes as the
+	// cluster domain was previously hardcoded to 'cluster.local' without a
+	// trailing dot.
+	probablyClusterDomain := strings.TrimPrefix(second.WithoutTrailingDot(), "svc.")
+	third := conf.SearchDomains[2]
+	if !strings.EqualFold(third.WithoutTrailingDot(), probablyClusterDomain) {
+		logger.Infof("[unexpected] expected resolver config to contain serch domains <namespace>.svc.<cluster-domain>, svc.<cluster-domain>, <cluster-domain>; got %s %s %s\n. Defaulting cluster domain to 'cluster.local'.", first, second, third)
+		return defaultClusterDomain
+	}
+	logger.Infof("Cluster domain %q extracted from resolver config", probablyClusterDomain)
+	return probablyClusterDomain
 }

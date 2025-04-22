@@ -32,7 +32,8 @@ type ConfigVAlpha struct {
 	AdvertiseRoutes []netip.Prefix `json:",omitempty"`
 	DisableSNAT     opt.Bool       `json:",omitempty"`
 
-	NetfilterMode *string `json:",omitempty"` // "on", "off", "nodivert"
+	NetfilterMode       *string  `json:",omitempty"` // "on", "off", "nodivert"
+	NoStatefulFiltering opt.Bool `json:",omitempty"`
 
 	PostureChecking opt.Bool         `json:",omitempty"`
 	RunSSHServer    opt.Bool         `json:",omitempty"` // Tailscale SSH
@@ -40,6 +41,10 @@ type ConfigVAlpha struct {
 	ShieldsUp       opt.Bool         `json:",omitempty"`
 	AutoUpdate      *AutoUpdatePrefs `json:",omitempty"`
 	ServeConfigTemp *ServeConfig     `json:",omitempty"` // TODO(bradfitz,maisem): make separate stable type for this
+
+	// StaticEndpoints are additional, user-defined endpoints that this node
+	// should advertise amongst its wireguard endpoints.
+	StaticEndpoints []netip.AddrPort `json:",omitempty"`
 
 	// TODO(bradfitz,maisem): future something like:
 	// Profile map[string]*Config // keyed by alice@gmail.com, corp.com (TailnetSID)
@@ -50,6 +55,7 @@ func (c *ConfigVAlpha) ToPrefs() (MaskedPrefs, error) {
 	if c == nil {
 		return mp, nil
 	}
+
 	mp.WantRunning = !c.Enabled.EqualBool(false)
 	mp.WantRunningSet = mp.WantRunning || c.Enabled != ""
 	if c.ServerURL != nil {
@@ -98,6 +104,11 @@ func (c *ConfigVAlpha) ToPrefs() (MaskedPrefs, error) {
 		mp.NoSNAT = c.DisableSNAT.EqualBool(true)
 		mp.NoSNAT = true
 	}
+	if c.NoStatefulFiltering != "" {
+		mp.NoStatefulFiltering = c.NoStatefulFiltering
+		mp.NoStatefulFilteringSet = true
+	}
+
 	if c.NetfilterMode != nil {
 		m, err := preftype.ParseNetfilterMode(*c.NetfilterMode)
 		if err != nil {

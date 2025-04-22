@@ -24,6 +24,7 @@ import (
 	"os/user"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,7 @@ import (
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/memnet"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/sessionrecording"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/tsd"
@@ -44,6 +46,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/lineread"
 	"tailscale.com/util/must"
@@ -54,11 +57,12 @@ import (
 func TestMatchRule(t *testing.T) {
 	someAction := new(tailcfg.SSHAction)
 	tests := []struct {
-		name     string
-		rule     *tailcfg.SSHRule
-		ci       *sshConnInfo
-		wantErr  error
-		wantUser string
+		name          string
+		rule          *tailcfg.SSHRule
+		ci            *sshConnInfo
+		wantErr       error
+		wantUser      string
+		wantAcceptEnv []string
 	}{
 		{
 			name: "invalid-conn",
@@ -87,7 +91,7 @@ func TestMatchRule(t *testing.T) {
 			name: "expired",
 			rule: &tailcfg.SSHRule{
 				Action:      someAction,
-				RuleExpires: timePtr(time.Unix(100, 0)),
+				RuleExpires: ptr.To(time.Unix(100, 0)),
 			},
 			ci:      &sshConnInfo{},
 			wantErr: errRuleExpired,
@@ -152,6 +156,21 @@ func TestMatchRule(t *testing.T) {
 			wantUser: "thealice",
 		},
 		{
+			name: "ok-with-accept-env",
+			rule: &tailcfg.SSHRule{
+				Action:     someAction,
+				Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+				SSHUsers: map[string]string{
+					"*":     "ubuntu",
+					"alice": "thealice",
+				},
+				AcceptEnv: []string{"EXAMPLE", "?_?", "TEST_*"},
+			},
+			ci:            &sshConnInfo{sshUser: "alice"},
+			wantUser:      "thealice",
+			wantAcceptEnv: []string{"EXAMPLE", "?_?", "TEST_*"},
+		},
+		{
 			name: "no-users-for-reject",
 			rule: &tailcfg.SSHRule{
 				Principals: []*tailcfg.SSHPrincipal{{Any: true}},
@@ -208,7 +227,7 @@ func TestMatchRule(t *testing.T) {
 				info: tt.ci,
 				srv:  &server{logf: t.Logf},
 			}
-			got, gotUser, err := c.matchRule(tt.rule, nil)
+			got, gotUser, gotAcceptEnv, err := c.matchRule(tt.rule, nil)
 			if err != tt.wantErr {
 				t.Errorf("err = %v; want %v", err, tt.wantErr)
 			}
@@ -218,11 +237,131 @@ func TestMatchRule(t *testing.T) {
 			if err == nil && got == nil {
 				t.Errorf("expected non-nil action on success")
 			}
+			if !slices.Equal(gotAcceptEnv, tt.wantAcceptEnv) {
+				t.Errorf("acceptEnv = %v; want %v", gotAcceptEnv, tt.wantAcceptEnv)
+			}
 		})
 	}
 }
 
-func timePtr(t time.Time) *time.Time { return &t }
+func TestEvalSSHPolicy(t *testing.T) {
+	someAction := new(tailcfg.SSHAction)
+	tests := []struct {
+		name          string
+		policy        *tailcfg.SSHPolicy
+		ci            *sshConnInfo
+		wantMatch     bool
+		wantUser      string
+		wantAcceptEnv []string
+	}{
+		{
+			name: "multiple-matches-picks-first-match",
+			policy: &tailcfg.SSHPolicy{
+				Rules: []*tailcfg.SSHRule{
+					{
+						Action:     someAction,
+						Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+						SSHUsers: map[string]string{
+							"other": "other1",
+						},
+					},
+					{
+						Action:     someAction,
+						Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+						SSHUsers: map[string]string{
+							"*":     "ubuntu",
+							"alice": "thealice",
+						},
+						AcceptEnv: []string{"EXAMPLE", "?_?", "TEST_*"},
+					},
+					{
+						Action:     someAction,
+						Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+						SSHUsers: map[string]string{
+							"other2": "other3",
+						},
+					},
+					{
+						Action:     someAction,
+						Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+						SSHUsers: map[string]string{
+							"*":     "ubuntu",
+							"alice": "thealice",
+							"mark":  "markthe",
+						},
+						AcceptEnv: []string{"*"},
+					},
+				},
+			},
+			ci:            &sshConnInfo{sshUser: "alice"},
+			wantUser:      "thealice",
+			wantAcceptEnv: []string{"EXAMPLE", "?_?", "TEST_*"},
+			wantMatch:     true,
+		},
+		{
+			name: "no-matches-returns-failure",
+			policy: &tailcfg.SSHPolicy{
+				Rules: []*tailcfg.SSHRule{
+					{
+						Action:     someAction,
+						Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+						SSHUsers: map[string]string{
+							"other": "other1",
+						},
+					},
+					{
+						Action:     someAction,
+						Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+						SSHUsers: map[string]string{
+							"fedora": "ubuntu",
+						},
+						AcceptEnv: []string{"EXAMPLE", "?_?", "TEST_*"},
+					},
+					{
+						Action:     someAction,
+						Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+						SSHUsers: map[string]string{
+							"other2": "other3",
+						},
+					},
+					{
+						Action:     someAction,
+						Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+						SSHUsers: map[string]string{
+							"mark": "markthe",
+						},
+						AcceptEnv: []string{"*"},
+					},
+				},
+			},
+			ci:            &sshConnInfo{sshUser: "alice"},
+			wantUser:      "",
+			wantAcceptEnv: nil,
+			wantMatch:     false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &conn{
+				info: tt.ci,
+				srv:  &server{logf: t.Logf},
+			}
+			got, gotUser, gotAcceptEnv, match := c.evalSSHPolicy(tt.policy, nil)
+			if match != tt.wantMatch {
+				t.Errorf("match = %v; want %v", match, tt.wantMatch)
+			}
+			if gotUser != tt.wantUser {
+				t.Errorf("user = %q; want %q", gotUser, tt.wantUser)
+			}
+			if tt.wantMatch == true && got == nil {
+				t.Errorf("expected non-nil action on success")
+			}
+			if !slices.Equal(gotAcceptEnv, tt.wantAcceptEnv) {
+				t.Errorf("acceptEnv = %v; want %v", gotAcceptEnv, tt.wantAcceptEnv)
+			}
+		})
+	}
+}
 
 // localState implements ipnLocalBackend for testing.
 type localState struct {
@@ -282,7 +421,11 @@ func (ts *localState) NetMap() *netmap.NetworkMap {
 	}
 }
 
-func (ts *localState) WhoIs(ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
+func (ts *localState) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
+	if proto != "tcp" {
+		return tailcfg.NodeView{}, tailcfg.UserProfile{}, false
+	}
+
 	return (&tailcfg.Node{
 			ID:       2,
 			StableID: "peer-id",
@@ -627,7 +770,7 @@ func TestSSHRecordingNonInteractive(t *testing.T) {
 	wg.Wait()
 
 	<-ctx.Done() // wait for recording to finish
-	var ch CastHeader
+	var ch sessionrecording.CastHeader
 	if err := json.NewDecoder(bytes.NewReader(recording)).Decode(&ch); err != nil {
 		t.Fatal(err)
 	}
@@ -822,7 +965,7 @@ func TestSSHAuthFlow(t *testing.T) {
 func TestSSH(t *testing.T) {
 	var logf logger.Logf = t.Logf
 	sys := &tsd.System{}
-	eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set)
+	eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1016,7 +1159,7 @@ func TestPublicKeyFetching(t *testing.T) {
 		pubKeyHTTPClient: ts.Client(),
 		timeNow:          clock.Now,
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		got, err := srv.fetchPublicKeysURL(keys + "/alice.keys")
 		if err != nil {
 			t.Fatal(err)

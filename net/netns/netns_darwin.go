@@ -18,7 +18,6 @@ import (
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
 	"tailscale.com/envknob"
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
@@ -62,12 +61,12 @@ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string)
 	// Helper so we can log errors.
 	defaultIdx := func() (int, error) {
 		if netMon == nil {
-			idx, err := interfaces.DefaultRouteInterfaceIndex()
+			idx, err := netmon.DefaultRouteInterfaceIndex()
 			if err != nil {
 				// It's somewhat common for there to be no default gateway route
 				// (e.g. on a phone with no connectivity), don't log those errors
 				// since they are expected.
-				if !errors.Is(err, interfaces.ErrNoGatewayIndexFound) {
+				if !errors.Is(err, netmon.ErrNoGatewayIndexFound) {
 					logf("[unexpected] netns: DefaultRouteInterfaceIndex: %v", err)
 				}
 				return -1, err
@@ -90,16 +89,12 @@ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string)
 		return defaultIdx()
 	}
 
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		// No port number; use the string directly.
-		host = address
-	}
-
 	// If the address doesn't parse, use the default index.
-	addr, err := netip.ParseAddr(host)
+	addr, err := parseAddress(address)
 	if err != nil {
-		logf("[unexpected] netns: error parsing address %q: %v", host, err)
+		if err != errUnspecifiedHost {
+			logf("[unexpected] netns: error parsing address %q: %v", address, err)
+		}
 		return defaultIdx()
 	}
 

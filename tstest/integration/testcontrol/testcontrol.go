@@ -13,7 +13,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"maps"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -69,6 +70,9 @@ type Server struct {
 	// nodeSubnetRoutes is a list of subnet routes that are served
 	// by the specified node.
 	nodeSubnetRoutes map[key.NodePublic][]netip.Prefix
+
+	// peerIsJailed is the set of peers that are jailed for a node.
+	peerIsJailed map[key.NodePublic]map[key.NodePublic]bool // node => peer => isJailed
 
 	// masquerades is the set of masquerades that should be applied to
 	// MapResponses sent to clients. It is keyed by the requesting nodes
@@ -362,6 +366,7 @@ func (s *Server) serveMachine(w http.ResponseWriter, r *http.Request) {
 func (s *Server) SetSubnetRoutes(nodeKey key.NodePublic, routes []netip.Prefix) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.logf("Setting subnet routes for %s: %v", nodeKey.ShortString(), routes)
 	mak.Set(&s.nodeSubnetRoutes, nodeKey, routes)
 }
 
@@ -376,6 +381,20 @@ type MasqueradePair struct {
 	Node              key.NodePublic
 	Peer              key.NodePublic
 	NodeMasqueradesAs netip.Addr
+}
+
+// SetJailed sets b to be jailed when it is a peer of a.
+func (s *Server) SetJailed(a, b key.NodePublic, jailed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.peerIsJailed == nil {
+		s.peerIsJailed = map[key.NodePublic]map[key.NodePublic]bool{}
+	}
+	if s.peerIsJailed[a] == nil {
+		s.peerIsJailed[a] = map[key.NodePublic]bool{}
+	}
+	s.peerIsJailed[a][b] = jailed
+	s.updateLocked("SetJailed", s.nodeIDsLocked(0))
 }
 
 // SetMasqueradeAddresses sets the masquerade addresses for the server.
@@ -585,7 +604,7 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 		j, _ := json.MarshalIndent(req, "", "\t")
 		log.Printf("Got %T: %s", req, j)
 	}
-	if s.RequireAuthKey != "" && req.Auth.AuthKey != s.RequireAuthKey {
+	if s.RequireAuthKey != "" && (req.Auth == nil || req.Auth.AuthKey != s.RequireAuthKey) {
 		res := must.Get(s.encode(false, tailcfg.RegisterResponse{
 			Error: "invalid authkey",
 		}))
@@ -756,7 +775,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 		go panic(fmt.Sprintf("bad map request: %v", err))
 	}
 
-	jitter := time.Duration(rand.Intn(8000)) * time.Millisecond
+	jitter := rand.N(8 * time.Second)
 	keepAlive := 50*time.Second + jitter
 
 	node := s.Node(req.NodeKey)
@@ -914,7 +933,12 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 		// node key rotated away (once test server supports that)
 		return nil, nil
 	}
-	node.CapMap = s.nodeCapMaps[nk]
+
+	s.mu.Lock()
+	nodeCapMap := maps.Clone(s.nodeCapMaps[nk])
+	s.mu.Unlock()
+
+	node.CapMap = nodeCapMap
 	node.Capabilities = append(node.Capabilities, tailcfg.NodeAttrDisableUPnP)
 
 	user, _ := s.getUser(nk)
@@ -939,6 +963,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 
 	s.mu.Lock()
 	nodeMasqs := s.masquerades[node.Key]
+	jailed := maps.Clone(s.peerIsJailed[node.Key])
 	s.mu.Unlock()
 	for _, p := range s.AllNodes() {
 		if p.StableID == node.StableID {
@@ -951,6 +976,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 				p.SelfNodeV4MasqAddrForThisPeer = ptr.To(masqIP)
 			}
 		}
+		p.IsJailed = jailed[p.Key]
 
 		s.mu.Lock()
 		peerAddress := s.masquerades[p.Key][node.Key]
@@ -993,6 +1019,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	res.Node.PrimaryRoutes = s.nodeSubnetRoutes[nk]
 	res.Node.AllowedIPs = append(res.Node.Addresses, s.nodeSubnetRoutes[nk]...)
 
 	// Consume a PingRequest while protected by mutex if it exists

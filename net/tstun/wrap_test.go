@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"expvar"
 	"fmt"
 	"net/netip"
 	"reflect"
@@ -36,7 +37,9 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netlogtype"
 	"tailscale.com/types/ptr"
+	"tailscale.com/types/views"
 	"tailscale.com/util/must"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
@@ -156,10 +159,10 @@ func netports(netPorts ...string) (ret []filter.NetPortRange) {
 }
 
 func setfilter(logf logger.Logf, tun *Wrapper) {
-	protos := []ipproto.Proto{
+	protos := views.SliceOf([]ipproto.Proto{
 		ipproto.TCP,
 		ipproto.UDP,
-	}
+	})
 	matches := []filter.Match{
 		{IPProto: protos, Srcs: nets("5.6.7.8"), Dsts: netports("1.2.3.4:89-90")},
 		{IPProto: protos, Srcs: nets("1.2.3.4"), Dsts: netports("5.6.7.8:98")},
@@ -167,12 +170,13 @@ func setfilter(logf logger.Logf, tun *Wrapper) {
 	var sb netipx.IPSetBuilder
 	sb.AddPrefix(netip.MustParsePrefix("1.2.0.0/16"))
 	ipSet, _ := sb.IPSet()
-	tun.SetFilter(filter.New(matches, ipSet, ipSet, nil, logf))
+	tun.SetFilter(filter.New(matches, nil, ipSet, ipSet, nil, logf))
 }
 
 func newChannelTUN(logf logger.Logf, secure bool) (*tuntest.ChannelTUN, *Wrapper) {
 	chtun := tuntest.NewChannelTUN()
-	tun := Wrap(logf, chtun.TUN())
+	reg := new(usermetric.Registry)
+	tun := Wrap(logf, chtun.TUN(), reg)
 	if secure {
 		setfilter(logf, tun)
 	} else {
@@ -184,7 +188,8 @@ func newChannelTUN(logf logger.Logf, secure bool) (*tuntest.ChannelTUN, *Wrapper
 
 func newFakeTUN(logf logger.Logf, secure bool) (*fakeTUN, *Wrapper) {
 	ftun := NewFake()
-	tun := Wrap(logf, ftun)
+	reg := new(usermetric.Registry)
+	tun := Wrap(logf, ftun, reg)
 	if secure {
 		setfilter(logf, tun)
 	} else {
@@ -222,7 +227,7 @@ func TestReadAndInject(t *testing.T) {
 	var seen = make(map[string]bool)
 	sizes := make([]int, 1)
 	// We expect the same packets back, in no particular order.
-	for i := 0; i < len(written)+len(injected); i++ {
+	for i := range len(written) + len(injected) {
 		packet := buf[:]
 		buffs := [][]byte{packet}
 		numPackets, err := tun.Read(buffs, sizes, 0)
@@ -283,7 +288,7 @@ func TestWriteAndInject(t *testing.T) {
 
 	seen := make(map[string]bool)
 	// We expect the same packets back, in no particular order.
-	for i := 0; i < len(written)+len(injected); i++ {
+	for i := range len(written) + len(injected) {
 		packet := <-chtun.Inbound
 		got := string(packet)
 		t.Logf("read %d: got %s", i, got)
@@ -314,8 +319,14 @@ func mustHexDecode(s string) []byte {
 }
 
 func TestFilter(t *testing.T) {
+
 	chtun, tun := newChannelTUN(t.Logf, true)
 	defer tun.Close()
+
+	// Reset the metrics before test. These are global
+	// so the different tests might have affected them.
+	tun.metrics.inboundDroppedPacketsTotal.ResetAllForTest()
+	tun.metrics.outboundDroppedPacketsTotal.ResetAllForTest()
 
 	type direction int
 
@@ -428,6 +439,28 @@ func TestFilter(t *testing.T) {
 			}
 		})
 	}
+
+	var metricInboundDroppedPacketsACL, metricInboundDroppedPacketsErr, metricOutboundDroppedPacketsACL int64
+	if m, ok := tun.metrics.inboundDroppedPacketsTotal.Get(dropPacketLabel{Reason: DropReasonACL}).(*expvar.Int); ok {
+		metricInboundDroppedPacketsACL = m.Value()
+	}
+	if m, ok := tun.metrics.inboundDroppedPacketsTotal.Get(dropPacketLabel{Reason: DropReasonError}).(*expvar.Int); ok {
+		metricInboundDroppedPacketsErr = m.Value()
+	}
+	if m, ok := tun.metrics.outboundDroppedPacketsTotal.Get(dropPacketLabel{Reason: DropReasonACL}).(*expvar.Int); ok {
+		metricOutboundDroppedPacketsACL = m.Value()
+	}
+
+	assertMetricPackets(t, "inACL", 3, metricInboundDroppedPacketsACL)
+	assertMetricPackets(t, "inError", 0, metricInboundDroppedPacketsErr)
+	assertMetricPackets(t, "outACL", 1, metricOutboundDroppedPacketsACL)
+}
+
+func assertMetricPackets(t *testing.T, metricName string, want, got int64) {
+	t.Helper()
+	if want != got {
+		t.Errorf("%s got unexpected value, got %d, want %d", metricName, got, want)
+	}
 }
 
 func TestAllocs(t *testing.T) {
@@ -470,7 +503,7 @@ func BenchmarkWrite(b *testing.B) {
 	defer tun.Close()
 
 	packet := [][]byte{udp4("5.6.7.8", "1.2.3.4", 89, 89)}
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, err := ftun.Write(packet, 0)
 		if err != nil {
 			b.Errorf("err = %v; want nil", err)
@@ -489,6 +522,7 @@ func TestAtomic64Alignment(t *testing.T) {
 }
 
 func TestPeerAPIBypass(t *testing.T) {
+	reg := new(usermetric.Registry)
 	wrapperWithPeerAPI := &Wrapper{
 		PeerAPIPort: func(ip netip.Addr) (port uint16, ok bool) {
 			if ip == netip.MustParseAddr("100.64.1.2") {
@@ -496,6 +530,7 @@ func TestPeerAPIBypass(t *testing.T) {
 			}
 			return
 		},
+		metrics: registerMetrics(reg),
 	}
 
 	tests := []struct {
@@ -511,13 +546,16 @@ func TestPeerAPIBypass(t *testing.T) {
 				PeerAPIPort: func(netip.Addr) (port uint16, ok bool) {
 					return 60000, true
 				},
+				metrics: registerMetrics(reg),
 			},
 			pkt:  tcp4syn("1.2.3.4", "100.64.1.2", 1234, 60000),
 			want: filter.Drop,
 		},
 		{
-			name:   "reject_with_filter",
-			w:      &Wrapper{},
+			name: "reject_with_filter",
+			w: &Wrapper{
+				metrics: registerMetrics(reg),
+			},
 			filter: filter.NewAllowNone(logger.Discard, new(netipx.IPSet)),
 			pkt:    tcp4syn("1.2.3.4", "100.64.1.2", 1234, 60000),
 			want:   filter.Drop,
@@ -551,7 +589,7 @@ func TestPeerAPIBypass(t *testing.T) {
 			tt.w.SetFilter(tt.filter)
 			tt.w.disableTSMPRejected = true
 			tt.w.logf = t.Logf
-			if got := tt.w.filterPacketInboundFromWireGuard(p, nil); got != tt.want {
+			if got, _ := tt.w.filterPacketInboundFromWireGuard(p, nil, nil, nil); got != tt.want {
 				t.Errorf("got = %v; want %v", got, tt.want)
 			}
 		})
@@ -581,7 +619,7 @@ func TestFilterDiscoLoop(t *testing.T) {
 
 	p := new(packet.Parsed)
 	p.Decode(pkt)
-	got := tw.filterPacketInboundFromWireGuard(p, nil)
+	got, _ := tw.filterPacketInboundFromWireGuard(p, nil, nil, nil)
 	if got != filter.DropSilently {
 		t.Errorf("got %v; want DropSilently", got)
 	}
@@ -592,7 +630,7 @@ func TestFilterDiscoLoop(t *testing.T) {
 	memLog.Reset()
 	pp := new(packet.Parsed)
 	pp.Decode(pkt)
-	got = tw.filterPacketOutboundToWireGuard(pp)
+	got, _ = tw.filterPacketOutboundToWireGuard(pp, nil, nil)
 	if got != filter.DropSilently {
 		t.Errorf("got %v; want DropSilently", got)
 	}
@@ -601,7 +639,9 @@ func TestFilterDiscoLoop(t *testing.T) {
 	}
 }
 
-func TestNATCfg(t *testing.T) {
+// TODO(andrew-d): refactor this test to no longer use addrFam, after #11945
+// removed it in peerConfigFromWGConfig
+func TestPeerCfg_NAT(t *testing.T) {
 	node := func(ip, masqIP netip.Addr, otherAllowedIPs ...netip.Prefix) wgcfg.Peer {
 		p := wgcfg.Peer{
 			PublicKey: key.NewNode().Public(),
@@ -651,11 +691,17 @@ func TestNATCfg(t *testing.T) {
 			publicIP = netip.MustParseAddr("2001:4860:4860::8888")
 		}
 
+		type dnatTest struct {
+			src  netip.Addr
+			dst  netip.Addr
+			want netip.Addr // new destination after DNAT
+		}
+
 		tests := []struct {
 			name    string
 			wcfg    *wgcfg.Config
 			snatMap map[netip.Addr]netip.Addr // dst -> src
-			dnatMap map[netip.Addr]netip.Addr
+			dnat    []dnatTest
 		}{
 			{
 				name: "no-cfg",
@@ -665,10 +711,10 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfNativeIP,
 					subnetIP: selfNativeIP,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfEIP1,
-					selfEIP2:     selfEIP2,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfEIP1},
+					{peer2IP, selfEIP2, selfEIP2},
 				},
 			},
 			{
@@ -677,19 +723,19 @@ func TestNATCfg(t *testing.T) {
 					Addresses: selfAddrs,
 					Peers: []wgcfg.Peer{
 						node(peer1IP, noIP),
-						node(peer2IP, selfEIP1),
+						node(peer2IP, selfEIP2),
 					},
 				},
 				snatMap: map[netip.Addr]netip.Addr{
 					peer1IP:  selfNativeIP,
-					peer2IP:  selfEIP1,
+					peer2IP:  selfEIP2,
 					subnetIP: selfNativeIP,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfNativeIP,
-					selfEIP2:     selfEIP2,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfEIP1},
+					{peer2IP, selfEIP2, selfNativeIP}, // NATed
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 			{
@@ -706,11 +752,11 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfEIP2,
 					subnetIP: selfNativeIP,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfNativeIP,
-					selfEIP2:     selfNativeIP,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 			{
@@ -727,11 +773,11 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfEIP2,
 					subnetIP: selfEIP2,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfNativeIP,
-					selfEIP2:     selfNativeIP,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 			{
@@ -748,11 +794,11 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfEIP2,
 					publicIP: selfEIP2,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfNativeIP,
-					selfEIP2:     selfNativeIP,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 			{
@@ -769,11 +815,11 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfNativeIP,
 					subnetIP: selfNativeIP,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfEIP1,
-					selfEIP2:     selfEIP2,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfEIP1},
+					{peer2IP, selfEIP2, selfEIP2},
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 			{
@@ -790,29 +836,29 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfEIP2,
 					publicIP: selfEIP2,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP2:     selfNativeIP,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 		}
 
 		for _, tc := range tests {
 			t.Run(fmt.Sprintf("%v/%v", addrFam, tc.name), func(t *testing.T) {
-				ncfg := natConfigFromWGConfig(tc.wcfg, addrFam)
+				pcfg := peerConfigTableFromWGConfig(tc.wcfg)
 				for peer, want := range tc.snatMap {
-					if got := ncfg.selectSrcIP(selfNativeIP, peer); got != want {
+					if got := pcfg.selectSrcIP(selfNativeIP, peer); got != want {
 						t.Errorf("selectSrcIP[%v]: got %v; want %v", peer, got, want)
 					}
 				}
-				for dstIP, want := range tc.dnatMap {
-					if got := ncfg.mapDstIP(dstIP); got != want {
-						t.Errorf("mapDstIP[%v]: got %v; want %v", dstIP, got, want)
+				for i, dt := range tc.dnat {
+					if got := pcfg.mapDstIP(dt.src, dt.dst); got != dt.want {
+						t.Errorf("dnat[%d]: mapDstIP[%v, %v]: got %v; want %v", i, dt.src, dt.dst, got, dt.want)
 					}
 				}
 				if t.Failed() {
-					t.Logf("%v", ncfg)
+					t.Logf("%v", pcfg)
 				}
 			})
 		}
@@ -873,7 +919,10 @@ func TestCaptureHook(t *testing.T) {
 	packetBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData([]byte("InjectInboundPacketBuffer")),
 	})
-	w.InjectInboundPacketBuffer(packetBuf)
+	buffs := make([][]byte, 1)
+	buffs[0] = make([]byte, PacketStartOffset+packetBuf.Size())
+	sizes := make([]int, 1)
+	w.InjectInboundPacketBuffer(packetBuf, buffs, sizes)
 
 	packetBuf = stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData([]byte("InjectOutboundPacketBuffer")),
@@ -902,7 +951,7 @@ func TestCaptureHook(t *testing.T) {
 			pkt:  []byte("InjectOutboundPacketBuffer"),
 		},
 	}
-	for i := 0; i < len(want); i++ {
+	for i := range len(want) {
 		want[i].now = now
 	}
 	if !reflect.DeepEqual(captured, want) {

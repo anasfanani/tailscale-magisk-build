@@ -52,7 +52,7 @@ func runSSH(ctx context.Context, args []string) error {
 		return errors.New("The 'tailscale ssh' subcommand is not available on macOS builds distributed through the App Store or TestFlight.\nInstall the Standalone variant of Tailscale (download it from https://pkgs.tailscale.com), or use the regular 'ssh' client instead.")
 	}
 	if len(args) == 0 {
-		return errors.New("usage: ssh [user@]<host>")
+		return errors.New("usage: tailscale ssh [user@]<host>")
 	}
 	arg, argRest := args[0], args[1:]
 	username, host, ok := strings.Cut(arg, "@")
@@ -110,8 +110,8 @@ func runSSH(ctx context.Context, args []string) error {
 	// mode, so 'nc' isn't very useful.
 	if runtime.GOOS != "darwin" {
 		socketArg := ""
-		if rootArgs.socket != "" && rootArgs.socket != paths.DefaultTailscaledSocket() {
-			socketArg = fmt.Sprintf("--socket=%q", rootArgs.socket)
+		if localClient.Socket != "" && localClient.Socket != paths.DefaultTailscaledSocket() {
+			socketArg = fmt.Sprintf("--socket=%q", localClient.Socket)
 		}
 
 		argv = append(argv,

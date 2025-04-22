@@ -17,6 +17,7 @@ import (
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 )
@@ -59,6 +60,15 @@ relay node.
 	})(),
 }
 
+func init() {
+	ffcomplete.Args(pingCmd, func(args []string) ([]string, ffcomplete.ShellCompDirective, error) {
+		if len(args) > 1 {
+			return nil, ffcomplete.ShellCompDirectiveNoFileComp, nil
+		}
+		return completeHostOrIP(ffcomplete.LastArg(args))
+	})
+}
+
 var pingArgs struct {
 	num         int
 	size        int
@@ -95,7 +105,7 @@ func runPing(ctx context.Context, args []string) error {
 	}
 
 	if len(args) != 1 || args[0] == "" {
-		return errors.New("usage: ping <hostname-or-IP>")
+		return errors.New("usage: tailscale ping <hostname-or-IP>")
 	}
 	var ip string
 

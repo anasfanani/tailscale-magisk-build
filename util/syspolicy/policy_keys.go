@@ -3,7 +3,9 @@
 
 package syspolicy
 
-type Key string
+import "tailscale.com/util/syspolicy/setting"
+
+type Key = setting.Key
 
 const (
 	// Keys with a string value
@@ -58,6 +60,9 @@ const (
 	// installations and uses the Sparkle naming convention, even though it does
 	// not actually control updates, merely the UI for that setting.
 	AutoUpdateVisibility Key = "ApplyUpdates"
+	// SuggestedExitNodeVisibility controls the visibility of suggested exit nodes in the client GUI.
+	// When this system policy is set to 'hide', an exit node suggestion won't be presented to the user as part of the exit nodes picker.
+	SuggestedExitNodeVisibility Key = "SuggestedExitNode"
 
 	// Keys with a string value formatted for use with time.ParseDuration().
 	KeyExpirationNoticeTime Key = "KeyExpirationNotice" // default 24 hours
@@ -73,6 +78,10 @@ const (
 	// Key is a string value that specifies an option: "always", "never", "user-decides".
 	// The default is "user-decides" unless otherwise stated.
 	PostureChecking Key = "PostureChecking"
+	// DeviceSerialNumber is the serial number of the device that is running Tailscale.
+	// This is used on iOS/tvOS to allow IT administrators to manually give us a serial number via MDM.
+	// We are unable to programmatically get the serial number from IOKit due to sandboxing restrictions.
+	DeviceSerialNumber Key = "DeviceSerialNumber"
 
 	// ManagedByOrganizationName indicates the name of the organization managing the Tailscale
 	// install. It is displayed inside the client UI in a prominent location.
@@ -84,4 +93,20 @@ const (
 	// ManagedByURL is a valid URL pointing to a support help desk for Tailscale within the
 	// organization. A button in the client UI provides easy access to this URL.
 	ManagedByURL Key = "ManagedByURL"
+
+	// AuthKey is an auth key that will be used to login whenever the backend starts. This can be used to
+	// automatically authenticate managed devices, without requiring user interaction.
+	AuthKey Key = "AuthKey"
+
+	// MachineCertificateSubject is the exact name of a Subject that needs
+	// to be present in an identity's certificate chain to sign a RegisterRequest,
+	// formatted as per pkix.Name.String(). The Subject may be that of the identity
+	// itself, an intermediate CA or the root CA.
+	//
+	// Example: "CN=Tailscale Inc Test Root CA,OU=Tailscale Inc Test Certificate Authority,O=Tailscale Inc,ST=ON,C=CA"
+	MachineCertificateSubject Key = "MachineCertificateSubject"
+
+	// Keys with a string array value.
+	// AllowedSuggestedExitNodes's string array value is a list of exit node IDs that restricts which exit nodes are considered when generating suggestions for exit nodes.
+	AllowedSuggestedExitNodes Key = "AllowedSuggestedExitNodes"
 )

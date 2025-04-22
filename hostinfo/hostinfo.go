@@ -27,6 +27,7 @@ import (
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/lineread"
 	"tailscale.com/version"
+	"tailscale.com/version/distro"
 )
 
 var started = time.Now()
@@ -199,8 +200,13 @@ func SetFirewallMode(v string) { firewallMode.Store(v) }
 
 // SetPackage sets the packaging type for the app.
 //
-// As of 2022-03-25, this is used by Android ("nogoogle" for the
-// F-Droid build) and tsnet (set to "tsnet").
+// For Android, the possible values are:
+// - "googleplay": installed from Google Play Store.
+// - "fdroid": installed from the F-Droid repository.
+// - "amazon": installed from the Amazon Appstore.
+// - "unknown": when the installer package name is null.
+// - "unknown$installerPackageName": for unrecognized installer package names, prefixed by "unknown".
+// Additionally, tsnet sets this value to "tsnet".
 func SetPackage(v string) { packagingType.Store(v) }
 
 // SetApp sets the app type for the app.
@@ -462,3 +468,15 @@ func IsSELinuxEnforcing() bool {
 	out, _ := exec.Command("getenforce").Output()
 	return string(bytes.TrimSpace(out)) == "Enforcing"
 }
+
+// IsNATLabGuestVM reports whether the current host is a NAT Lab guest VM.
+func IsNATLabGuestVM() bool {
+	if runtime.GOOS == "linux" && distro.Get() == distro.Gokrazy {
+		cmdLine, _ := os.ReadFile("/proc/cmdline")
+		return bytes.Contains(cmdLine, []byte("tailscale-tta=1"))
+	}
+	return false
+}
+
+// NAT Lab VMs have a unique MAC address prefix.
+// See

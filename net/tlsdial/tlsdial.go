@@ -26,6 +26,7 @@ import (
 
 	"tailscale.com/envknob"
 	"tailscale.com/health"
+	"tailscale.com/hostinfo"
 )
 
 var counterFallbackOK int32 // atomic
@@ -46,7 +47,8 @@ var tlsdialWarningPrinted sync.Map // map[string]bool
 // Config returns a tls.Config for connecting to a server.
 // If base is non-nil, it's cloned as the base config before
 // being configured and returned.
-func Config(host string, base *tls.Config) *tls.Config {
+// If ht is non-nil, it's used to report health errors.
+func Config(host string, ht *health.Tracker, base *tls.Config) *tls.Config {
 	var conf *tls.Config
 	if base == nil {
 		conf = new(tls.Config)
@@ -75,15 +77,36 @@ func Config(host string, base *tls.Config) *tls.Config {
 	// own cert verification, as do the same work that it'd do
 	// (with the baked-in fallback root) in the VerifyConnection hook.
 	conf.InsecureSkipVerify = true
-	conf.VerifyConnection = func(cs tls.ConnectionState) error {
+	conf.VerifyConnection = func(cs tls.ConnectionState) (retErr error) {
+		if host == "log.tailscale.io" && hostinfo.IsNATLabGuestVM() {
+			// Allow log.tailscale.io TLS MITM for integration tests when
+			// the client's running within a NATLab VM.
+			return nil
+		}
+
 		// Perform some health checks on this certificate before we do
 		// any verification.
-		if certIsSelfSigned(cs.PeerCertificates[0]) {
-			// Self-signed certs are never valid.
-			health.SetTLSConnectionError(cs.ServerName, fmt.Errorf("certificate is self-signed"))
-		} else {
-			// Ensure we clear any error state for this ServerName.
-			health.SetTLSConnectionError(cs.ServerName, nil)
+		var selfSignedIssuer string
+		if certs := cs.PeerCertificates; len(certs) > 0 && certIsSelfSigned(certs[0]) {
+			selfSignedIssuer = certs[0].Issuer.String()
+		}
+		if ht != nil {
+			defer func() {
+				if retErr != nil && selfSignedIssuer != "" {
+					// Self-signed certs are never valid.
+					//
+					// TODO(bradfitz): plumb down the selfSignedIssuer as a
+					// structured health warning argument.
+					ht.SetTLSConnectionError(cs.ServerName, fmt.Errorf("likely intercepted connection; certificate is self-signed by %v", selfSignedIssuer))
+				} else {
+					// Ensure we clear any error state for this ServerName.
+					ht.SetTLSConnectionError(cs.ServerName, nil)
+					if selfSignedIssuer != "" {
+						// Log the self-signed issuer, but don't treat it as an error.
+						log.Printf("tlsdial: warning: server cert for %q passed x509 validation but is self-signed by %q", host, selfSignedIssuer)
+					}
+				}
+			}()
 		}
 
 		// First try doing x509 verification with the system's
@@ -204,7 +227,7 @@ func NewTransport() *http.Transport {
 				return nil, err
 			}
 			var d tls.Dialer
-			d.Config = Config(host, nil)
+			d.Config = Config(host, nil, nil)
 			return d.DialContext(ctx, network, addr)
 		},
 	}

@@ -24,11 +24,19 @@ var ConnectorKind = "Connector"
 // +kubebuilder:printcolumn:name="IsExitNode",type="string",JSONPath=`.status.isExitNode`,description="Whether this Connector instance defines an exit node."
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=`.status.conditions[?(@.type == "ConnectorReady")].reason`,description="Status of the deployed Connector resources."
 
+// Connector defines a Tailscale node that will be deployed in the cluster. The
+// node can be configured to act as a Tailscale subnet router and/or a Tailscale
+// exit node.
+// Connector is a cluster-scoped resource.
+// More info:
+// https://tailscale.com/kb/1441/kubernetes-operator-connector
 type Connector struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// ConnectorSpec describes the desired Tailscale component.
+	// More info:
+	// https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
 	Spec ConnectorSpec `json:"spec"`
 
 	// ConnectorStatus describes the status of the Connector. This is set
@@ -54,7 +62,7 @@ type ConnectorSpec struct {
 	// To autoapprove the subnet routes or exit node defined by a Connector,
 	// you can configure Tailscale ACLs to give these tags the necessary
 	// permissions.
-	// See https://tailscale.com/kb/1018/acls/#auto-approvers-for-routes-and-exit-nodes.
+	// See https://tailscale.com/kb/1337/acl-syntax#autoapprovers.
 	// If you specify custom tags here, you must also make the operator an owner of these tags.
 	// See  https://tailscale.com/kb/1236/kubernetes-operator/#setting-up-the-kubernetes-operator.
 	// Tags cannot be changed once a Connector node has been created.
@@ -140,7 +148,7 @@ type ConnectorStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	// +optional
-	Conditions []ConnectorCondition `json:"conditions"`
+	Conditions []metav1.Condition `json:"conditions"`
 	// SubnetRoutes are the routes currently exposed to tailnet via this
 	// Connector instance.
 	// +optional
@@ -148,44 +156,35 @@ type ConnectorStatus struct {
 	// IsExitNode is set to true if the Connector acts as an exit node.
 	// +optional
 	IsExitNode bool `json:"isExitNode"`
+	// TailnetIPs is the set of tailnet IP addresses (both IPv4 and IPv6)
+	// assigned to the Connector node.
+	// +optional
+	TailnetIPs []string `json:"tailnetIPs,omitempty"`
+	// Hostname is the fully qualified domain name of the Connector node.
+	// If MagicDNS is enabled in your tailnet, it is the MagicDNS name of the
+	// node.
+	// +optional
+	Hostname string `json:"hostname,omitempty"`
 }
 
-// ConnectorCondition contains condition information for a Connector.
-type ConnectorCondition struct {
-	// Type of the condition, known values are (`SubnetRouterReady`).
-	Type ConnectorConditionType `json:"type"`
-
-	// Status of the condition, one of ('True', 'False', 'Unknown').
-	Status metav1.ConditionStatus `json:"status"`
-
-	// LastTransitionTime is the timestamp corresponding to the last status
-	// change of this condition.
-	// +optional
-	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
-
-	// Reason is a brief machine readable explanation for the condition's last
-	// transition.
-	// +optional
-	Reason string `json:"reason,omitempty"`
-
-	// Message is a human readable description of the details of the last
-	// transition, complementing reason.
-	// +optional
-	Message string `json:"message,omitempty"`
-
-	// If set, this represents the .metadata.generation that the condition was
-	// set based upon.
-	// For instance, if .metadata.generation is currently 12, but the
-	// .status.condition[x].observedGeneration is 9, the condition is out of date
-	// with respect to the current state of the Connector.
-	// +optional
-	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
-}
-
-// ConnectorConditionType represents a Connector condition type.
-type ConnectorConditionType string
+type ConditionType string
 
 const (
-	ConnectorReady  ConnectorConditionType = `ConnectorReady`
-	ProxyClassready ConnectorConditionType = `ProxyClassReady`
+	ConnectorReady  ConditionType = `ConnectorReady`
+	ProxyClassReady ConditionType = `ProxyClassReady`
+	ProxyGroupReady ConditionType = `ProxyGroupReady`
+	ProxyReady      ConditionType = `TailscaleProxyReady` // a Tailscale-specific condition type for corev1.Service
+	RecorderReady   ConditionType = `RecorderReady`
+	// EgressSvcValid gets set on a user configured ExternalName Service that defines a tailnet target to be exposed
+	// on a ProxyGroup.
+	// Set to true if the user provided configuration is valid.
+	EgressSvcValid ConditionType = `TailscaleEgressSvcValid`
+	// EgressSvcConfigured gets set on a user configured ExternalName Service that defines a tailnet target to be exposed
+	// on a ProxyGroup.
+	// Set to true if the cluster resources for the service have been successfully configured.
+	EgressSvcConfigured ConditionType = `TailscaleEgressSvcConfigured`
+	// EgressSvcReady gets set on a user configured ExternalName Service that defines a tailnet target to be exposed
+	// on a ProxyGroup.
+	// Set to true if the service is ready to route cluster traffic.
+	EgressSvcReady ConditionType = `TailscaleEgressSvcReady`
 )

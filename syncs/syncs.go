@@ -6,6 +6,7 @@ package syncs
 
 import (
 	"context"
+	"iter"
 	"sync"
 	"sync/atomic"
 
@@ -23,10 +24,17 @@ func initClosedChan() <-chan struct{} {
 	return ch
 }
 
-// AtomicValue is the generic version of atomic.Value.
+// AtomicValue is the generic version of [atomic.Value].
 type AtomicValue[T any] struct {
 	v atomic.Value
 }
+
+// wrappedValue is used to wrap a value T in a concrete type,
+// otherwise atomic.Value.Store may panic due to mismatching types in interfaces.
+// This wrapping is not necessary for non-interface kinds of T,
+// but there is no harm in wrapping anyways.
+// See https://cs.opensource.google/go/go/+/refs/tags/go1.22.2:src/sync/atomic/value.go;l=78
+type wrappedValue[T any] struct{ v T }
 
 // Load returns the value set by the most recent Store.
 // It returns the zero value for T if the value is empty.
@@ -40,7 +48,7 @@ func (v *AtomicValue[T]) Load() T {
 func (v *AtomicValue[T]) LoadOk() (_ T, ok bool) {
 	x := v.v.Load()
 	if x != nil {
-		return x.(T), true
+		return x.(wrappedValue[T]).v, true
 	}
 	var zero T
 	return zero, false
@@ -48,22 +56,22 @@ func (v *AtomicValue[T]) LoadOk() (_ T, ok bool) {
 
 // Store sets the value of the Value to x.
 func (v *AtomicValue[T]) Store(x T) {
-	v.v.Store(x)
+	v.v.Store(wrappedValue[T]{x})
 }
 
 // Swap stores new into Value and returns the previous value.
 // It returns the zero value for T if the value is empty.
 func (v *AtomicValue[T]) Swap(x T) (old T) {
-	oldV := v.v.Swap(x)
+	oldV := v.v.Swap(wrappedValue[T]{x})
 	if oldV != nil {
-		return oldV.(T)
+		return oldV.(wrappedValue[T]).v
 	}
 	return old
 }
 
 // CompareAndSwap executes the compare-and-swap operation for the Value.
 func (v *AtomicValue[T]) CompareAndSwap(oldV, newV T) (swapped bool) {
-	return v.v.CompareAndSwap(oldV, newV)
+	return v.v.CompareAndSwap(wrappedValue[T]{oldV}, wrappedValue[T]{newV})
 }
 
 // WaitGroupChan is like a sync.WaitGroup, but has a chan that closes
@@ -245,16 +253,61 @@ func (m *Map[K, V]) Delete(key K) {
 	delete(m.m, key)
 }
 
-// Range iterates over the map in undefined order calling f for each entry.
-// Iteration stops if f returns false. Map changes are blocked during iteration.
-func (m *Map[K, V]) Range(f func(key K, value V) bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for k, v := range m.m {
-		if !f(k, v) {
-			return
+// Keys iterates over all keys in the map in an undefined order.
+// A read lock is held for the entire duration of the iteration.
+// Use the [WithLock] method instead to mutate the map during iteration.
+func (m *Map[K, V]) Keys() iter.Seq[K] {
+	return func(yield func(K) bool) {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		for k := range m.m {
+			if !yield(k) {
+				return
+			}
 		}
 	}
+}
+
+// Values iterates over all values in the map in an undefined order.
+// A read lock is held for the entire duration of the iteration.
+// Use the [WithLock] method instead to mutate the map during iteration.
+func (m *Map[K, V]) Values() iter.Seq[V] {
+	return func(yield func(V) bool) {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		for _, v := range m.m {
+			if !yield(v) {
+				return
+			}
+		}
+	}
+}
+
+// All iterates over all entries in the map in an undefined order.
+// A read lock is held for the entire duration of the iteration.
+// Use the [WithLock] method instead to mutate the map during iteration.
+func (m *Map[K, V]) All() iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		for k, v := range m.m {
+			if !yield(k, v) {
+				return
+			}
+		}
+	}
+}
+
+// WithLock calls f with the underlying map.
+// Use of m2 must not escape the duration of this call.
+// The write-lock is held for the entire duration of this call.
+func (m *Map[K, V]) WithLock(f func(m2 map[K]V)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.m == nil {
+		m.m = make(map[K]V)
+	}
+	f(m.m)
 }
 
 // Len returns the length of the map.

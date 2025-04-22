@@ -10,10 +10,14 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,11 +32,27 @@ import (
 const (
 	domain = `test$%domain.com`
 
-	remote1 = `rem ote$%1`
-	remote2 = `_rem ote$%2`
-	share11 = `sha re$%11`
-	share12 = `_sha re$%12`
-	file111 = `fi le$%111.txt`
+	remote1 = `rem ote$%<>1`
+	remote2 = `_rem ote$%<>2`
+	share11 = `sha re$%<>11`
+	share12 = `_sha re$%<>12`
+	file112 = `file112.txt`
+)
+
+var (
+	file111 = `fi le$%<>111.txt`
+)
+
+func init() {
+	if runtime.GOOS == "windows" {
+		// file with less than and greater than doesn't work on Windows
+		file111 = `fi le$%111.txt`
+	}
+}
+
+var (
+	lockRootRegex  = regexp.MustCompile(`<D:lockroot><D:href>/?([^<]*)/?</D:href>`)
+	lockTokenRegex = regexp.MustCompile(`<D:locktoken><D:href>([0-9]+)/?</D:href>`)
 )
 
 func init() {
@@ -81,11 +101,265 @@ func TestFileManipulation(t *testing.T) {
 	s.checkFileStatus(remote1, share11, file111)
 	s.checkFileContents(remote1, share11, file111)
 
-	s.addShare(remote1, share12, drive.PermissionReadOnly)
-	s.writeFile("writing file to read-only remote should fail", remote1, share12, file111, "hello world", false)
+	s.renameFile("renaming file across shares should fail", remote1, share11, file111, share12, file112, false)
 
+	s.renameFile("renaming file in same share should succeed", remote1, share11, file111, share11, file112, true)
+	s.checkFileContents(remote1, share11, file112)
+
+	s.addShare(remote1, share12, drive.PermissionReadOnly)
 	s.writeFile("writing file to non-existent remote should fail", "non-existent", share11, file111, "hello world", false)
 	s.writeFile("writing file to non-existent share should fail", remote1, "non-existent", file111, "hello world", false)
+}
+
+func TestPermissions(t *testing.T) {
+	s := newSystem(t)
+
+	s.addRemote(remote1)
+	s.addShare(remote1, share12, drive.PermissionReadOnly)
+
+	s.writeFile("writing file to read-only remote should fail", remote1, share12, file111, "hello world", false)
+	if err := s.client.Mkdir(path.Join(remote1, share12), 0644); err == nil {
+		t.Error("making directory on read-only remote should fail")
+	}
+
+	// Now, write file directly to file system so that we can test permissions
+	// on other operations.
+	s.write(remote1, share12, file111, "hello world")
+	if err := s.client.Remove(pathTo(remote1, share12, file111)); err == nil {
+		t.Error("deleting file from read-only remote should fail")
+	}
+	if err := s.client.Rename(pathTo(remote1, share12, file111), pathTo(remote1, share12, file112), true); err == nil {
+		t.Error("moving file on read-only remote should fail")
+	}
+}
+
+// TestSecretTokenAuth verifies that the fileserver running at localhost cannot
+// be accessed directly without the correct secret token. This matters because
+// if a victim can be induced to visit the localhost URL and access a malicious
+// file on their own share, it could allow a Mark-of-the-Web bypass attack.
+func TestSecretTokenAuth(t *testing.T) {
+	s := newSystem(t)
+
+	fileserverAddr := s.addRemote(remote1)
+	s.addShare(remote1, share11, drive.PermissionReadWrite)
+	s.writeFile("writing file to read/write remote should succeed", remote1, share11, file111, "hello world", true)
+
+	client := &http.Client{
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+	addr := strings.Split(fileserverAddr, "|")[1]
+	wrongSecret, err := generateSecretToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := fmt.Sprintf("http://%s/%s/%s", addr, wrongSecret, url.PathEscape(file111))
+	resp, err := client.Get(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected %d for incorrect secret token, but got %d", http.StatusForbidden, resp.StatusCode)
+	}
+}
+
+func TestLOCK(t *testing.T) {
+	s := newSystem(t)
+
+	s.addRemote(remote1)
+	s.addShare(remote1, share11, drive.PermissionReadWrite)
+	s.writeFile("writing file to read/write remote should succeed", remote1, share11, file111, "hello world", true)
+
+	client := &http.Client{
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+
+	u := fmt.Sprintf("http://%s/%s/%s/%s/%s",
+		s.local.l.Addr(),
+		url.PathEscape(domain),
+		url.PathEscape(remote1),
+		url.PathEscape(share11),
+		url.PathEscape(file111))
+
+	// First acquire a lock with a short timeout
+	req, err := http.NewRequest("LOCK", u, strings.NewReader(lockBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Depth", "infinity")
+	req.Header.Set("Timeout", "Second-1")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected LOCK to succeed, but got status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	submatches := lockRootRegex.FindStringSubmatch(string(body))
+	if len(submatches) != 2 {
+		t.Fatal("failed to find lockroot")
+	}
+	want := shared.EscapeForXML(pathTo(remote1, share11, file111))
+	got := submatches[1]
+	if got != want {
+		t.Fatalf("want lockroot %q, got %q", want, got)
+	}
+
+	submatches = lockTokenRegex.FindStringSubmatch(string(body))
+	if len(submatches) != 2 {
+		t.Fatal("failed to find locktoken")
+	}
+	lockToken := submatches[1]
+	ifHeader := fmt.Sprintf("<%s> (<%s>)", u, lockToken)
+
+	// Then refresh the lock with a longer timeout
+	req, err = http.NewRequest("LOCK", u, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Depth", "infinity")
+	req.Header.Set("Timeout", "Second-600")
+	req.Header.Set("If", ifHeader)
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected LOCK refresh to succeed, but got status %d", resp.StatusCode)
+	}
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	submatches = lockRootRegex.FindStringSubmatch(string(body))
+	if len(submatches) != 2 {
+		t.Fatal("failed to find lockroot after refresh")
+	}
+	want = shared.EscapeForXML(pathTo(remote1, share11, file111))
+	got = submatches[1]
+	if got != want {
+		t.Fatalf("want lockroot after refresh %q, got %q", want, got)
+	}
+
+	submatches = lockTokenRegex.FindStringSubmatch(string(body))
+	if len(submatches) != 2 {
+		t.Fatal("failed to find locktoken after refresh")
+	}
+	if submatches[1] != lockToken {
+		t.Fatalf("on refresh, lock token changed from %q to %q", lockToken, submatches[1])
+	}
+
+	// Then wait past the original timeout, then try to delete without the lock
+	// (should fail)
+	time.Sleep(1 * time.Second)
+	req, err = http.NewRequest("DELETE", u, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	resp, err = client.Do(req)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 423 {
+		t.Fatalf("deleting without lock token should fail with 423, but got %d", resp.StatusCode)
+	}
+
+	// Then delete with the lock (should succeed)
+	req, err = http.NewRequest("DELETE", u, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	req.Header.Set("If", ifHeader)
+	resp, err = client.Do(req)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 204 {
+		t.Fatalf("deleting with lock token should have succeeded with 204, but got %d", resp.StatusCode)
+	}
+}
+
+func TestUNLOCK(t *testing.T) {
+	s := newSystem(t)
+
+	s.addRemote(remote1)
+	s.addShare(remote1, share11, drive.PermissionReadWrite)
+	s.writeFile("writing file to read/write remote should succeed", remote1, share11, file111, "hello world", true)
+
+	client := &http.Client{
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+
+	u := fmt.Sprintf("http://%s/%s/%s/%s/%s",
+		s.local.l.Addr(),
+		url.PathEscape(domain),
+		url.PathEscape(remote1),
+		url.PathEscape(share11),
+		url.PathEscape(file111))
+
+	// Acquire a lock
+	req, err := http.NewRequest("LOCK", u, strings.NewReader(lockBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Depth", "infinity")
+	req.Header.Set("Timeout", "Second-600")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected LOCK to succeed, but got status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	submatches := lockTokenRegex.FindStringSubmatch(string(body))
+	if len(submatches) != 2 {
+		t.Fatal("failed to find locktoken")
+	}
+	lockToken := submatches[1]
+
+	// Release the lock
+	req, err = http.NewRequest("UNLOCK", u, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Lock-Token", fmt.Sprintf("<%s>", lockToken))
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 204 {
+		t.Fatalf("expected UNLOCK to succeed with a 204, but got status %d", resp.StatusCode)
+	}
+
+	// Then delete without the lock (should succeed)
+	req, err = http.NewRequest("DELETE", u, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	resp, err = client.Do(req)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 204 {
+		t.Fatalf("deleting without lock should have succeeded with 204, but got %d", resp.StatusCode)
+	}
 }
 
 type local struct {
@@ -127,7 +401,7 @@ func newSystem(t *testing.T) *system {
 	// Make sure we don't leak goroutines
 	tstest.ResourceCheck(t)
 
-	fs := NewFileSystemForLocal(log.Printf)
+	fs := newFileSystemForLocal(log.Printf, nil)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to Listen: %s", err)
@@ -156,7 +430,7 @@ func newSystem(t *testing.T) *system {
 	return s
 }
 
-func (s *system) addRemote(name string) {
+func (s *system) addRemote(name string) string {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		s.t.Fatalf("failed to Listen: %s", err)
@@ -195,6 +469,8 @@ func (s *system) addRemote(name string) {
 			DisableKeepAlives:     true,
 			ResponseHeaderTimeout: 5 * time.Second,
 		})
+
+	return fileServer.Addr()
 }
 
 func (s *system) addShare(remoteName, shareName string, permission drive.Permission) {
@@ -241,7 +517,18 @@ func (s *system) writeFile(label, remoteName, shareName, name, contents string, 
 	if expectSuccess && err != nil {
 		s.t.Fatalf("%v: expected success writing file %q, but got error %v", label, path, err)
 	} else if !expectSuccess && err == nil {
-		s.t.Fatalf("%v: expected error writing file %q", label, path)
+		s.t.Fatalf("%v: expected error writing file %q, but got no error", label, path)
+	}
+}
+
+func (s *system) renameFile(label, remoteName, fromShare, fromFile, toShare, toFile string, expectSuccess bool) {
+	fromPath := pathTo(remoteName, fromShare, fromFile)
+	toPath := pathTo(remoteName, toShare, toFile)
+	err := s.client.Rename(fromPath, toPath, true)
+	if expectSuccess && err != nil {
+		s.t.Fatalf("%v: expected success moving file %q to %q, but got error %v", label, fromPath, toPath, err)
+	} else if !expectSuccess && err == nil {
+		s.t.Fatalf("%v: expected error moving file %q to %q, but got no error", label, fromPath, toPath)
 	}
 }
 
@@ -306,6 +593,14 @@ func (s *system) read(remoteName, shareName, name string) string {
 	}
 
 	return string(b)
+}
+
+func (s *system) write(remoteName, shareName, name, contents string) {
+	filename := filepath.Join(s.remotes[remoteName].shares[shareName], name)
+	err := os.WriteFile(filename, []byte(contents), 0644)
+	if err != nil {
+		s.t.Fatalf("failed to WriteFile: %s", err)
+	}
 }
 
 func (s *system) readViaWebDAV(remoteName, shareName, name string) string {
@@ -408,3 +703,9 @@ func (a *noopAuthenticator) Clone() gowebdav.Authenticator {
 func (a *noopAuthenticator) Close() error {
 	return nil
 }
+
+const lockBody = `<?xml version="1.0" encoding="utf-8" ?> 
+<D:lockinfo xmlns:D='DAV:'> 
+  <D:lockscope><D:exclusive/></D:lockscope> 
+  <D:locktype><D:write/></D:locktype> 
+</D:lockinfo>`

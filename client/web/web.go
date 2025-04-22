@@ -17,7 +17,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +34,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
 	"tailscale.com/util/httpm"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
@@ -111,11 +111,6 @@ const (
 	// the source's Tailscale identity. If the source browser does not have
 	// a valid session, a readonly version of the app is displayed.
 	ManageServerMode ServerMode = "manage"
-)
-
-var (
-	exitNodeRouteV4 = netip.MustParsePrefix("0.0.0.0/0")
-	exitNodeRouteV6 = netip.MustParsePrefix("::/0")
 )
 
 // ServerOpts contains options for constructing a new Server.
@@ -281,6 +276,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src * data:; script-src 'self' '"+indexScriptHash+"'")
 			w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		}
+	}
+
+	if r.URL.Path == "/metrics" {
+		r.URL.Path = "/api/local/v0/usermetrics"
+		s.proxyRequestToLocalAPI(w, r)
+		return
 	}
 
 	if strings.HasPrefix(r.URL.Path, "/api/") {
@@ -921,10 +922,10 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 			return p == route
 		})
 	}
-	data.AdvertisingExitNodeApproved = routeApproved(exitNodeRouteV4) || routeApproved(exitNodeRouteV6)
+	data.AdvertisingExitNodeApproved = routeApproved(tsaddr.AllIPv4()) || routeApproved(tsaddr.AllIPv6())
 
 	for _, r := range prefs.AdvertiseRoutes {
-		if r == exitNodeRouteV4 || r == exitNodeRouteV6 {
+		if tsaddr.IsExitRoute(r) {
 			data.AdvertisingExitNode = true
 		} else {
 			data.AdvertisedRoutes = append(data.AdvertisedRoutes, subnetRoute{
@@ -1065,7 +1066,7 @@ func (s *Server) servePostRoutes(ctx context.Context, data postRoutesRequest) er
 	var currNonExitRoutes []string
 	var currAdvertisingExitNode bool
 	for _, r := range prefs.AdvertiseRoutes {
-		if r == exitNodeRouteV4 || r == exitNodeRouteV6 {
+		if tsaddr.IsExitRoute(r) {
 			currAdvertisingExitNode = true
 			continue
 		}
@@ -1086,12 +1087,7 @@ func (s *Server) servePostRoutes(ctx context.Context, data postRoutesRequest) er
 		return err
 	}
 
-	hasExitNodeRoute := func(all []netip.Prefix) bool {
-		return slices.Contains(all, exitNodeRouteV4) ||
-			slices.Contains(all, exitNodeRouteV6)
-	}
-
-	if !data.UseExitNode.IsZero() && hasExitNodeRoute(routes) {
+	if !data.UseExitNode.IsZero() && tsaddr.ContainsExitRoutes(views.SliceOf(routes)) {
 		return errors.New("cannot use and advertise exit node at same time")
 	}
 
@@ -1150,7 +1146,15 @@ func (s *Server) tailscaleUp(ctx context.Context, st *ipnstate.Status, opt tails
 		if !isRunning {
 			ipnOptions := ipn.Options{AuthKey: opt.AuthKey}
 			if opt.ControlURL != "" {
-				ipnOptions.UpdatePrefs = &ipn.Prefs{ControlURL: opt.ControlURL}
+				_, err := s.lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+					Prefs: ipn.Prefs{
+						ControlURL: opt.ControlURL,
+					},
+					ControlURLSet: true,
+				})
+				if err != nil {
+					s.logf("edit prefs: %v", err)
+				}
 			}
 			if err := s.lc.Start(ctx, ipnOptions); err != nil {
 				s.logf("start: %v", err)

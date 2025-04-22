@@ -22,6 +22,7 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/envknob"
 	"tailscale.com/paths"
 	"tailscale.com/version/distro"
@@ -77,10 +78,19 @@ func CleanUpArgs(args []string) []string {
 	return out
 }
 
-var localClient tailscale.LocalClient
+var localClient = tailscale.LocalClient{
+	Socket: paths.DefaultTailscaledSocket(),
+}
 
 // Run runs the CLI. The args do not include the binary name.
 func Run(args []string) (err error) {
+	if runtime.GOOS == "linux" && os.Getenv("GOKRAZY_FIRST_START") == "1" && distro.Get() == distro.Gokrazy && os.Getppid() == 1 {
+		// We're running on gokrazy and it's the first start.
+		// Don't run the tailscale CLI as a service; just exit.
+		// See https://gokrazy.org/development/process-interface/
+		os.Exit(0)
+	}
+
 	args = CleanUpArgs(args)
 
 	if len(args) == 1 && (args[0] == "-V" || args[0] == "--version") {
@@ -99,14 +109,32 @@ func Run(args []string) (err error) {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		if noexec := (ffcli.NoExecError{}); errors.As(err, &noexec) {
+			// When the user enters an unknown subcommand, ffcli tries to run
+			// the closest valid parent subcommand with everything else as args,
+			// returning NoExecError if it doesn't have an Exec function.
+			cmd := noexec.Command
+			args := cmd.FlagSet.Args()
+			if len(cmd.Subcommands) > 0 {
+				if len(args) > 0 {
+					return fmt.Errorf("%s: unknown subcommand: %s", fullCmd(rootCmd, cmd), args[0])
+				}
+				subs := make([]string, 0, len(cmd.Subcommands))
+				for _, sub := range cmd.Subcommands {
+					subs = append(subs, sub.Name)
+				}
+				return fmt.Errorf("%s: missing subcommand: %s", fullCmd(rootCmd, cmd), strings.Join(subs, ", "))
+			}
+		}
 		return err
 	}
 
 	if envknob.Bool("TS_DUMP_HELP") {
-		walkCommands(rootCmd, func(c *ffcli.Command) {
+		walkCommands(rootCmd, func(w cmdWalk) bool {
 			fmt.Println("===")
 			// UsageFuncs are typically called during Command.Run which ensures
 			// FlagSet is not nil.
+			c := w.Command
 			if c.FlagSet == nil {
 				c.FlagSet = flag.NewFlagSet(c.Name, flag.ContinueOnError)
 			}
@@ -115,16 +143,10 @@ func Run(args []string) (err error) {
 			} else {
 				fmt.Println(ffcli.DefaultUsageFunc(c))
 			}
+			return true
 		})
 		return
 	}
-
-	localClient.Socket = rootArgs.socket
-	rootCmd.FlagSet.Visit(func(f *flag.Flag) {
-		if f.Name == "socket" {
-			localClient.UseSocketOnly = true
-		}
-	})
 
 	err = rootCmd.Run(context.Background())
 	if tailscale.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
@@ -138,7 +160,12 @@ func Run(args []string) (err error) {
 
 func newRootCmd() *ffcli.Command {
 	rootfs := newFlagSet("tailscale")
-	rootfs.StringVar(&rootArgs.socket, "socket", paths.DefaultTailscaledSocket(), "path to tailscaled socket")
+	rootfs.Func("socket", "path to tailscaled socket", func(s string) error {
+		localClient.Socket = s
+		localClient.UseSocketOnly = true
+		return nil
+	})
+	rootfs.Lookup("socket").DefValue = localClient.Socket
 
 	rootCmd := &ffcli.Command{
 		Name:       "tailscale",
@@ -160,6 +187,7 @@ change in the future.
 			configureCmd,
 			netcheckCmd,
 			ipCmd,
+			dnsCmd,
 			statusCmd,
 			pingCmd,
 			ncCmd,
@@ -178,25 +206,29 @@ change in the future.
 			whoisCmd,
 			debugCmd,
 			driveCmd,
+			idTokenCmd,
 		},
 		FlagSet: rootfs,
-		Exec:    func(context.Context, []string) error { return flag.ErrHelp },
-	}
-	if envknob.UseWIPCode() {
-		rootCmd.Subcommands = append(rootCmd.Subcommands,
-			idTokenCmd,
-		)
+		Exec: func(ctx context.Context, args []string) error {
+			if len(args) > 0 {
+				return fmt.Errorf("tailscale: unknown subcommand: %s", args[0])
+			}
+			return flag.ErrHelp
+		},
 	}
 
 	if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
 		rootCmd.Subcommands = append(rootCmd.Subcommands, configureHostCmd)
 	}
 
-	walkCommands(rootCmd, func(c *ffcli.Command) {
-		if c.UsageFunc == nil {
-			c.UsageFunc = usageFunc
+	walkCommands(rootCmd, func(w cmdWalk) bool {
+		if w.UsageFunc == nil {
+			w.UsageFunc = usageFunc
 		}
+		return true
 	})
+
+	ffcomplete.Inject(rootCmd, func(c *ffcli.Command) { c.LongHelp = hidden + c.LongHelp }, usageFunc)
 	return rootCmd
 }
 
@@ -212,15 +244,57 @@ func fatalf(format string, a ...any) {
 // Fatalf, if non-nil, is used instead of log.Fatalf.
 var Fatalf func(format string, a ...any)
 
-var rootArgs struct {
-	socket string
+type cmdWalk struct {
+	*ffcli.Command
+	parents []*ffcli.Command
 }
 
-func walkCommands(cmd *ffcli.Command, f func(*ffcli.Command)) {
-	f(cmd)
-	for _, sub := range cmd.Subcommands {
-		walkCommands(sub, f)
+func (w cmdWalk) Path() string {
+	if len(w.parents) == 0 {
+		return w.Name
 	}
+
+	var sb strings.Builder
+	for _, p := range w.parents {
+		sb.WriteString(p.Name)
+		sb.WriteString(" ")
+	}
+	sb.WriteString(w.Name)
+	return sb.String()
+}
+
+// walkCommands calls f for root and all of its nested subcommands until f
+// returns false or all have been visited.
+func walkCommands(root *ffcli.Command, f func(w cmdWalk) (more bool)) {
+	var walk func(cmd *ffcli.Command, parents []*ffcli.Command, f func(cmdWalk) bool) bool
+	walk = func(cmd *ffcli.Command, parents []*ffcli.Command, f func(cmdWalk) bool) bool {
+		if !f(cmdWalk{cmd, parents}) {
+			return false
+		}
+		parents = append(parents, cmd)
+		for _, sub := range cmd.Subcommands {
+			if !walk(sub, parents, f) {
+				return false
+			}
+		}
+		return true
+	}
+	walk(root, nil, f)
+}
+
+// fullCmd returns the full "tailscale ... cmd" invocation for a subcommand.
+func fullCmd(root, cmd *ffcli.Command) (full string) {
+	walkCommands(root, func(w cmdWalk) bool {
+		if w.Command == cmd {
+			full = w.Path()
+			return false
+		}
+		return true
+	})
+	if full == "" {
+		return cmd.Name
+	}
+	return full
 }
 
 // usageFuncNoDefaultValues is like usageFunc but doesn't print default values.
@@ -232,9 +306,12 @@ func usageFunc(c *ffcli.Command) string {
 	return usageFuncOpt(c, true)
 }
 
+// hidden is the prefix that hides subcommands and flags from --help output when
+// found at the start of the subcommand's LongHelp or flag's Usage.
+const hidden = "HIDDEN: "
+
 func usageFuncOpt(c *ffcli.Command, withDefaults bool) string {
 	var b strings.Builder
-	const hiddenPrefix = "HIDDEN: "
 
 	if c.ShortHelp != "" {
 		fmt.Fprintf(&b, "%s\n\n", c.ShortHelp)
@@ -248,8 +325,7 @@ func usageFuncOpt(c *ffcli.Command, withDefaults bool) string {
 	}
 	fmt.Fprintf(&b, "\n")
 
-	if c.LongHelp != "" {
-		help, _ := strings.CutPrefix(c.LongHelp, hiddenPrefix)
+	if help := strings.TrimPrefix(c.LongHelp, hidden); help != "" {
 		fmt.Fprintf(&b, "%s\n\n", help)
 	}
 
@@ -257,7 +333,7 @@ func usageFuncOpt(c *ffcli.Command, withDefaults bool) string {
 		fmt.Fprintf(&b, "SUBCOMMANDS\n")
 		tw := tabwriter.NewWriter(&b, 0, 2, 2, ' ', 0)
 		for _, subcommand := range c.Subcommands {
-			if strings.HasPrefix(subcommand.LongHelp, hiddenPrefix) {
+			if strings.HasPrefix(subcommand.LongHelp, hidden) {
 				continue
 			}
 			fmt.Fprintf(tw, "  %s\t%s\n", subcommand.Name, subcommand.ShortHelp)
@@ -272,7 +348,7 @@ func usageFuncOpt(c *ffcli.Command, withDefaults bool) string {
 		c.FlagSet.VisitAll(func(f *flag.Flag) {
 			var s string
 			name, usage := flag.UnquoteUsage(f)
-			if strings.HasPrefix(usage, hiddenPrefix) {
+			if strings.HasPrefix(usage, hidden) {
 				return
 			}
 			if isBoolFlag(f) {

@@ -4,7 +4,10 @@
 // Package slicesx contains some helpful generic slice functions.
 package slicesx
 
-import "math/rand"
+import (
+	"math/rand/v2"
+	"slices"
+)
 
 // Interleave combines two slices of the form [a, b, c] and [x, y, z] into a
 // slice with elements interleaved; i.e. [a, x, b, y, c, z].
@@ -34,11 +37,11 @@ func Shuffle[S ~[]T, T any](s S) {
 	n := len(s)
 	i := n - 1
 	for ; i > 1<<31-1-1; i-- {
-		j := int(rand.Int63n(int64(i + 1)))
+		j := int(rand.N(int64(i + 1)))
 		s[i], s[j] = s[j], s[i]
 	}
 	for ; i > 0; i-- {
-		j := int(rand.Int31n(int32(i + 1)))
+		j := int(rand.N(int32(i + 1)))
 		s[i], s[j] = s[j], s[i]
 	}
 }
@@ -90,4 +93,58 @@ func Filter[S ~[]T, T any](dst, src S, fn func(T) bool) S {
 		}
 	}
 	return dst
+}
+
+// AppendMatching appends elements in ps to dst if f(x) is true.
+func AppendMatching[T any](dst, ps []T, f func(T) bool) []T {
+	for _, p := range ps {
+		if f(p) {
+			dst = append(dst, p)
+		}
+	}
+	return dst
+}
+
+// HasPrefix reports whether the byte slice s begins with prefix.
+func HasPrefix[E comparable](s, prefix []E) bool {
+	return len(s) >= len(prefix) && slices.Equal(s[0:len(prefix)], prefix)
+}
+
+// HasSuffix reports whether the slice s ends with suffix.
+func HasSuffix[E comparable](s, suffix []E) bool {
+	return len(s) >= len(suffix) && slices.Equal(s[len(s)-len(suffix):], suffix)
+}
+
+// CutPrefix returns s without the provided leading prefix slice and reports
+// whether it found the prefix. If s doesn't start with prefix, CutPrefix
+// returns s, false. If prefix is the empty slice, CutPrefix returns s, true.
+// CutPrefix returns slices of the original slice s, not copies.
+func CutPrefix[E comparable](s, prefix []E) (after []E, found bool) {
+	if !HasPrefix(s, prefix) {
+		return s, false
+	}
+	return s[len(prefix):], true
+}
+
+// CutSuffix returns s without the provided ending suffix slice and reports
+// whether it found the suffix. If s doesn't end with suffix, CutSuffix returns
+// s, false. If suffix is the empty slice, CutSuffix returns s, true.
+// CutSuffix returns slices of the original slice s, not copies.
+func CutSuffix[E comparable](s, suffix []E) (after []E, found bool) {
+	if !HasSuffix(s, suffix) {
+		return s, false
+	}
+	return s[:len(s)-len(suffix)], true
+}
+
+// FirstEqual reports whether len(s) > 0 and
+// its first element == v.
+func FirstEqual[T comparable](s []T, v T) bool {
+	return len(s) > 0 && s[0] == v
+}
+
+// LastEqual reports whether len(s) > 0 and
+// its last element == v.
+func LastEqual[T comparable](s []T, v T) bool {
+	return len(s) > 0 && s[len(s)-1] == v
 }

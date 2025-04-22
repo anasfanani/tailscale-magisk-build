@@ -9,13 +9,12 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/netip"
 	"strings"
 	"time"
 
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
-	"tailscale.com/types/key"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 )
 
@@ -36,7 +35,8 @@ func startMesh(s *derp.Server) error {
 
 func startMeshWithHost(s *derp.Server, host string) error {
 	logf := logger.WithPrefix(log.Printf, fmt.Sprintf("mesh(%q): ", host))
-	c, err := derphttp.NewClient(s.PrivateKey(), "https://"+host+"/derp", logf)
+	netMon := netmon.NewStatic() // good enough for cmd/derper; no need for netns fanciness
+	c, err := derphttp.NewClient(s.PrivateKey(), "https://"+host+"/derp", logf, netMon)
 	if err != nil {
 		return err
 	}
@@ -69,8 +69,8 @@ func startMeshWithHost(s *derp.Server, host string) error {
 		return d.DialContext(ctx, network, addr)
 	})
 
-	add := func(k key.NodePublic, _ netip.AddrPort) { s.AddPacketForwarder(k, c) }
-	remove := func(k key.NodePublic) { s.RemovePacketForwarder(k, c) }
+	add := func(m derp.PeerPresentMessage) { s.AddPacketForwarder(m.Key, c) }
+	remove := func(m derp.PeerGoneMessage) { s.RemovePacketForwarder(m.Peer, c) }
 	go c.RunWatchConnectionLoop(context.Background(), s.PublicKey(), logf, add, remove)
 	return nil
 }

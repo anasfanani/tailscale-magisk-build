@@ -16,6 +16,7 @@ import (
 
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
+	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -140,7 +141,7 @@ func TestRunDerpProbeNodePair(t *testing.T) {
 		}
 	}()
 	newClient := func() *derphttp.Client {
-		c, err := derphttp.NewClient(key.NewNode(), serverURL, t.Logf)
+		c, err := derphttp.NewClient(key.NewNode(), serverURL, t.Logf, netmon.NewStatic())
 		if err != nil {
 			t.Fatalf("NewClient: %v", err)
 		}
@@ -186,7 +187,7 @@ func Test_packetsForSize(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			hashes := make(map[string]int)
-			for i := 0; i < 5; i++ {
+			for range 5 {
 				pkts := packetsForSize(int64(tt.size))
 				if len(pkts) != tt.wantPackets {
 					t.Errorf("packetsForSize(%d) got %d packets, want %d", tt.size, len(pkts), tt.wantPackets)

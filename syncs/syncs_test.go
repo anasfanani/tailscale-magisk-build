@@ -5,11 +5,65 @@ package syncs
 
 import (
 	"context"
-	"sync"
+	"io"
+	"os"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 )
+
+func TestAtomicValue(t *testing.T) {
+	{
+		// Always wrapping should not allocate for simple values
+		// because wrappedValue[T] has the same memory layout as T.
+		var v AtomicValue[bool]
+		bools := []bool{true, false}
+		if n := int(testing.AllocsPerRun(1000, func() {
+			for _, b := range bools {
+				v.Store(b)
+			}
+		})); n != 0 {
+			t.Errorf("AllocsPerRun = %d, want 0", n)
+		}
+	}
+
+	{
+		var v AtomicValue[int]
+		got, gotOk := v.LoadOk()
+		if got != 0 || gotOk {
+			t.Fatalf("LoadOk = (%v, %v), want (0, false)", got, gotOk)
+		}
+		v.Store(1)
+		got, gotOk = v.LoadOk()
+		if got != 1 || !gotOk {
+			t.Fatalf("LoadOk = (%v, %v), want (1, true)", got, gotOk)
+		}
+	}
+
+	{
+		var v AtomicValue[error]
+		got, gotOk := v.LoadOk()
+		if got != nil || gotOk {
+			t.Fatalf("LoadOk = (%v, %v), want (nil, false)", got, gotOk)
+		}
+		v.Store(io.EOF)
+		got, gotOk = v.LoadOk()
+		if got != io.EOF || !gotOk {
+			t.Fatalf("LoadOk = (%v, %v), want (EOF, true)", got, gotOk)
+		}
+		err := &os.PathError{}
+		v.Store(err)
+		got, gotOk = v.LoadOk()
+		if got != err || !gotOk {
+			t.Fatalf("LoadOk = (%v, %v), want (%v, true)", got, gotOk, err)
+		}
+		v.Store(nil)
+		got, gotOk = v.LoadOk()
+		if got != nil || !gotOk {
+			t.Fatalf("LoadOk = (%v, %v), want (nil, true)", got, gotOk)
+		}
+	}
+}
 
 func TestWaitGroupChan(t *testing.T) {
 	wg := NewWaitGroupChan()
@@ -45,7 +99,7 @@ func TestWaitGroupChan(t *testing.T) {
 
 func TestClosedChan(t *testing.T) {
 	ch := ClosedChan()
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-ch:
 		default:
@@ -106,10 +160,9 @@ func TestMap(t *testing.T) {
 	}
 	got := map[string]int{}
 	want := map[string]int{"one": 1, "two": 2, "three": 3}
-	m.Range(func(k string, v int) bool {
+	for k, v := range m.All() {
 		got[k] = v
-		return true
-	})
+	}
 	if d := cmp.Diff(got, want); d != "" {
 		t.Errorf("Range mismatch (-got +want):\n%s", d)
 	}
@@ -124,29 +177,20 @@ func TestMap(t *testing.T) {
 	m.Delete("noexist")
 	got = map[string]int{}
 	want = map[string]int{}
-	m.Range(func(k string, v int) bool {
+	for k, v := range m.All() {
 		got[k] = v
-		return true
-	})
+	}
 	if d := cmp.Diff(got, want); d != "" {
 		t.Errorf("Range mismatch (-got +want):\n%s", d)
 	}
 
 	t.Run("LoadOrStore", func(t *testing.T) {
 		var m Map[string, string]
-		var wg sync.WaitGroup
-		wg.Add(2)
+		var wg WaitGroup
 		var ok1, ok2 bool
-		go func() {
-			defer wg.Done()
-			_, ok1 = m.LoadOrStore("", "")
-		}()
-		go func() {
-			defer wg.Done()
-			_, ok2 = m.LoadOrStore("", "")
-		}()
+		wg.Go(func() { _, ok1 = m.LoadOrStore("", "") })
+		wg.Go(func() { _, ok2 = m.LoadOrStore("", "") })
 		wg.Wait()
-
 		if ok1 == ok2 {
 			t.Errorf("exactly one LoadOrStore should load")
 		}

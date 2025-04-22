@@ -13,17 +13,27 @@ import (
 	"golang.org/x/sys/windows/registry"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/winutil"
+	"tailscale.com/util/winutil/winenv"
 )
 
 func init() {
+	distroName = lazyDistroName.Get
 	osVersion = lazyOSVersion.Get
 	packageType = lazyPackageType.Get
 }
 
 var (
+	lazyDistroName  = &lazyAtomicValue[string]{f: ptr.To(distroNameWindows)}
 	lazyOSVersion   = &lazyAtomicValue[string]{f: ptr.To(osVersionWindows)}
 	lazyPackageType = &lazyAtomicValue[string]{f: ptr.To(packageTypeWindows)}
 )
+
+func distroNameWindows() string {
+	if winenv.IsWindowsServer() {
+		return "Server"
+	}
+	return ""
+}
 
 func osVersionWindows() string {
 	major, minor, build := windows.RtlGetNtVersionNumbers()
@@ -62,10 +72,6 @@ func packageTypeWindows() string {
 	if _, err := os.Stat(`C:\ProgramData\chocolatey\lib\tailscale`); err == nil {
 		return "choco"
 	}
-	msiSentinel, _ := winutil.GetRegInteger("MSI")
-	if msiSentinel == 1 {
-		return "msi"
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		return ""
@@ -74,13 +80,15 @@ func packageTypeWindows() string {
 	if strings.HasPrefix(exe, filepath.Join(home, "scoop", "apps", "tailscale")) {
 		return "scoop"
 	}
-	dir := filepath.Dir(exe)
-	nsisUninstaller := filepath.Join(dir, "Uninstall-Tailscale.exe")
-	_, err = os.Stat(nsisUninstaller)
-	if err == nil {
-		return "nsis"
+	msiSentinel, _ := winutil.GetRegInteger("MSI")
+	if msiSentinel != 1 {
+		// Atypical. Not worth trying to detect. Likely open
+		// source tailscaled or a developer running by hand.
+		return ""
 	}
-	// Atypical. Not worth trying to detect. Likely open
-	// source tailscaled or a developer running by hand.
-	return ""
+	result := "msi"
+	if env, _ := winutil.GetRegString("MSIDist"); env != "" {
+		result += "/" + env
+	}
+	return result
 }

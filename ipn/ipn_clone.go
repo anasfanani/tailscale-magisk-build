@@ -11,8 +11,10 @@ import (
 
 	"tailscale.com/drive"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
+	"tailscale.com/types/ptr"
 )
 
 // Clone makes a deep copy of Prefs.
@@ -28,7 +30,11 @@ func (src *Prefs) Clone() *Prefs {
 	if src.DriveShares != nil {
 		dst.DriveShares = make([]*drive.Share, len(src.DriveShares))
 		for i := range dst.DriveShares {
-			dst.DriveShares[i] = src.DriveShares[i].Clone()
+			if src.DriveShares[i] == nil {
+				dst.DriveShares[i] = nil
+			} else {
+				dst.DriveShares[i] = src.DriveShares[i].Clone()
+			}
 		}
 	}
 	dst.Persist = src.Persist.Clone()
@@ -39,10 +45,9 @@ func (src *Prefs) Clone() *Prefs {
 var _PrefsCloneNeedsRegeneration = Prefs(struct {
 	ControlURL             string
 	RouteAll               bool
-	AllowSingleHosts       bool
 	ExitNodeID             tailcfg.StableNodeID
 	ExitNodeIP             netip.Addr
-	InternalExitNodePrior  string
+	InternalExitNodePrior  tailcfg.StableNodeID
 	ExitNodeAllowLANAccess bool
 	CorpDNS                bool
 	RunSSH                 bool
@@ -57,6 +62,7 @@ var _PrefsCloneNeedsRegeneration = Prefs(struct {
 	Egg                    bool
 	AdvertiseRoutes        []netip.Prefix
 	NoSNAT                 bool
+	NoStatefulFiltering    opt.Bool
 	NetfilterMode          preftype.NetfilterMode
 	OperatorUser           string
 	ProfileName            string
@@ -65,6 +71,7 @@ var _PrefsCloneNeedsRegeneration = Prefs(struct {
 	PostureChecking        bool
 	NetfilterKind          string
 	DriveShares            []*drive.Share
+	AllowSingleHosts       marshalAsTrueInJSON
 	Persist                *persist.Persist
 }{})
 
@@ -79,20 +86,32 @@ func (src *ServeConfig) Clone() *ServeConfig {
 	if dst.TCP != nil {
 		dst.TCP = map[uint16]*TCPPortHandler{}
 		for k, v := range src.TCP {
-			dst.TCP[k] = v.Clone()
+			if v == nil {
+				dst.TCP[k] = nil
+			} else {
+				dst.TCP[k] = ptr.To(*v)
+			}
 		}
 	}
 	if dst.Web != nil {
 		dst.Web = map[HostPort]*WebServerConfig{}
 		for k, v := range src.Web {
-			dst.Web[k] = v.Clone()
+			if v == nil {
+				dst.Web[k] = nil
+			} else {
+				dst.Web[k] = v.Clone()
+			}
 		}
 	}
 	dst.AllowFunnel = maps.Clone(src.AllowFunnel)
 	if dst.Foreground != nil {
 		dst.Foreground = map[string]*ServeConfig{}
 		for k, v := range src.Foreground {
-			dst.Foreground[k] = v.Clone()
+			if v == nil {
+				dst.Foreground[k] = nil
+			} else {
+				dst.Foreground[k] = v.Clone()
+			}
 		}
 	}
 	return dst
@@ -155,7 +174,11 @@ func (src *WebServerConfig) Clone() *WebServerConfig {
 	if dst.Handlers != nil {
 		dst.Handlers = map[string]*HTTPHandler{}
 		for k, v := range src.Handlers {
-			dst.Handlers[k] = v.Clone()
+			if v == nil {
+				dst.Handlers[k] = nil
+			} else {
+				dst.Handlers[k] = ptr.To(*v)
+			}
 		}
 	}
 	return dst

@@ -9,17 +9,20 @@ import (
 	"context"
 	"encoding/json"
 	"net/netip"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"tailscale.com/client/tailscale"
@@ -42,16 +45,24 @@ type configOpts struct {
 	tailnetTargetIP                                string
 	tailnetTargetFQDN                              string
 	clusterTargetIP                                string
+	clusterTargetDNS                               string
 	subnetRoutes                                   string
 	isExitNode                                     bool
 	confFileHash                                   string
 	serveConfig                                    *ipn.ServeConfig
 	shouldEnableForwardingClusterTrafficViaIngress bool
 	proxyClass                                     string // configuration from the named ProxyClass should be applied to proxy resources
+	app                                            string
+	shouldRemoveAuthKey                            bool
+	secretExtraData                                map[string][]byte
 }
 
 func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.StatefulSet {
 	t.Helper()
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
 	tsContainer := corev1.Container{
 		Name:  "tailscale",
 		Image: "tailscale/tailscale",
@@ -60,6 +71,7 @@ func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.Statef
 			{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "", FieldPath: "status.podIP"}, ResourceFieldRef: nil, ConfigMapKeyRef: nil, SecretKeyRef: nil}},
 			{Name: "TS_KUBE_SECRET", Value: opts.secretName},
 			{Name: "EXPERIMENTAL_TS_CONFIGFILE_PATH", Value: "/etc/tsconfig/tailscaled"},
+			{Name: "TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR", Value: "/etc/tsconfig"},
 		},
 		SecurityContext: &corev1.SecurityContext{
 			Capabilities: &corev1.Capabilities{
@@ -82,12 +94,6 @@ func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.Statef
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName: opts.secretName,
-					Items: []corev1.KeyToPath{
-						{
-							Key:  "tailscaled",
-							Path: "tailscaled",
-						},
-					},
 				},
 			},
 		},
@@ -125,17 +131,25 @@ func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.Statef
 			Value: opts.clusterTargetIP,
 		})
 		annots["tailscale.com/operator-last-set-cluster-ip"] = opts.clusterTargetIP
+	} else if opts.clusterTargetDNS != "" {
+		tsContainer.Env = append(tsContainer.Env, corev1.EnvVar{
+			Name:  "TS_EXPERIMENTAL_DEST_DNS_NAME",
+			Value: opts.clusterTargetDNS,
+		})
+		annots["tailscale.com/operator-last-set-cluster-dns-name"] = opts.clusterTargetDNS
 	}
 	if opts.serveConfig != nil {
 		tsContainer.Env = append(tsContainer.Env, corev1.EnvVar{
 			Name:  "TS_SERVE_CONFIG",
 			Value: "/etc/tailscaled/serve-config",
 		})
-		volumes = append(volumes, corev1.Volume{
-			Name: "serve-config", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: opts.secretName, Items: []corev1.KeyToPath{{Path: "serve-config", Key: "serve-config"}}}},
-		})
+		volumes = append(volumes, corev1.Volume{Name: "serve-config", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: opts.secretName, Items: []corev1.KeyToPath{{Key: "serve-config", Path: "serve-config"}}}}})
 		tsContainer.VolumeMounts = append(tsContainer.VolumeMounts, corev1.VolumeMount{Name: "serve-config", ReadOnly: true, MountPath: "/etc/tailscaled"})
 	}
+	tsContainer.Env = append(tsContainer.Env, corev1.EnvVar{
+		Name:  "TS_INTERNAL_APP",
+		Value: opts.app,
+	})
 	ss := &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "StatefulSet",
@@ -176,8 +190,8 @@ func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.Statef
 						{
 							Name:    "sysctler",
 							Image:   "tailscale/tailscale",
-							Command: []string{"/bin/sh"},
-							Args:    []string{"-c", "sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1"},
+							Command: []string{"/bin/sh", "-c"},
+							Args:    []string{"sysctl -w net.ipv4.ip_forward=1 && if sysctl net.ipv6.conf.all.forwarding; then sysctl -w net.ipv6.conf.all.forwarding=1; fi"},
 							SecurityContext: &corev1.SecurityContext{
 								Privileged: ptr.To(true),
 							},
@@ -197,21 +211,28 @@ func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.Statef
 		if err := cl.Get(context.Background(), types.NamespacedName{Name: opts.proxyClass}, proxyClass); err != nil {
 			t.Fatalf("error getting ProxyClass: %v", err)
 		}
-		return applyProxyClassToStatefulSet(proxyClass, ss)
+		return applyProxyClassToStatefulSet(proxyClass, ss, new(tailscaleSTSConfig), zl.Sugar())
 	}
 	return ss
 }
 
 func expectedSTSUserspace(t *testing.T, cl client.Client, opts configOpts) *appsv1.StatefulSet {
 	t.Helper()
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
 	tsContainer := corev1.Container{
 		Name:  "tailscale",
 		Image: "tailscale/tailscale",
 		Env: []corev1.EnvVar{
 			{Name: "TS_USERSPACE", Value: "true"},
+			{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "", FieldPath: "status.podIP"}, ResourceFieldRef: nil, ConfigMapKeyRef: nil, SecretKeyRef: nil}},
 			{Name: "TS_KUBE_SECRET", Value: opts.secretName},
 			{Name: "EXPERIMENTAL_TS_CONFIGFILE_PATH", Value: "/etc/tsconfig/tailscaled"},
+			{Name: "TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR", Value: "/etc/tsconfig"},
 			{Name: "TS_SERVE_CONFIG", Value: "/etc/tailscaled/serve-config"},
+			{Name: "TS_INTERNAL_APP", Value: opts.app},
 		},
 		ImagePullPolicy: "Always",
 		VolumeMounts: []corev1.VolumeMount{
@@ -225,20 +246,12 @@ func expectedSTSUserspace(t *testing.T, cl client.Client, opts configOpts) *apps
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName: opts.secretName,
-					Items: []corev1.KeyToPath{
-						{
-							Key:  "tailscaled",
-							Path: "tailscaled",
-						},
-					},
 				},
 			},
 		},
 		{Name: "serve-config",
 			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: opts.secretName,
-					Items: []corev1.KeyToPath{{Key: "serve-config", Path: "serve-config"}}}},
-		},
+				Secret: &corev1.SecretVolumeSource{SecretName: opts.secretName, Items: []corev1.KeyToPath{{Key: "serve-config", Path: "serve-config"}}}}},
 	}
 	ss := &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
@@ -293,17 +306,13 @@ func expectedSTSUserspace(t *testing.T, cl client.Client, opts configOpts) *apps
 		if err := cl.Get(context.Background(), types.NamespacedName{Name: opts.proxyClass}, proxyClass); err != nil {
 			t.Fatalf("error getting ProxyClass: %v", err)
 		}
-		return applyProxyClassToStatefulSet(proxyClass, ss)
+		return applyProxyClassToStatefulSet(proxyClass, ss, new(tailscaleSTSConfig), zl.Sugar())
 	}
 	return ss
 }
 
 func expectedHeadlessService(name string, parentType string) *corev1.Service {
 	return &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:         name,
 			GenerateName: "ts-test-",
@@ -319,18 +328,15 @@ func expectedHeadlessService(name string, parentType string) *corev1.Service {
 			Selector: map[string]string{
 				"app": "1234-UID",
 			},
-			ClusterIP: "None",
+			ClusterIP:      "None",
+			IPFamilyPolicy: ptr.To(corev1.IPFamilyPolicyPreferDualStack),
 		},
 	}
 }
 
-func expectedSecret(t *testing.T, opts configOpts) *corev1.Secret {
+func expectedSecret(t *testing.T, cl client.Client, opts configOpts) *corev1.Secret {
 	t.Helper()
 	s := &corev1.Secret{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Secret",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      opts.secretName,
 			Namespace: "operator-ns",
@@ -351,6 +357,19 @@ func expectedSecret(t *testing.T, opts configOpts) *corev1.Secret {
 		AuthKey:      ptr.To("secret-authkey"),
 		AcceptRoutes: "false",
 	}
+	if opts.proxyClass != "" {
+		t.Logf("applying configuration from ProxyClass %s", opts.proxyClass)
+		proxyClass := new(tsapi.ProxyClass)
+		if err := cl.Get(context.Background(), types.NamespacedName{Name: opts.proxyClass}, proxyClass); err != nil {
+			t.Fatalf("error getting ProxyClass: %v", err)
+		}
+		if proxyClass.Spec.TailscaleConfig != nil && proxyClass.Spec.TailscaleConfig.AcceptRoutes {
+			conf.AcceptRoutes = "true"
+		}
+	}
+	if opts.shouldRemoveAuthKey {
+		conf.AuthKey = nil
+	}
 	var routes []netip.Prefix
 	if opts.subnetRoutes != "" || opts.isExitNode {
 		r := opts.subnetRoutes
@@ -370,7 +389,17 @@ func expectedSecret(t *testing.T, opts configOpts) *corev1.Secret {
 	if err != nil {
 		t.Fatalf("error marshalling tailscaled config")
 	}
+	if opts.tailnetTargetFQDN != "" || opts.tailnetTargetIP != "" {
+		conf.NoStatefulFiltering = "true"
+	} else {
+		conf.NoStatefulFiltering = "false"
+	}
+	bn, err := json.Marshal(conf)
+	if err != nil {
+		t.Fatalf("error marshalling tailscaled config")
+	}
 	mak.Set(&s.StringData, "tailscaled", string(b))
+	mak.Set(&s.StringData, "cap-95.hujson", string(bn))
 	labels := map[string]string{
 		"tailscale.com/managed":              "true",
 		"tailscale.com/parent-resource":      "test",
@@ -381,6 +410,9 @@ func expectedSecret(t *testing.T, opts configOpts) *corev1.Secret {
 		labels["tailscale.com/parent-resource-ns"] = "" // Connector is cluster scoped
 	}
 	s.Labels = labels
+	for key, val := range opts.secretExtraData {
+		mak.Set(&s.Data, key, val)
+	}
 	return s
 }
 
@@ -441,11 +473,11 @@ func mustUpdateStatus[T any, O ptrObject[T]](t *testing.T, client client.Client,
 
 // expectEqual accepts a Kubernetes object and a Kubernetes client. It tests
 // whether an object with equivalent contents can be retrieved by the passed
-// client. If you want to NOT test some object fields for equality, ensure that
-// they are not present in the passed object and use the modify func to remove
-// them from the cluster object. If no such modifications are needed, you can
-// pass nil in place of the modify function.
-func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want O, modify func(O)) {
+// client. If you want to NOT test some object fields for equality, use the
+// modify func to ensure that they are removed from the cluster object and the
+// object passed as 'want'. If no such modifications are needed, you can pass
+// nil in place of the modify function.
+func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want O, modifier func(O)) {
 	t.Helper()
 	got := O(new(T))
 	if err := client.Get(context.Background(), types.NamespacedName{
@@ -459,11 +491,12 @@ func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want
 	// so just remove it from both got and want.
 	got.SetResourceVersion("")
 	want.SetResourceVersion("")
-	if modify != nil {
-		modify(got)
+	if modifier != nil {
+		modifier(want)
+		modifier(got)
 	}
 	if diff := cmp.Diff(got, want); diff != "" {
-		t.Fatalf("unexpected object (-got +want):\n%s", diff)
+		t.Fatalf("unexpected %s (-got +want):\n%s", reflect.TypeOf(want).Elem().Name(), diff)
 	}
 }
 
@@ -474,7 +507,7 @@ func expectMissing[T any, O ptrObject[T]](t *testing.T, client client.Client, ns
 		Name:      name,
 		Namespace: ns,
 	}, obj); !apierrors.IsNotFound(err) {
-		t.Fatalf("object %s/%s unexpectedly present, wanted missing", ns, name)
+		t.Fatalf("%s %s/%s unexpectedly present, wanted missing", reflect.TypeOf(obj).Elem().Name(), ns, name)
 	}
 }
 
@@ -515,6 +548,34 @@ func expectRequeue(t *testing.T, sr reconcile.Reconciler, ns, name string) {
 	}
 }
 
+// expectEvents accepts a test recorder and a list of events, tests that expected
+// events are sent down the recorder's channel. Waits for 5s for each event.
+func expectEvents(t *testing.T, rec *record.FakeRecorder, wantsEvents []string) {
+	t.Helper()
+	// Events are not expected to arrive in order.
+	seenEvents := make([]string, 0)
+	for range len(wantsEvents) {
+		timer := time.NewTimer(time.Second * 5)
+		defer timer.Stop()
+		select {
+		case gotEvent := <-rec.Events:
+			found := false
+			for _, wantEvent := range wantsEvents {
+				if wantEvent == gotEvent {
+					found = true
+					seenEvents = append(seenEvents, gotEvent)
+					break
+				}
+			}
+			if !found {
+				t.Errorf("got unexpected event %q, expected events: %+#v", gotEvent, wantsEvents)
+			}
+		case <-timer.C:
+			t.Errorf("timeout waiting for an event, wants events %#+v, got events %+#v", wantsEvents, seenEvents)
+		}
+	}
+}
+
 type fakeTSClient struct {
 	sync.Mutex
 	keyRequests []tailscale.KeyCapabilities
@@ -538,6 +599,17 @@ func (c *fakeTSClient) CreateKey(ctx context.Context, caps tailscale.KeyCapabili
 		Capabilities: caps,
 	}
 	return "secret-authkey", k, nil
+}
+
+func (c *fakeTSClient) Device(ctx context.Context, deviceID string, fields *tailscale.DeviceFieldsOpts) (*tailscale.Device, error) {
+	return &tailscale.Device{
+		DeviceID: deviceID,
+		Hostname: "hostname-" + deviceID,
+		Addresses: []string{
+			"1.2.3.4",
+			"::1",
+		},
+	}, nil
 }
 
 func (c *fakeTSClient) DeleteDevice(ctx context.Context, deviceID string) error {
@@ -565,4 +637,42 @@ func (c *fakeTSClient) Deleted() []string {
 // change to the configfile contents).
 func removeHashAnnotation(sts *appsv1.StatefulSet) {
 	delete(sts.Spec.Template.Annotations, podAnnotationLastSetConfigFileHash)
+}
+
+func removeTargetPortsFromSvc(svc *corev1.Service) {
+	newPorts := make([]corev1.ServicePort, 0)
+	for _, p := range svc.Spec.Ports {
+		newPorts = append(newPorts, corev1.ServicePort{Protocol: p.Protocol, Port: p.Port})
+	}
+	svc.Spec.Ports = newPorts
+}
+
+func removeAuthKeyIfExistsModifier(t *testing.T) func(s *corev1.Secret) {
+	return func(secret *corev1.Secret) {
+		t.Helper()
+		if len(secret.StringData["tailscaled"]) != 0 {
+			conf := &ipn.ConfigVAlpha{}
+			if err := json.Unmarshal([]byte(secret.StringData["tailscaled"]), conf); err != nil {
+				t.Fatalf("error unmarshalling 'tailscaled' contents: %v", err)
+			}
+			conf.AuthKey = nil
+			b, err := json.Marshal(conf)
+			if err != nil {
+				t.Fatalf("error marshalling updated 'tailscaled' config: %v", err)
+			}
+			mak.Set(&secret.StringData, "tailscaled", string(b))
+		}
+		if len(secret.StringData["cap-95.hujson"]) != 0 {
+			conf := &ipn.ConfigVAlpha{}
+			if err := json.Unmarshal([]byte(secret.StringData["cap-95.hujson"]), conf); err != nil {
+				t.Fatalf("error umarshalling 'cap-95.hujson' contents: %v", err)
+			}
+			conf.AuthKey = nil
+			b, err := json.Marshal(conf)
+			if err != nil {
+				t.Fatalf("error marshalling 'cap-95.huson' contents: %v", err)
+			}
+			mak.Set(&secret.StringData, "cap-95.hujson", string(b))
+		}
+	}
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/time/rate"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/envknob"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/syncs"
@@ -43,12 +44,6 @@ var fileCmd = &ffcli.Command{
 	Subcommands: []*ffcli.Command{
 		fileCpCmd,
 		fileGetCmd,
-	},
-	Exec: func(context.Context, []string) error {
-		// TODO(bradfitz): is there a better ffcli way to
-		// annotate subcommand-required commands that don't
-		// have an exec body of their own?
-		return errors.New("file subcommand required; run 'tailscale file -h' for details")
 	},
 }
 
@@ -424,6 +419,7 @@ var fileGetCmd = &ffcli.Command{
 	skip:       skip conflicting files: leave them in the taildrop inbox and print an error. get any non-conflicting files
 	overwrite:  overwrite existing file
 	rename:     write to a new number-suffixed filename`)
+		ffcomplete.Flag(fs, "conflict", ffcomplete.Fixed("skip", "overwrite", "rename"))
 		return fs
 	})(),
 }
@@ -560,7 +556,7 @@ func runFileGetOneBatch(ctx context.Context, dir string) []error {
 
 func runFileGet(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: file get <target-directory>")
+		return errors.New("usage: tailscale file get <target-directory>")
 	}
 	log.SetFlags(0)
 

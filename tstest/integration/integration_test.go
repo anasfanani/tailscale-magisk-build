@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -22,19 +23,24 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/miekg/dns"
 	"go4.org/mem"
+	"tailscale.com/client/tailscale"
 	"tailscale.com/clientupdate"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
+	"tailscale.com/net/tsaddr"
+	"tailscale.com/net/tstun"
 	"tailscale.com/safesocket"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
@@ -44,6 +50,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/util/must"
 	"tailscale.com/util/rands"
 	"tailscale.com/version"
@@ -257,7 +264,7 @@ func TestStateSavedOnStart(t *testing.T) {
 	n1.MustDown()
 
 	// And change the hostname to something:
-	if err := n1.Tailscale("up", "--login-server="+n1.env.ControlServer.URL, "--hostname=foo").Run(); err != nil {
+	if err := n1.Tailscale("up", "--login-server="+n1.env.controlURL(), "--hostname=foo").Run(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
 
@@ -287,9 +294,9 @@ func TestOneNodeUpAuth(t *testing.T) {
 	st := n1.MustStatus()
 	t.Logf("Status: %s", st.BackendState)
 
-	t.Logf("Running up --login-server=%s ...", env.ControlServer.URL)
+	t.Logf("Running up --login-server=%s ...", env.controlURL())
 
-	cmd := n1.Tailscale("up", "--login-server="+env.ControlServer.URL)
+	cmd := n1.Tailscale("up", "--login-server="+env.controlURL())
 	var authCountAtomic int32
 	cmd.Stdout = &authURLParserWriter{fn: func(urlStr string) error {
 		if env.Control.CompleteAuth(urlStr) {
@@ -345,7 +352,6 @@ func TestConfigFileAuthKey(t *testing.T) {
 
 func TestTwoNodes(t *testing.T) {
 	tstest.Shard(t)
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/3598")
 	tstest.Parallel(t)
 	env := newTestEnv(t)
 
@@ -358,17 +364,49 @@ func TestTwoNodes(t *testing.T) {
 	n2SocksAddrCh := n2.socks5AddrChan()
 	d2 := n2.StartDaemon()
 
+	// Drop some logs to disk on test failure.
+	//
+	// TODO(bradfitz): make all nodes for all tests do this? give each node a
+	// unique integer within the test? But for now only do this test because
+	// this is what we often saw flaking.
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		n1.mu.Lock()
+		n2.mu.Lock()
+		defer n1.mu.Unlock()
+		defer n2.mu.Unlock()
+
+		rxNoDates := regexp.MustCompile(`(?m)^\d{4}.\d{2}.\d{2}.\d{2}:\d{2}:\d{2}`)
+		cleanLog := func(n *testNode) []byte {
+			b := n.tailscaledParser.allBuf.Bytes()
+			b = rxNoDates.ReplaceAll(b, nil)
+			return b
+		}
+
+		t.Logf("writing tailscaled logs to n1.log and n2.log")
+		os.WriteFile("n1.log", cleanLog(n1), 0666)
+		os.WriteFile("n2.log", cleanLog(n2), 0666)
+	})
+
 	n1Socks := n1.AwaitSocksAddr(n1SocksAddrCh)
 	n2Socks := n1.AwaitSocksAddr(n2SocksAddrCh)
 	t.Logf("node1 SOCKS5 addr: %v", n1Socks)
 	t.Logf("node2 SOCKS5 addr: %v", n2Socks)
 
 	n1.AwaitListening()
+	t.Logf("n1 is listening")
 	n2.AwaitListening()
+	t.Logf("n2 is listening")
 	n1.MustUp()
+	t.Logf("n1 is up")
 	n2.MustUp()
+	t.Logf("n2 is up")
 	n1.AwaitRunning()
+	t.Logf("n1 is running")
 	n2.AwaitRunning()
+	t.Logf("n2 is running")
 
 	if err := tstest.WaitFor(2*time.Second, func() error {
 		st := n1.MustStatus()
@@ -382,6 +420,11 @@ func TestTwoNodes(t *testing.T) {
 		if peer.ID == st.Self.ID {
 			return errors.New("peer is self")
 		}
+
+		if len(st.TailscaleIPs) == 0 {
+			return errors.New("no Tailscale IPs")
+		}
+
 		return nil
 	}); err != nil {
 		t.Error(err)
@@ -395,7 +438,6 @@ func TestTwoNodes(t *testing.T) {
 // PeersRemoved set) saying that the second node disappeared.
 func TestIncrementalMapUpdatePeersRemoved(t *testing.T) {
 	tstest.Shard(t)
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/3598")
 	tstest.Parallel(t)
 	env := newTestEnv(t)
 
@@ -653,17 +695,14 @@ func TestNoControlConnWhenDown(t *testing.T) {
 	d2 := n1.StartDaemon()
 	n1.AwaitResponding()
 
-	st := n1.MustStatus()
-	if got, want := st.BackendState, "Stopped"; got != want {
-		t.Fatalf("after restart, state = %q; want %q", got, want)
-	}
+	n1.AwaitBackendState("Stopped")
 
 	ip2 := n1.AwaitIP4()
 	if ip1 != ip2 {
 		t.Errorf("IPs different: %q vs %q", ip1, ip2)
 	}
 
-	// The real test: verify our daemon doesn't have an HTTP request open.:
+	// The real test: verify our daemon doesn't have an HTTP request open.
 	if n := env.Control.InServeMap(); n != 0 {
 		t.Errorf("in serve map = %d; want 0", n)
 	}
@@ -690,9 +729,125 @@ func TestOneNodeUpWindowsStyle(t *testing.T) {
 	d1.MustCleanShutdown(t)
 }
 
+// TestClientSideJailing tests that when one node is jailed for another, the
+// jailed node cannot initiate connections to the other node however the other
+// node can initiate connections to the jailed node.
+func TestClientSideJailing(t *testing.T) {
+	tstest.Shard(t)
+	tstest.Parallel(t)
+	env := newTestEnv(t)
+	registerNode := func() (*testNode, key.NodePublic) {
+		n := newTestNode(t, env)
+		n.StartDaemon()
+		n.AwaitListening()
+		n.MustUp()
+		n.AwaitRunning()
+		k := n.MustStatus().Self.PublicKey
+		return n, k
+	}
+	n1, k1 := registerNode()
+	n2, k2 := registerNode()
+
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := uint16(ln.Addr().(*net.TCPAddr).Port)
+
+	lc1 := &tailscale.LocalClient{
+		Socket:        n1.sockFile,
+		UseSocketOnly: true,
+	}
+	lc2 := &tailscale.LocalClient{
+		Socket:        n2.sockFile,
+		UseSocketOnly: true,
+	}
+
+	ip1 := n1.AwaitIP4()
+	ip2 := n2.AwaitIP4()
+
+	tests := []struct {
+		name          string
+		n1JailedForN2 bool
+		n2JailedForN1 bool
+	}{
+		{
+			name:          "not_jailed",
+			n1JailedForN2: false,
+			n2JailedForN1: false,
+		},
+		{
+			name:          "uni_jailed",
+			n1JailedForN2: true,
+			n2JailedForN1: false,
+		},
+		{
+			name:          "bi_jailed", // useless config?
+			n1JailedForN2: true,
+			n2JailedForN1: true,
+		},
+	}
+
+	testDial := func(t *testing.T, lc *tailscale.LocalClient, ip netip.Addr, port uint16, shouldFail bool) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		c, err := lc.DialTCP(ctx, ip.String(), port)
+		failed := err != nil
+		if failed != shouldFail {
+			t.Errorf("failed = %v; want %v", failed, shouldFail)
+		}
+		if c != nil {
+			c.Close()
+		}
+	}
+
+	b1, err := lc1.WatchIPNBus(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := lc2.WatchIPNBus(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitPeerIsJailed := func(t *testing.T, b *tailscale.IPNBusWatcher, jailed bool) {
+		t.Helper()
+		for {
+			n, err := b.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n.NetMap == nil {
+				continue
+			}
+			if len(n.NetMap.Peers) == 0 {
+				continue
+			}
+			if j := n.NetMap.Peers[0].IsJailed(); j == jailed {
+				break
+			}
+		}
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env.Control.SetJailed(k1, k2, tc.n2JailedForN1)
+			env.Control.SetJailed(k2, k1, tc.n1JailedForN2)
+
+			// Wait for the jailed status to propagate.
+			waitPeerIsJailed(t, b1, tc.n2JailedForN1)
+			waitPeerIsJailed(t, b2, tc.n1JailedForN2)
+
+			testDial(t, lc1, ip2, port, tc.n1JailedForN2)
+			testDial(t, lc2, ip1, port, tc.n2JailedForN1)
+		})
+	}
+}
+
 // TestNATPing creates two nodes, n1 and n2, sets up masquerades for both and
 // tries to do bi-directional pings between them.
 func TestNATPing(t *testing.T) {
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/12169")
 	tstest.Shard(t)
 	tstest.Parallel(t)
 	for _, v6 := range []bool{false, true} {
@@ -920,7 +1075,7 @@ func TestAutoUpdateDefaults(t *testing.T) {
 				// Should not be changed even if sent "true" later.
 				sendAndCheckDefault(t, n, true, false)
 				// But can be changed explicitly by the user.
-				if out, err := n.Tailscale("set", "--auto-update").CombinedOutput(); err != nil {
+				if out, err := n.TailscaleForOutput("set", "--auto-update").CombinedOutput(); err != nil {
 					t.Fatalf("failed to enable auto-update on node: %v\noutput: %s", err, out)
 				}
 				sendAndCheckDefault(t, n, false, true)
@@ -934,7 +1089,7 @@ func TestAutoUpdateDefaults(t *testing.T) {
 				// Should not be changed even if sent "false" later.
 				sendAndCheckDefault(t, n, false, true)
 				// But can be changed explicitly by the user.
-				if out, err := n.Tailscale("set", "--auto-update=false").CombinedOutput(); err != nil {
+				if out, err := n.TailscaleForOutput("set", "--auto-update=false").CombinedOutput(); err != nil {
 					t.Fatalf("failed to disable auto-update on node: %v\noutput: %s", err, out)
 				}
 				sendAndCheckDefault(t, n, true, false)
@@ -944,7 +1099,7 @@ func TestAutoUpdateDefaults(t *testing.T) {
 			desc: "user-sets-first",
 			run: func(t *testing.T, n *testNode) {
 				// User sets auto-update first, before receiving defaults.
-				if out, err := n.Tailscale("set", "--auto-update=false").CombinedOutput(); err != nil {
+				if out, err := n.TailscaleForOutput("set", "--auto-update=false").CombinedOutput(); err != nil {
 					t.Fatalf("failed to disable auto-update on node: %v\noutput: %s", err, out)
 				}
 				// Defaults sent from control should be ignored.
@@ -968,13 +1123,386 @@ func TestAutoUpdateDefaults(t *testing.T) {
 	}
 }
 
+// TestDNSOverTCPIntervalResolver tests that the quad-100 resolver successfully
+// serves TCP queries. It exercises the host's TCP stack, a TUN device, and
+// gVisor/netstack.
+// https://github.com/tailscale/corp/issues/22511
+func TestDNSOverTCPIntervalResolver(t *testing.T) {
+	tstest.Shard(t)
+	if os.Getuid() != 0 {
+		t.Skip("skipping when not root")
+	}
+	env := newTestEnv(t)
+	env.tunMode = true
+	n1 := newTestNode(t, env)
+	d1 := n1.StartDaemon()
+
+	n1.AwaitResponding()
+	n1.MustUp()
+
+	wantIP4 := n1.AwaitIP4()
+	n1.AwaitRunning()
+
+	status, err := n1.Status()
+	if err != nil {
+		t.Fatalf("failed to get node status: %v", err)
+	}
+	selfDNSName, err := dnsname.ToFQDN(status.Self.DNSName)
+	if err != nil {
+		t.Fatalf("error converting self dns name to fqdn: %v", err)
+	}
+
+	cases := []struct {
+		network     string
+		serviceAddr netip.Addr
+	}{
+		{
+			"tcp4",
+			tsaddr.TailscaleServiceIP(),
+		},
+		{
+			"tcp6",
+			tsaddr.TailscaleServiceIPv6(),
+		},
+	}
+	for _, c := range cases {
+		err = tstest.WaitFor(time.Second*5, func() error {
+			m := new(dns.Msg)
+			m.SetQuestion(selfDNSName.WithTrailingDot(), dns.TypeA)
+			conn, err := net.DialTimeout(c.network, net.JoinHostPort(c.serviceAddr.String(), "53"), time.Second*1)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+			dnsConn := &dns.Conn{
+				Conn: conn,
+			}
+			dnsClient := &dns.Client{}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			resp, _, err := dnsClient.ExchangeWithConnContext(ctx, m, dnsConn)
+			if err != nil {
+				return err
+			}
+			if len(resp.Answer) != 1 {
+				return fmt.Errorf("unexpected DNS resp: %s", resp)
+			}
+			var gotAddr net.IP
+			answer, ok := resp.Answer[0].(*dns.A)
+			if !ok {
+				return fmt.Errorf("unexpected answer type: %s", resp.Answer[0])
+			}
+			gotAddr = answer.A
+			if !bytes.Equal(gotAddr, wantIP4.AsSlice()) {
+				return fmt.Errorf("got (%s) != want (%s)", gotAddr, wantIP4)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	d1.MustCleanShutdown(t)
+}
+
+// TestNetstackTCPLoopback tests netstack loopback of a TCP stream, in both
+// directions.
+func TestNetstackTCPLoopback(t *testing.T) {
+	tstest.Shard(t)
+	if os.Getuid() != 0 {
+		t.Skip("skipping when not root")
+	}
+
+	env := newTestEnv(t)
+	env.tunMode = true
+	loopbackPort := 5201
+	env.loopbackPort = &loopbackPort
+	loopbackPortStr := strconv.Itoa(loopbackPort)
+	n1 := newTestNode(t, env)
+	d1 := n1.StartDaemon()
+
+	n1.AwaitResponding()
+	n1.MustUp()
+
+	n1.AwaitIP4()
+	n1.AwaitRunning()
+
+	cases := []struct {
+		lisAddr  string
+		network  string
+		dialAddr string
+	}{
+		{
+			lisAddr:  net.JoinHostPort("127.0.0.1", loopbackPortStr),
+			network:  "tcp4",
+			dialAddr: net.JoinHostPort(tsaddr.TailscaleServiceIPString, loopbackPortStr),
+		},
+		{
+			lisAddr:  net.JoinHostPort("::1", loopbackPortStr),
+			network:  "tcp6",
+			dialAddr: net.JoinHostPort(tsaddr.TailscaleServiceIPv6String, loopbackPortStr),
+		},
+	}
+
+	writeBufSize := 128 << 10 // 128KiB, exercise GSO if enabled
+	writeBufIterations := 100 // allow TCP send window to open up
+	wantTotal := writeBufSize * writeBufIterations
+
+	for _, c := range cases {
+		lis, err := net.Listen(c.network, c.lisAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lis.Close()
+
+		writeFn := func(conn net.Conn) error {
+			for i := 0; i < writeBufIterations; i++ {
+				toWrite := make([]byte, writeBufSize)
+				var wrote int
+				for {
+					n, err := conn.Write(toWrite)
+					if err != nil {
+						return err
+					}
+					wrote += n
+					if wrote == len(toWrite) {
+						break
+					}
+				}
+			}
+			return nil
+		}
+
+		readFn := func(conn net.Conn) error {
+			var read int
+			for {
+				b := make([]byte, writeBufSize)
+				n, err := conn.Read(b)
+				if err != nil {
+					return err
+				}
+				read += n
+				if read == wantTotal {
+					return nil
+				}
+			}
+		}
+
+		lisStepCh := make(chan error)
+		go func() {
+			conn, err := lis.Accept()
+			if err != nil {
+				lisStepCh <- err
+				return
+			}
+			lisStepCh <- readFn(conn)
+			lisStepCh <- writeFn(conn)
+		}()
+
+		var conn net.Conn
+		err = tstest.WaitFor(time.Second*5, func() error {
+			conn, err = net.DialTimeout(c.network, c.dialAddr, time.Second*1)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+
+		dialerStepCh := make(chan error)
+		go func() {
+			dialerStepCh <- writeFn(conn)
+			dialerStepCh <- readFn(conn)
+		}()
+
+		var (
+			dialerSteps int
+			lisSteps    int
+		)
+		for {
+			select {
+			case lisErr := <-lisStepCh:
+				if lisErr != nil {
+					t.Fatal(err)
+				}
+				lisSteps++
+				if dialerSteps == 2 && lisSteps == 2 {
+					return
+				}
+			case dialerErr := <-dialerStepCh:
+				if dialerErr != nil {
+					t.Fatal(err)
+				}
+				dialerSteps++
+				if dialerSteps == 2 && lisSteps == 2 {
+					return
+				}
+			}
+		}
+	}
+
+	d1.MustCleanShutdown(t)
+}
+
+// TestNetstackUDPLoopback tests netstack loopback of UDP packets, in both
+// directions.
+func TestNetstackUDPLoopback(t *testing.T) {
+	tstest.Shard(t)
+	if os.Getuid() != 0 {
+		t.Skip("skipping when not root")
+	}
+
+	env := newTestEnv(t)
+	env.tunMode = true
+	loopbackPort := 5201
+	env.loopbackPort = &loopbackPort
+	n1 := newTestNode(t, env)
+	d1 := n1.StartDaemon()
+
+	n1.AwaitResponding()
+	n1.MustUp()
+
+	ip4 := n1.AwaitIP4()
+	ip6 := n1.AwaitIP6()
+	n1.AwaitRunning()
+
+	cases := []struct {
+		pingerLAddr *net.UDPAddr
+		pongerLAddr *net.UDPAddr
+		network     string
+		dialAddr    *net.UDPAddr
+	}{
+		{
+			pingerLAddr: &net.UDPAddr{IP: ip4.AsSlice(), Port: loopbackPort + 1},
+			pongerLAddr: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: loopbackPort},
+			network:     "udp4",
+			dialAddr:    &net.UDPAddr{IP: tsaddr.TailscaleServiceIP().AsSlice(), Port: loopbackPort},
+		},
+		{
+			pingerLAddr: &net.UDPAddr{IP: ip6.AsSlice(), Port: loopbackPort + 1},
+			pongerLAddr: &net.UDPAddr{IP: net.ParseIP("::1"), Port: loopbackPort},
+			network:     "udp6",
+			dialAddr:    &net.UDPAddr{IP: tsaddr.TailscaleServiceIPv6().AsSlice(), Port: loopbackPort},
+		},
+	}
+
+	writeBufSize := int(tstun.DefaultTUNMTU()) - 40 - 8 // mtu - ipv6 header - udp header
+	wantPongs := 100
+
+	for _, c := range cases {
+		pongerConn, err := net.ListenUDP(c.network, c.pongerLAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pongerConn.Close()
+
+		var pingerConn *net.UDPConn
+		err = tstest.WaitFor(time.Second*5, func() error {
+			pingerConn, err = net.DialUDP(c.network, c.pingerLAddr, c.dialAddr)
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pingerConn.Close()
+
+		pingerFn := func(conn *net.UDPConn) error {
+			b := make([]byte, writeBufSize)
+			n, err := conn.Write(b)
+			if err != nil {
+				return err
+			}
+			if n != len(b) {
+				return fmt.Errorf("bad write size: %d", n)
+			}
+			err = conn.SetReadDeadline(time.Now().Add(time.Millisecond * 500))
+			if err != nil {
+				return err
+			}
+			n, err = conn.Read(b)
+			if err != nil {
+				return err
+			}
+			if n != len(b) {
+				return fmt.Errorf("bad read size: %d", n)
+			}
+			return nil
+		}
+
+		pongerFn := func(conn *net.UDPConn) error {
+			for {
+				b := make([]byte, writeBufSize)
+				n, from, err := conn.ReadFromUDP(b)
+				if err != nil {
+					return err
+				}
+				if n != len(b) {
+					return fmt.Errorf("bad read size: %d", n)
+				}
+				n, err = conn.WriteToUDP(b, from)
+				if err != nil {
+					return err
+				}
+				if n != len(b) {
+					return fmt.Errorf("bad write size: %d", n)
+				}
+			}
+		}
+
+		pongerErrCh := make(chan error, 1)
+		go func() {
+			pongerErrCh <- pongerFn(pongerConn)
+		}()
+
+		err = tstest.WaitFor(time.Second*5, func() error {
+			err = pingerFn(pingerConn)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var pongsRX int
+		for {
+			pingerErrCh := make(chan error)
+			go func() {
+				pingerErrCh <- pingerFn(pingerConn)
+			}()
+
+			select {
+			case err := <-pongerErrCh:
+				t.Fatal(err)
+			case err := <-pingerErrCh:
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			pongsRX++
+			if pongsRX == wantPongs {
+				break
+			}
+		}
+	}
+
+	d1.MustCleanShutdown(t)
+}
+
 // testEnv contains the test environment (set of servers) used by one
 // or more nodes.
 type testEnv struct {
-	t       testing.TB
-	tunMode bool
-	cli     string
-	daemon  string
+	t            testing.TB
+	tunMode      bool
+	cli          string
+	daemon       string
+	loopbackPort *int
 
 	LogCatcher       *LogCatcher
 	LogCatcherServer *httptest.Server
@@ -984,6 +1512,16 @@ type testEnv struct {
 
 	TrafficTrap       *trafficTrap
 	TrafficTrapServer *httptest.Server
+}
+
+// controlURL returns e.ControlServer.URL, panicking if it's the empty string,
+// which it should never be in tests.
+func (e *testEnv) controlURL() string {
+	s := e.ControlServer.URL
+	if s == "" {
+		panic("control server not set")
+	}
+	return s
 }
 
 type testEnvOpt interface {
@@ -1002,7 +1540,6 @@ func newTestEnv(t testing.TB, opts ...testEnvOpt) *testEnv {
 	if runtime.GOOS == "windows" {
 		t.Skip("not tested/working on Windows yet")
 	}
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/7036")
 	derpMap := RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
 	logc := new(LogCatcher)
 	control := &testcontrol.Server{
@@ -1035,6 +1572,7 @@ func newTestEnv(t testing.TB, opts ...testEnvOpt) *testEnv {
 		e.TrafficTrapServer.Close()
 		e.ControlServer.Close()
 	})
+	t.Logf("control URL: %v", e.controlURL())
 	return e
 }
 
@@ -1042,7 +1580,8 @@ func newTestEnv(t testing.TB, opts ...testEnvOpt) *testEnv {
 // Currently, the test is simplistic and user==node==machine.
 // That may grow complexity later to test more.
 type testNode struct {
-	env *testEnv
+	env              *testEnv
+	tailscaledParser *nodeOutputParser
 
 	dir        string // temp dir for sock & state
 	configFile string // or empty for none
@@ -1073,11 +1612,16 @@ func newTestNode(t *testing.T, env *testEnv) *testNode {
 
 	// Look for a data race. Once we see the start marker, start logging the rest.
 	var sawRace bool
+	var sawPanic bool
 	n.addLogLineHook(func(line []byte) {
-		if mem.Contains(mem.B(line), mem.S("WARNING: DATA RACE")) {
+		lineB := mem.B(line)
+		if mem.Contains(lineB, mem.S("WARNING: DATA RACE")) {
 			sawRace = true
 		}
-		if sawRace {
+		if mem.HasPrefix(lineB, mem.S("panic: ")) {
+			sawPanic = true
+		}
+		if sawRace || sawPanic {
 			t.Logf("%s", line)
 		}
 	})
@@ -1168,19 +1712,25 @@ func (n *testNode) AwaitSocksAddr(ch <-chan string) string {
 // per-line callbacks previously registered via
 // testNode.addLogLineHook.
 type nodeOutputParser struct {
-	buf bytes.Buffer
-	n   *testNode
+	allBuf      bytes.Buffer
+	pendLineBuf bytes.Buffer
+	n           *testNode
 }
 
 func (op *nodeOutputParser) Write(p []byte) (n int, err error) {
-	n, err = op.buf.Write(p)
-	op.parseLines()
+	tn := op.n
+	tn.mu.Lock()
+	defer tn.mu.Unlock()
+
+	op.allBuf.Write(p)
+	n, err = op.pendLineBuf.Write(p)
+	op.parseLinesLocked()
 	return
 }
 
-func (op *nodeOutputParser) parseLines() {
+func (op *nodeOutputParser) parseLinesLocked() {
 	n := op.n
-	buf := op.buf.Bytes()
+	buf := op.pendLineBuf.Bytes()
 	for len(buf) > 0 {
 		nl := bytes.IndexByte(buf, '\n')
 		if nl == -1 {
@@ -1189,16 +1739,14 @@ func (op *nodeOutputParser) parseLines() {
 		line := buf[:nl+1]
 		buf = buf[nl+1:]
 
-		n.mu.Lock()
 		for _, f := range n.onLogLine {
 			f(line)
 		}
-		n.mu.Unlock()
 	}
 	if len(buf) == 0 {
-		op.buf.Reset()
+		op.pendLineBuf.Reset()
 	} else {
-		io.CopyN(io.Discard, &op.buf, int64(op.buf.Len()-len(buf)))
+		io.CopyN(io.Discard, &op.pendLineBuf, int64(op.pendLineBuf.Len()-len(buf)))
 	}
 }
 
@@ -1243,6 +1791,7 @@ func (n *testNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 		cmd.Args = append(cmd.Args, "--config="+n.configFile)
 	}
 	cmd.Env = append(os.Environ(),
+		"TS_CONTROL_IS_PLAINTEXT_HTTP=1",
 		"TS_DEBUG_PERMIT_HTTP_C2N=1",
 		"TS_LOG_TARGET="+n.env.LogCatcherServer.URL,
 		"HTTP_PROXY="+n.env.TrafficTrapServer.URL,
@@ -1250,11 +1799,19 @@ func (n *testNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 		"TS_DEBUG_FAKE_GOOS="+ipnGOOS,
 		"TS_LOGS_DIR="+t.TempDir(),
 		"TS_NETCHECK_GENERATE_204_URL="+n.env.ControlServer.URL+"/generate_204",
+		"TS_ASSUME_NETWORK_UP_FOR_TEST=1", // don't pause control client in airplane mode (no wifi, etc)
+		"TS_PANIC_IF_HIT_MAIN_CONTROL=1",
+		"TS_DISABLE_PORTMAPPER=1", // shouldn't be needed; test is all localhost
+		"TS_DEBUG_LOG_RATE=all",
 	)
+	if n.env.loopbackPort != nil {
+		cmd.Env = append(cmd.Env, "TS_DEBUG_NETSTACK_LOOPBACK_PORT="+strconv.Itoa(*n.env.loopbackPort))
+	}
 	if version.IsRace() {
 		cmd.Env = append(cmd.Env, "GORACE=halt_on_error=1")
 	}
-	cmd.Stderr = &nodeOutputParser{n: n}
+	n.tailscaledParser = &nodeOutputParser{n: n}
+	cmd.Stderr = n.tailscaledParser
 	if *verboseTailscaled {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = io.MultiWriter(cmd.Stderr, os.Stderr)
@@ -1282,7 +1839,7 @@ func (n *testNode) MustUp(extraArgs ...string) {
 	t.Helper()
 	args := []string{
 		"up",
-		"--login-server=" + n.env.ControlServer.URL,
+		"--login-server=" + n.env.controlURL(),
 		"--reset",
 	}
 	args = append(args, extraArgs...)
@@ -1323,7 +1880,7 @@ func (n *testNode) Ping(otherNode *testNode) error {
 func (n *testNode) AwaitListening() {
 	t := n.env.t
 	if err := tstest.WaitFor(20*time.Second, func() (err error) {
-		c, err := safesocket.Connect(n.sockFile)
+		c, err := safesocket.ConnectContext(context.Background(), n.sockFile)
 		if err == nil {
 			c.Close()
 		}
@@ -1384,6 +1941,10 @@ func (n *testNode) AwaitIP6() netip.Addr {
 
 // AwaitRunning waits for n to reach the IPN state "Running".
 func (n *testNode) AwaitRunning() {
+	n.AwaitBackendState("Running")
+}
+
+func (n *testNode) AwaitBackendState(state string) {
 	t := n.env.t
 	t.Helper()
 	if err := tstest.WaitFor(20*time.Second, func() error {
@@ -1391,8 +1952,8 @@ func (n *testNode) AwaitRunning() {
 		if err != nil {
 			return err
 		}
-		if st.BackendState != "Running" {
-			return fmt.Errorf("in state %q", st.BackendState)
+		if st.BackendState != state {
+			return fmt.Errorf("in state %q; want %q", st.BackendState, state)
 		}
 		return nil
 	}); err != nil {
@@ -1416,6 +1977,13 @@ func (n *testNode) AwaitNeedsLogin() {
 	}); err != nil {
 		t.Fatalf("failure/timeout waiting for transition to NeedsLogin status: %v", err)
 	}
+}
+
+func (n *testNode) TailscaleForOutput(arg ...string) *exec.Cmd {
+	cmd := n.Tailscale(arg...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	return cmd
 }
 
 // Tailscale returns a command that runs the tailscale CLI with the provided arguments.
@@ -1475,7 +2043,7 @@ func (tt *trafficTrap) Err() error {
 func (tt *trafficTrap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var got bytes.Buffer
 	r.Write(&got)
-	err := fmt.Errorf("unexpected HTTP proxy via proxy: %s", got.Bytes())
+	err := fmt.Errorf("unexpected HTTP request via proxy: %s", got.Bytes())
 	mainError.Store(err)
 	if tt.Err() == nil {
 		// Best effort at remembering the first request.

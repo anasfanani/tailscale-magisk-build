@@ -22,6 +22,8 @@ const (
 	legacyPrefsExt                   = ".conf"
 )
 
+var errAlreadyMigrated = errors.New("profile migration already completed")
+
 func legacyPrefsDir(uid ipn.WindowsUserID) (string, error) {
 	// TODO(aaron): Ideally we'd have the impersonation token for the pipe's
 	// client and use it to call SHGetKnownFolderPath, thus yielding the correct
@@ -37,10 +39,10 @@ func legacyPrefsDir(uid ipn.WindowsUserID) (string, error) {
 	return userLegacyPrefsDir, nil
 }
 
-func (pm *profileManager) loadLegacyPrefs() (string, ipn.PrefsView, error) {
-	userLegacyPrefsDir, err := legacyPrefsDir(pm.currentUserID)
+func (pm *profileManager) loadLegacyPrefs(uid ipn.WindowsUserID) (string, ipn.PrefsView, error) {
+	userLegacyPrefsDir, err := legacyPrefsDir(uid)
 	if err != nil {
-		pm.dlogf("no legacy preferences directory for %q: %v", pm.currentUserID, err)
+		pm.dlogf("no legacy preferences directory for %q: %v", uid, err)
 		return "", ipn.PrefsView{}, err
 	}
 
@@ -57,7 +59,7 @@ func (pm *profileManager) loadLegacyPrefs() (string, ipn.PrefsView, error) {
 	}
 
 	prefsPath := filepath.Join(userLegacyPrefsDir, legacyPrefsFile+legacyPrefsExt)
-	prefs, err := ipn.LoadPrefs(prefsPath)
+	prefs, err := ipn.LoadPrefsWindows(prefsPath)
 	pm.dlogf("ipn.LoadPrefs(%q) = %v, %v", prefsPath, prefs, err)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", ipn.PrefsView{}, errAlreadyMigrated

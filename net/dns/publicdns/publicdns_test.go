@@ -121,8 +121,8 @@ func TestDoHIPsOfBase(t *testing.T) {
 			want: ips(
 				"76.76.2.22",
 				"76.76.10.22",
-				"2a07:a8c0:0:6:7b5b:5949:35ad:0",
-				"2a07:a8c1:0:6:7b5b:5949:35ad:0",
+				"2606:1a40:0:6:7b5b:5949:35ad:0",
+				"2606:1a40:1:6:7b5b:5949:35ad:0",
 			),
 		},
 		{
@@ -130,8 +130,17 @@ func TestDoHIPsOfBase(t *testing.T) {
 			want: ips(
 				"76.76.2.22",
 				"76.76.10.22",
-				"2a07:a8c0:0:ffff:ffff:ffff:ffff:0",
-				"2a07:a8c1:0:ffff:ffff:ffff:ffff:0",
+				"2606:1a40:0:ffff:ffff:ffff:ffff:0",
+				"2606:1a40:1:ffff:ffff:ffff:ffff:0",
+			),
+		},
+		{
+			base: "https://dns.controld.com/hyq3ipr2ct/test-host-name",
+			want: ips(
+				"76.76.2.22",
+				"76.76.10.22",
+				"2606:1a40:0:6:7b5b:5949:35ad:0",
+				"2606:1a40:1:6:7b5b:5949:35ad:0",
 			),
 		},
 	}

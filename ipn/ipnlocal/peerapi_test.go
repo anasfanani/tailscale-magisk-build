@@ -26,6 +26,7 @@ import (
 	"tailscale.com/appc"
 	"tailscale.com/appc/appctest"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
@@ -34,6 +35,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/must"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 )
@@ -109,7 +111,7 @@ func fileHasContents(name string, want string) check {
 
 func hexAll(v string) string {
 	var sb strings.Builder
-	for i := 0; i < len(v); i++ {
+	for i := range len(v) {
 		fmt.Fprintf(&sb, "%%%02x", v[i])
 	}
 	return sb.String()
@@ -604,7 +606,7 @@ func TestFileDeleteRace(t *testing.T) {
 		ps: ps,
 	}
 	buf := make([]byte, 2<<20)
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		rr := httptest.NewRecorder()
 		ph.ServeHTTP(rr, httptest.NewRequest("PUT", "http://100.100.100.101:123/v0/put/foo.txt", bytes.NewReader(buf[:rand.Intn(len(buf))])))
 		if res := rr.Result(); res.StatusCode != 200 {
@@ -641,8 +643,10 @@ func TestPeerAPIReplyToDNSQueries(t *testing.T) {
 	h.isSelf = false
 	h.remoteAddr = netip.MustParseAddrPort("100.150.151.152:12345")
 
-	eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0)
-	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
+	ht := new(health.Tracker)
+	reg := new(usermetric.Registry)
+	eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0, ht, reg)
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf, ht))
 	h.ps = &peerAPIServer{
 		b: &LocalBackend{
 			e:     eng,
@@ -687,185 +691,215 @@ func TestPeerAPIReplyToDNSQueries(t *testing.T) {
 }
 
 func TestPeerAPIPrettyReplyCNAME(t *testing.T) {
-	var h peerAPIHandler
-	h.remoteAddr = netip.MustParseAddrPort("100.150.151.152:12345")
+	for _, shouldStore := range []bool{false, true} {
+		var h peerAPIHandler
+		h.remoteAddr = netip.MustParseAddrPort("100.150.151.152:12345")
 
-	eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0)
-	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
-	h.ps = &peerAPIServer{
-		b: &LocalBackend{
-			e:     eng,
-			pm:    pm,
-			store: pm.Store(),
-			// configure as an app connector just to enable the API.
-			appConnector: appc.NewAppConnector(t.Logf, &appctest.RouteCollector{}),
-		},
-	}
+		ht := new(health.Tracker)
+		reg := new(usermetric.Registry)
+		eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0, ht, reg)
+		pm := must.Get(newProfileManager(new(mem.Store), t.Logf, ht))
+		var a *appc.AppConnector
+		if shouldStore {
+			a = appc.NewAppConnector(t.Logf, &appctest.RouteCollector{}, &appc.RouteInfo{}, fakeStoreRoutes)
+		} else {
+			a = appc.NewAppConnector(t.Logf, &appctest.RouteCollector{}, nil, nil)
+		}
+		h.ps = &peerAPIServer{
+			b: &LocalBackend{
+				e:     eng,
+				pm:    pm,
+				store: pm.Store(),
+				// configure as an app connector just to enable the API.
+				appConnector: a,
+			},
+		}
 
-	h.ps.resolver = &fakeResolver{build: func(b *dnsmessage.Builder) {
-		b.CNAMEResource(
-			dnsmessage.ResourceHeader{
-				Name:  dnsmessage.MustNewName("www.example.com."),
-				Type:  dnsmessage.TypeCNAME,
-				Class: dnsmessage.ClassINET,
-				TTL:   0,
-			},
-			dnsmessage.CNAMEResource{
-				CNAME: dnsmessage.MustNewName("example.com."),
-			},
-		)
-		b.AResource(
-			dnsmessage.ResourceHeader{
-				Name:  dnsmessage.MustNewName("example.com."),
-				Type:  dnsmessage.TypeA,
-				Class: dnsmessage.ClassINET,
-				TTL:   0,
-			},
-			dnsmessage.AResource{
-				A: [4]byte{192, 0, 0, 8},
-			},
-		)
-	}}
-	f := filter.NewAllowAllForTest(logger.Discard)
-	h.ps.b.setFilter(f)
+		h.ps.resolver = &fakeResolver{build: func(b *dnsmessage.Builder) {
+			b.CNAMEResource(
+				dnsmessage.ResourceHeader{
+					Name:  dnsmessage.MustNewName("www.example.com."),
+					Type:  dnsmessage.TypeCNAME,
+					Class: dnsmessage.ClassINET,
+					TTL:   0,
+				},
+				dnsmessage.CNAMEResource{
+					CNAME: dnsmessage.MustNewName("example.com."),
+				},
+			)
+			b.AResource(
+				dnsmessage.ResourceHeader{
+					Name:  dnsmessage.MustNewName("example.com."),
+					Type:  dnsmessage.TypeA,
+					Class: dnsmessage.ClassINET,
+					TTL:   0,
+				},
+				dnsmessage.AResource{
+					A: [4]byte{192, 0, 0, 8},
+				},
+			)
+		}}
+		f := filter.NewAllowAllForTest(logger.Discard)
+		h.ps.b.setFilter(f)
 
-	if !h.replyToDNSQueries() {
-		t.Errorf("unexpectedly deny; wanted to be a DNS server")
-	}
+		if !h.replyToDNSQueries() {
+			t.Errorf("unexpectedly deny; wanted to be a DNS server")
+		}
 
-	w := httptest.NewRecorder()
-	h.handleDNSQuery(w, httptest.NewRequest("GET", "/dns-query?q=www.example.com.", nil))
-	if w.Code != http.StatusOK {
-		t.Errorf("unexpected status code: %v", w.Code)
-	}
-	var addrs []string
-	json.NewDecoder(w.Body).Decode(&addrs)
-	if len(addrs) == 0 {
-		t.Fatalf("no addresses returned")
-	}
-	for _, addr := range addrs {
-		netip.MustParseAddr(addr)
+		w := httptest.NewRecorder()
+		h.handleDNSQuery(w, httptest.NewRequest("GET", "/dns-query?q=www.example.com.", nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("unexpected status code: %v", w.Code)
+		}
+		var addrs []string
+		json.NewDecoder(w.Body).Decode(&addrs)
+		if len(addrs) == 0 {
+			t.Fatalf("no addresses returned")
+		}
+		for _, addr := range addrs {
+			netip.MustParseAddr(addr)
+		}
 	}
 }
 
 func TestPeerAPIReplyToDNSQueriesAreObserved(t *testing.T) {
-	ctx := context.Background()
-	var h peerAPIHandler
-	h.remoteAddr = netip.MustParseAddrPort("100.150.151.152:12345")
+	for _, shouldStore := range []bool{false, true} {
+		ctx := context.Background()
+		var h peerAPIHandler
+		h.remoteAddr = netip.MustParseAddrPort("100.150.151.152:12345")
 
-	rc := &appctest.RouteCollector{}
-	eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0)
-	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
-	h.ps = &peerAPIServer{
-		b: &LocalBackend{
-			e:            eng,
-			pm:           pm,
-			store:        pm.Store(),
-			appConnector: appc.NewAppConnector(t.Logf, rc),
-		},
-	}
-	h.ps.b.appConnector.UpdateDomains([]string{"example.com"})
-	h.ps.b.appConnector.Wait(ctx)
-
-	h.ps.resolver = &fakeResolver{build: func(b *dnsmessage.Builder) {
-		b.AResource(
-			dnsmessage.ResourceHeader{
-				Name:  dnsmessage.MustNewName("example.com."),
-				Type:  dnsmessage.TypeA,
-				Class: dnsmessage.ClassINET,
-				TTL:   0,
+		rc := &appctest.RouteCollector{}
+		ht := new(health.Tracker)
+		reg := new(usermetric.Registry)
+		eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0, ht, reg)
+		pm := must.Get(newProfileManager(new(mem.Store), t.Logf, ht))
+		var a *appc.AppConnector
+		if shouldStore {
+			a = appc.NewAppConnector(t.Logf, rc, &appc.RouteInfo{}, fakeStoreRoutes)
+		} else {
+			a = appc.NewAppConnector(t.Logf, rc, nil, nil)
+		}
+		h.ps = &peerAPIServer{
+			b: &LocalBackend{
+				e:            eng,
+				pm:           pm,
+				store:        pm.Store(),
+				appConnector: a,
 			},
-			dnsmessage.AResource{
-				A: [4]byte{192, 0, 0, 8},
-			},
-		)
-	}}
-	f := filter.NewAllowAllForTest(logger.Discard)
-	h.ps.b.setFilter(f)
+		}
+		h.ps.b.appConnector.UpdateDomains([]string{"example.com"})
+		h.ps.b.appConnector.Wait(ctx)
 
-	if !h.ps.b.OfferingAppConnector() {
-		t.Fatal("expecting to be offering app connector")
-	}
-	if !h.replyToDNSQueries() {
-		t.Errorf("unexpectedly deny; wanted to be a DNS server")
-	}
+		h.ps.resolver = &fakeResolver{build: func(b *dnsmessage.Builder) {
+			b.AResource(
+				dnsmessage.ResourceHeader{
+					Name:  dnsmessage.MustNewName("example.com."),
+					Type:  dnsmessage.TypeA,
+					Class: dnsmessage.ClassINET,
+					TTL:   0,
+				},
+				dnsmessage.AResource{
+					A: [4]byte{192, 0, 0, 8},
+				},
+			)
+		}}
+		f := filter.NewAllowAllForTest(logger.Discard)
+		h.ps.b.setFilter(f)
 
-	w := httptest.NewRecorder()
-	h.handleDNSQuery(w, httptest.NewRequest("GET", "/dns-query?q=example.com.", nil))
-	if w.Code != http.StatusOK {
-		t.Errorf("unexpected status code: %v", w.Code)
-	}
-	h.ps.b.appConnector.Wait(ctx)
+		if !h.ps.b.OfferingAppConnector() {
+			t.Fatal("expecting to be offering app connector")
+		}
+		if !h.replyToDNSQueries() {
+			t.Errorf("unexpectedly deny; wanted to be a DNS server")
+		}
 
-	wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
-	if !slices.Equal(rc.Routes(), wantRoutes) {
-		t.Errorf("got %v; want %v", rc.Routes(), wantRoutes)
+		w := httptest.NewRecorder()
+		h.handleDNSQuery(w, httptest.NewRequest("GET", "/dns-query?q=example.com.", nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("unexpected status code: %v", w.Code)
+		}
+		h.ps.b.appConnector.Wait(ctx)
+
+		wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
+		if !slices.Equal(rc.Routes(), wantRoutes) {
+			t.Errorf("got %v; want %v", rc.Routes(), wantRoutes)
+		}
 	}
 }
 
 func TestPeerAPIReplyToDNSQueriesAreObservedWithCNAMEFlattening(t *testing.T) {
-	ctx := context.Background()
-	var h peerAPIHandler
-	h.remoteAddr = netip.MustParseAddrPort("100.150.151.152:12345")
+	for _, shouldStore := range []bool{false, true} {
+		ctx := context.Background()
+		var h peerAPIHandler
+		h.remoteAddr = netip.MustParseAddrPort("100.150.151.152:12345")
 
-	rc := &appctest.RouteCollector{}
-	eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0)
-	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
-	h.ps = &peerAPIServer{
-		b: &LocalBackend{
-			e:            eng,
-			pm:           pm,
-			store:        pm.Store(),
-			appConnector: appc.NewAppConnector(t.Logf, rc),
-		},
-	}
-	h.ps.b.appConnector.UpdateDomains([]string{"www.example.com"})
-	h.ps.b.appConnector.Wait(ctx)
-
-	h.ps.resolver = &fakeResolver{build: func(b *dnsmessage.Builder) {
-		b.CNAMEResource(
-			dnsmessage.ResourceHeader{
-				Name:  dnsmessage.MustNewName("www.example.com."),
-				Type:  dnsmessage.TypeCNAME,
-				Class: dnsmessage.ClassINET,
-				TTL:   0,
+		ht := new(health.Tracker)
+		reg := new(usermetric.Registry)
+		rc := &appctest.RouteCollector{}
+		eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0, ht, reg)
+		pm := must.Get(newProfileManager(new(mem.Store), t.Logf, ht))
+		var a *appc.AppConnector
+		if shouldStore {
+			a = appc.NewAppConnector(t.Logf, rc, &appc.RouteInfo{}, fakeStoreRoutes)
+		} else {
+			a = appc.NewAppConnector(t.Logf, rc, nil, nil)
+		}
+		h.ps = &peerAPIServer{
+			b: &LocalBackend{
+				e:            eng,
+				pm:           pm,
+				store:        pm.Store(),
+				appConnector: a,
 			},
-			dnsmessage.CNAMEResource{
-				CNAME: dnsmessage.MustNewName("example.com."),
-			},
-		)
-		b.AResource(
-			dnsmessage.ResourceHeader{
-				Name:  dnsmessage.MustNewName("example.com."),
-				Type:  dnsmessage.TypeA,
-				Class: dnsmessage.ClassINET,
-				TTL:   0,
-			},
-			dnsmessage.AResource{
-				A: [4]byte{192, 0, 0, 8},
-			},
-		)
-	}}
-	f := filter.NewAllowAllForTest(logger.Discard)
-	h.ps.b.setFilter(f)
+		}
+		h.ps.b.appConnector.UpdateDomains([]string{"www.example.com"})
+		h.ps.b.appConnector.Wait(ctx)
 
-	if !h.ps.b.OfferingAppConnector() {
-		t.Fatal("expecting to be offering app connector")
-	}
-	if !h.replyToDNSQueries() {
-		t.Errorf("unexpectedly deny; wanted to be a DNS server")
-	}
+		h.ps.resolver = &fakeResolver{build: func(b *dnsmessage.Builder) {
+			b.CNAMEResource(
+				dnsmessage.ResourceHeader{
+					Name:  dnsmessage.MustNewName("www.example.com."),
+					Type:  dnsmessage.TypeCNAME,
+					Class: dnsmessage.ClassINET,
+					TTL:   0,
+				},
+				dnsmessage.CNAMEResource{
+					CNAME: dnsmessage.MustNewName("example.com."),
+				},
+			)
+			b.AResource(
+				dnsmessage.ResourceHeader{
+					Name:  dnsmessage.MustNewName("example.com."),
+					Type:  dnsmessage.TypeA,
+					Class: dnsmessage.ClassINET,
+					TTL:   0,
+				},
+				dnsmessage.AResource{
+					A: [4]byte{192, 0, 0, 8},
+				},
+			)
+		}}
+		f := filter.NewAllowAllForTest(logger.Discard)
+		h.ps.b.setFilter(f)
 
-	w := httptest.NewRecorder()
-	h.handleDNSQuery(w, httptest.NewRequest("GET", "/dns-query?q=www.example.com.", nil))
-	if w.Code != http.StatusOK {
-		t.Errorf("unexpected status code: %v", w.Code)
-	}
-	h.ps.b.appConnector.Wait(ctx)
+		if !h.ps.b.OfferingAppConnector() {
+			t.Fatal("expecting to be offering app connector")
+		}
+		if !h.replyToDNSQueries() {
+			t.Errorf("unexpectedly deny; wanted to be a DNS server")
+		}
 
-	wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
-	if !slices.Equal(rc.Routes(), wantRoutes) {
-		t.Errorf("got %v; want %v", rc.Routes(), wantRoutes)
+		w := httptest.NewRecorder()
+		h.handleDNSQuery(w, httptest.NewRequest("GET", "/dns-query?q=www.example.com.", nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("unexpected status code: %v", w.Code)
+		}
+		h.ps.b.appConnector.Wait(ctx)
+
+		wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
+		if !slices.Equal(rc.Routes(), wantRoutes) {
+			t.Errorf("got %v; want %v", rc.Routes(), wantRoutes)
+		}
 	}
 }
 

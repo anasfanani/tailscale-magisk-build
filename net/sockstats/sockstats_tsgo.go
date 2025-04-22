@@ -15,10 +15,10 @@ import (
 	"syscall"
 	"time"
 
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/version"
 )
 
 const IsAvailable = true
@@ -89,7 +89,7 @@ func withSockStats(ctx context.Context, label Label, logf logger.Logf) context.C
 		// had a chance to populate knownInterfaces). In that case, we'll have
 		// to get the list of interfaces ourselves.
 		if len(sockStats.knownInterfaces) == 0 {
-			if ifaces, err := interfaces.GetList(); err == nil {
+			if ifaces, err := netmon.GetInterfaceList(); err == nil {
 				for _, iface := range ifaces {
 					counters.rxBytesByInterface[iface.Index] = &atomic.Uint64{}
 					counters.txBytesByInterface[iface.Index] = &atomic.Uint64{}
@@ -157,7 +157,11 @@ func withSockStats(ctx context.Context, label Label, logf logger.Logf) context.C
 		}
 	}
 	willOverwrite := func(trace *net.SockTrace) {
-		logf("sockstats: trace %q was overwritten by another", label)
+		if version.IsUnstableBuild() {
+			// Only spam about this in dev builds.
+			// See https://github.com/tailscale/tailscale/issues/13731 for known problems.
+			logf("sockstats: trace %q was overwritten by another", label)
+		}
 	}
 
 	return net.WithSockTrace(ctx, &net.SockTrace{
@@ -275,7 +279,13 @@ func setNetMon(netMon *netmon.Monitor) {
 		if ifName == "" {
 			return
 		}
-		ifIndex := state.Interface[ifName].Index
+		// DefaultRouteInterface and Interface are gathered at different points in time.
+		// Check for existence first, to avoid a nil pointer dereference.
+		iface, ok := state.Interface[ifName]
+		if !ok {
+			return
+		}
+		ifIndex := iface.Index
 		sockStats.mu.Lock()
 		defer sockStats.mu.Unlock()
 		// Ignore changes to unknown interfaces -- it would require

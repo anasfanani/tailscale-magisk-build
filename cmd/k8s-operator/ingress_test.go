@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"tailscale.com/ipn"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
 )
@@ -93,6 +94,7 @@ func TestTailscaleIngress(t *testing.T) {
 		namespace:  "default",
 		parentType: "ingress",
 		hostname:   "default-test",
+		app:        kubetypes.AppIngressResource,
 	}
 	serveConfig := &ipn.ServeConfig{
 		TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
@@ -100,7 +102,7 @@ func TestTailscaleIngress(t *testing.T) {
 	}
 	opts.serveConfig = serveConfig
 
-	expectEqual(t, fc, expectedSecret(t, opts), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"), nil)
 	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation)
 
@@ -224,6 +226,7 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 		namespace:  "default",
 		parentType: "ingress",
 		hostname:   "default-test",
+		app:        kubetypes.AppIngressResource,
 	}
 	serveConfig := &ipn.ServeConfig{
 		TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
@@ -231,7 +234,7 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 	}
 	opts.serveConfig = serveConfig
 
-	expectEqual(t, fc, expectedSecret(t, opts), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"), nil)
 	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation)
 
@@ -248,9 +251,9 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 	// created proxy resources.
 	mustUpdateStatus(t, fc, "", "custom-metadata", func(pc *tsapi.ProxyClass) {
 		pc.Status = tsapi.ProxyClassStatus{
-			Conditions: []tsapi.ConnectorCondition{{
+			Conditions: []metav1.Condition{{
 				Status:             metav1.ConditionTrue,
-				Type:               tsapi.ProxyClassready,
+				Type:               string(tsapi.ProxyClassReady),
 				ObservedGeneration: pc.Generation,
 			}}}
 	})

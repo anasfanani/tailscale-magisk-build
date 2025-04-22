@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The derper binary is a simple DERP server.
+//
+// For more information, see:
+//
+//   - About: https://tailscale.com/kb/1232/derp-servers
+//   - Protocol & Go docs: https://pkg.go.dev/tailscale.com/derp
+//   - Running a DERP server: https://github.com/tailscale/tailscale/tree/main/cmd/derper#derp
 package main // import "tailscale.com/cmd/derper"
 
 import (
@@ -22,6 +28,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	runtimemetrics "runtime/metrics"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -55,7 +64,7 @@ var (
 	meshPSKFile     = flag.String("mesh-psk-file", defaultMeshPSKFile(), "if non-empty, path to file containing the mesh pre-shared key file. It should contain some hex string; whitespace is trimmed.")
 	meshWith        = flag.String("mesh-with", "", "optional comma-separated list of hostnames to mesh with; the server's own hostname can be in the list")
 	bootstrapDNS    = flag.String("bootstrap-dns-names", "", "optional comma-separated list of hostnames to make available at /bootstrap-dns")
-	unpublishedDNS  = flag.String("unpublished-bootstrap-dns-names", "", "optional comma-separated list of hostnames to make available at /bootstrap-dns and not publish in the list")
+	unpublishedDNS  = flag.String("unpublished-bootstrap-dns-names", "", "optional comma-separated list of hostnames to make available at /bootstrap-dns and not publish in the list. If an entry contains a slash, the second part names a DNS record to poll for its TXT record with a `0` to `100` value for rollout percentage.")
 	verifyClients   = flag.Bool("verify-clients", false, "verify clients to this DERP server through a local tailscaled instance.")
 	verifyClientURL = flag.String("verify-client-url", "", "if non-empty, an admission controller URL for permitting client connections; see tailcfg.DERPAdmitClientRequest")
 	verifyFailOpen  = flag.Bool("verify-client-url-fail-open", true, "whether we fail open if --verify-client-url is unreachable")
@@ -191,7 +200,12 @@ func main() {
 			http.Error(w, "derp server disabled", http.StatusNotFound)
 		}))
 	}
-	mux.HandleFunc("/derp/probe", probeHandler)
+
+	// These two endpoints are the same. Different versions of the clients
+	// have assumes different paths over time so we support both.
+	mux.HandleFunc("/derp/probe", derphttp.ProbeHandler)
+	mux.HandleFunc("/derp/latency-check", derphttp.ProbeHandler)
+
 	go refreshBootstrapDNSLoop()
 	mux.HandleFunc("/bootstrap-dns", tsweb.BrowserHeaderHandlerFunc(handleBootstrapDNS))
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -201,11 +215,16 @@ func main() {
 		io.WriteString(w, `<html><body>
 <h1>DERP</h1>
 <p>
-  This is a
-  <a href="https://tailscale.com/">Tailscale</a>
-  <a href="https://pkg.go.dev/tailscale.com/derp">DERP</a>
-  server.
+  This is a <a href="https://tailscale.com/">Tailscale</a> DERP server.
 </p>
+<p>
+  Documentation:
+</p>
+<ul>
+  <li><a href="https://tailscale.com/kb/1232/derp-servers">About DERP</a></li>
+  <li><a href="https://pkg.go.dev/tailscale.com/derp">Protocol & Go docs</a></li>
+  <li><a href="https://github.com/tailscale/tailscale/tree/main/cmd/derper#derp">How to run a DERP server</a></li>
+</ul>
 `)
 		if !*runDERP {
 			io.WriteString(w, `<p>Status: <b>disabled</b></p>`)
@@ -218,7 +237,7 @@ func main() {
 		tsweb.AddBrowserHeaders(w)
 		io.WriteString(w, "User-agent: *\nDisallow: /\n")
 	}))
-	mux.Handle("/generate_204", http.HandlerFunc(serveNoContent))
+	mux.Handle("/generate_204", http.HandlerFunc(derphttp.ServeNoContent))
 	debug := tsweb.Debugger(mux)
 	debug.KV("TLS hostname", *hostname)
 	debug.KV("Mesh key", s.HasMeshKey())
@@ -231,6 +250,20 @@ func main() {
 		}
 	}))
 	debug.Handle("traffic", "Traffic check", http.HandlerFunc(s.ServeDebugTraffic))
+	debug.Handle("set-mutex-profile-fraction", "SetMutexProfileFraction", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := r.FormValue("rate")
+		if s == "" || r.Header.Get("Sec-Debug") != "derp" {
+			http.Error(w, "To set, use: curl -HSec-Debug:derp 'http://derp/debug/set-mutex-profile-fraction?rate=100'", http.StatusBadRequest)
+			return
+		}
+		v, err := strconv.Atoi(s)
+		if err != nil {
+			http.Error(w, "bad rate value", http.StatusBadRequest)
+			return
+		}
+		old := runtime.SetMutexProfileFraction(v)
+		fmt.Fprintf(w, "mutex changed from %v to %v\n", old, v)
+	}))
 
 	// Longer lived DERP connections send an application layer keepalive. Note
 	// if the keepalive is hit, the user timeout will take precedence over the
@@ -304,7 +337,7 @@ func main() {
 		if *httpPort > -1 {
 			go func() {
 				port80mux := http.NewServeMux()
-				port80mux.HandleFunc("/generate_204", serveNoContent)
+				port80mux.HandleFunc("/generate_204", derphttp.ServeNoContent)
 				port80mux.Handle("/", certManager.HTTPHandler(tsweb.Port80Handler{Main: mux}))
 				port80srv := &http.Server{
 					Addr:        net.JoinHostPort(listenHost, fmt.Sprintf("%d", *httpPort)),
@@ -342,42 +375,6 @@ func main() {
 	}
 	if err != nil && err != http.ErrServerClosed {
 		log.Fatalf("derper: %v", err)
-	}
-}
-
-const (
-	noContentChallengeHeader = "X-Tailscale-Challenge"
-	noContentResponseHeader  = "X-Tailscale-Response"
-)
-
-// For captive portal detection
-func serveNoContent(w http.ResponseWriter, r *http.Request) {
-	if challenge := r.Header.Get(noContentChallengeHeader); challenge != "" {
-		badChar := strings.IndexFunc(challenge, func(r rune) bool {
-			return !isChallengeChar(r)
-		}) != -1
-		if len(challenge) <= 64 && !badChar {
-			w.Header().Set(noContentResponseHeader, "response "+challenge)
-		}
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func isChallengeChar(c rune) bool {
-	// Semi-randomly chosen as a limited set of valid characters
-	return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') ||
-		('0' <= c && c <= '9') ||
-		c == '.' || c == '-' || c == '_'
-}
-
-// probeHandler is the endpoint that js/wasm clients hit to measure
-// DERP latency, since they can't do UDP STUN queries.
-func probeHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "HEAD", "GET":
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-	default:
-		http.Error(w, "bogus probe method", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -457,4 +454,17 @@ func (l *rateLimitedListener) Accept() (net.Conn, error) {
 	}
 	l.numAccepts.Add(1)
 	return cn, nil
+}
+
+func init() {
+	expvar.Publish("go_sync_mutex_wait_seconds", expvar.Func(func() any {
+		const name = "/sync/mutex/wait/total:seconds" // Go 1.20+
+		var s [1]runtimemetrics.Sample
+		s[0].Name = name
+		runtimemetrics.Read(s[:])
+		if v := s[0].Value; v.Kind() == runtimemetrics.KindFloat64 {
+			return v.Float64()
+		}
+		return 0
+	}))
 }

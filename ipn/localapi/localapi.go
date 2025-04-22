@@ -6,6 +6,7 @@ package localapi
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -22,7 +23,6 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"runtime"
 	"slices"
@@ -31,12 +31,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/clientupdate"
 	"tailscale.com/drive"
 	"tailscale.com/envknob"
-	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnauth"
@@ -50,6 +49,7 @@ import (
 	"tailscale.com/taildrop"
 	"tailscale.com/tka"
 	"tailscale.com/tstime"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
@@ -60,9 +60,9 @@ import (
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/osdiag"
-	"tailscale.com/util/osuser"
 	"tailscale.com/util/progresstracking"
 	"tailscale.com/util/rands"
+	"tailscale.com/util/testenv"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/magicsock"
 )
@@ -98,6 +98,8 @@ var handler = map[string]localAPIHandler{
 	"derpmap":                     (*Handler).serveDERPMap,
 	"dev-set-state-store":         (*Handler).serveDevSetStateStore,
 	"dial":                        (*Handler).serveDial,
+	"dns-osconfig":                (*Handler).serveDNSOSConfig,
+	"dns-query":                   (*Handler).serveDNSQuery,
 	"drive/fileserver-address":    (*Handler).serveDriveServerAddr,
 	"drive/shares":                (*Handler).serveShares,
 	"file-targets":                (*Handler).serveFileTargets,
@@ -119,9 +121,11 @@ var handler = map[string]localAPIHandler{
 	"set-expiry-sooner":           (*Handler).serveSetExpirySooner,
 	"set-gui-visible":             (*Handler).serveSetGUIVisible,
 	"set-push-device-token":       (*Handler).serveSetPushDeviceToken,
+	"set-udp-gro-forwarding":      (*Handler).serveSetUDPGROForwarding,
 	"set-use-exit-node-enabled":   (*Handler).serveSetUseExitNodeEnabled,
 	"start":                       (*Handler).serveStart,
 	"status":                      (*Handler).serveStatus,
+	"suggest-exit-node":           (*Handler).serveSuggestExitNode,
 	"tka/affected-sigs":           (*Handler).serveTKAAffectedSigs,
 	"tka/cosign-recovery-aum":     (*Handler).serveTKACosignRecoveryAUM,
 	"tka/disable":                 (*Handler).serveTKADisable,
@@ -139,6 +143,7 @@ var handler = map[string]localAPIHandler{
 	"update/install":              (*Handler).serveUpdateInstall,
 	"update/progress":             (*Handler).serveUpdateProgress,
 	"upload-client-metrics":       (*Handler).serveUploadClientMetrics,
+	"usermetrics":                 (*Handler).serveUserMetrics,
 	"watch-ipn-bus":               (*Handler).serveWatchIPNBus,
 	"whois":                       (*Handler).serveWhoIs,
 }
@@ -155,8 +160,8 @@ var (
 
 // NewHandler creates a new LocalAPI HTTP handler. All parameters except netMon
 // are required (if non-nil it's used to do faster interface lookups).
-func NewHandler(b *ipnlocal.LocalBackend, logf logger.Logf, netMon *netmon.Monitor, logID logid.PublicID) *Handler {
-	return &Handler{b: b, logf: logf, netMon: netMon, backendLogID: logID, clock: tstime.StdClock{}}
+func NewHandler(b *ipnlocal.LocalBackend, logf logger.Logf, logID logid.PublicID) *Handler {
+	return &Handler{b: b, logf: logf, backendLogID: logID, clock: tstime.StdClock{}}
 }
 
 type Handler struct {
@@ -178,16 +183,11 @@ type Handler struct {
 	// cert fetching access.
 	PermitCert bool
 
-	// ConnIdentity is the identity of the client connected to the Handler.
-	ConnIdentity *ipnauth.ConnIdentity
-
-	// Test-only override for connIsLocalAdmin method. If non-nil,
-	// connIsLocalAdmin returns this value.
-	testConnIsLocalAdmin *bool
+	// Actor is the identity of the client connected to the Handler.
+	Actor ipnauth.Actor
 
 	b            *ipnlocal.LocalBackend
 	logf         logger.Logf
-	netMon       *netmon.Monitor // optional; nil means interfaces will be looked up on-demand
 	backendLogID logid.PublicID
 	clock        tstime.Clock
 }
@@ -357,7 +357,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 	}
 	hi, _ := json.Marshal(hostinfo.New())
 	h.logf("user bugreport hostinfo: %s", hi)
-	if err := health.OverallError(); err != nil {
+	if err := h.b.HealthTracker().OverallError(); err != nil {
 		h.logf("user bugreport health: %s", err.Error())
 	} else {
 		h.logf("user bugreport health: ok")
@@ -379,7 +379,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 	envknob.LogCurrent(logger.WithPrefix(h.logf, "user bugreport: "))
 
 	// OS-specific details
-	osdiag.LogSupportInfo(logger.WithPrefix(h.logf, "user bugreport OS: "), osdiag.LogSupportInfoReasonBugReport)
+	h.logf.JSON(1, "UserBugReportOS", osdiag.SupportInfo(osdiag.LogSupportInfoReasonBugReport))
 
 	if defBool(r.URL.Query().Get("diagnose"), false) {
 		h.b.Doctor(r.Context(), logger.WithPrefix(h.logf, "diag: "))
@@ -446,7 +446,8 @@ func (h *Handler) serveWhoIs(w http.ResponseWriter, r *http.Request) {
 // localBackendWhoIsMethods is the subset of ipn.LocalBackend as needed
 // by the localapi WhoIs method.
 type localBackendWhoIsMethods interface {
-	WhoIs(netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
+	WhoIs(string, netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
+	WhoIsNodeKey(key.NodePublic) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
 	PeerCaps(netip.Addr) tailcfg.PeerCapMap
 }
 
@@ -455,9 +456,21 @@ func (h *Handler) serveWhoIsWithBackend(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "whois access denied", http.StatusForbidden)
 		return
 	}
+	var (
+		n  tailcfg.NodeView
+		u  tailcfg.UserProfile
+		ok bool
+	)
 	var ipp netip.AddrPort
 	if v := r.FormValue("addr"); v != "" {
-		if ip, err := netip.ParseAddr(v); err == nil {
+		if strings.HasPrefix(v, "nodekey:") {
+			var k key.NodePublic
+			if err := k.UnmarshalText([]byte(v)); err != nil {
+				http.Error(w, "invalid nodekey in 'addr' parameter", http.StatusBadRequest)
+				return
+			}
+			n, u, ok = b.WhoIsNodeKey(k)
+		} else if ip, err := netip.ParseAddr(v); err == nil {
 			ipp = netip.AddrPortFrom(ip, 0)
 		} else {
 			var err error
@@ -467,11 +480,13 @@ func (h *Handler) serveWhoIsWithBackend(w http.ResponseWriter, r *http.Request, 
 				return
 			}
 		}
+		if ipp.IsValid() {
+			n, u, ok = b.WhoIs(r.FormValue("proto"), ipp)
+		}
 	} else {
 		http.Error(w, "missing 'addr' parameter", http.StatusBadRequest)
 		return
 	}
-	n, u, ok := b.WhoIs(ipp)
 	if !ok {
 		http.Error(w, "no match for IP:port", http.StatusNotFound)
 		return
@@ -555,6 +570,18 @@ func (h *Handler) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	clientmetric.WritePrometheusExpositionFormat(w)
 }
 
+// TODO(kradalby): Remove this once we have landed on a final set of
+// metrics to export to clients and consider the metrics stable.
+var debugUsermetricsEndpoint = envknob.RegisterBool("TS_DEBUG_USER_METRICS")
+
+func (h *Handler) serveUserMetrics(w http.ResponseWriter, r *http.Request) {
+	if !testenv.InTest() && !debugUsermetricsEndpoint() {
+		http.Error(w, "usermetrics debug flag not enabled", http.StatusForbidden)
+		return
+	}
+	h.b.UserMetricsRegistry().Handler(w, r)
+}
+
 func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
 		http.Error(w, "debug access denied", http.StatusForbidden)
@@ -584,20 +611,6 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 		err = h.b.DebugRebind()
 	case "restun":
 		err = h.b.DebugReSTUN()
-	case "enginestatus":
-		// serveRequestEngineStatus kicks off a call to RequestEngineStatus (via
-		// LocalBackend => UserspaceEngine => LocalBackend =>
-		// ipn.Notify{Engine}).
-		//
-		// This is a temporary (2022-11-25) measure for the Windows client's
-		// move to the LocalAPI HTTP interface. It was polling this over the IPN
-		// bus before every 2 seconds which is wasteful. We should add a bit to
-		// WatchIPNMask instead to let an IPN bus watcher say that it's
-		// interested in that info and then only send it on demand, not via
-		// polling. But for now we keep this interface because that's what the
-		// client already did. A future change will remove this, so don't depend
-		// on it.
-		h.b.RequestEngineStatus()
 	case "notify":
 		var n ipn.Notify
 		err = json.NewDecoder(r.Body).Decode(&n)
@@ -761,7 +774,7 @@ func (h *Handler) serveDebugPortmap(w http.ResponseWriter, r *http.Request) {
 	done := make(chan bool, 1)
 
 	var c *portmapper.Client
-	c = portmapper.NewClient(logger.WithPrefix(logf, "portmapper: "), h.netMon, debugKnobs, h.b.ControlKnobs(), func() {
+	c = portmapper.NewClient(logger.WithPrefix(logf, "portmapper: "), h.b.NetMon(), debugKnobs, h.b.ControlKnobs(), func() {
 		logf("portmapping changed.")
 		logf("have mapping: %v", c.HaveMapping())
 
@@ -916,7 +929,7 @@ func (h *Handler) serveDebugDialTypes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wg.Wait()
-	for i := 0; i < len(dialers); i++ {
+	for range len(dialers) {
 		res := <-results
 		fmt.Fprintf(w, "[%s] connected=%v err=%v\n", res.name, res.conn != nil, res.err)
 		if res.conn != nil {
@@ -1048,7 +1061,7 @@ func authorizeServeConfigForGOOSAndUserContext(goos string, configIn *ipn.ServeC
 	if !configIn.HasPathHandler() {
 		return nil
 	}
-	if h.connIsLocalAdmin() {
+	if h.Actor.IsLocalAdmin(h.b.OperatorUserID()) {
 		return nil
 	}
 	switch goos {
@@ -1062,104 +1075,6 @@ func authorizeServeConfigForGOOSAndUserContext(goos string, configIn *ipn.ServeC
 		panic("unreachable")
 	}
 
-}
-
-// connIsLocalAdmin reports whether the connected client has administrative
-// access to the local machine, for whatever that means with respect to the
-// current OS.
-//
-// This is useful because tailscaled itself always runs with elevated rights:
-// we want to avoid privilege escalation for certain mutative operations.
-func (h *Handler) connIsLocalAdmin() bool {
-	if h.testConnIsLocalAdmin != nil {
-		return *h.testConnIsLocalAdmin
-	}
-	if h.ConnIdentity == nil {
-		h.logf("[unexpected] missing ConnIdentity in LocalAPI Handler")
-		return false
-	}
-	switch runtime.GOOS {
-	case "windows":
-		tok, err := h.ConnIdentity.WindowsToken()
-		if err != nil {
-			if !errors.Is(err, ipnauth.ErrNotImplemented) {
-				h.logf("ipnauth.ConnIdentity.WindowsToken() error: %v", err)
-			}
-			return false
-		}
-		defer tok.Close()
-
-		return tok.IsElevated()
-
-	case "darwin":
-		// Unknown, or at least unchecked on sandboxed macOS variants. Err on
-		// the side of less permissions.
-		//
-		// authorizeServeConfigForGOOSAndUserContext should not call
-		// connIsLocalAdmin on sandboxed variants anyway.
-		if version.IsSandboxedMacOS() {
-			return false
-		}
-		// This is a standalone tailscaled setup, use the same logic as on
-		// Linux.
-		fallthrough
-	case "linux":
-		uid, ok := h.ConnIdentity.Creds().UserID()
-		if !ok {
-			return false
-		}
-		// root is always admin.
-		if uid == "0" {
-			return true
-		}
-		// if non-root, must be operator AND able to execute "sudo tailscale".
-		operatorUID := h.b.OperatorUserID()
-		if operatorUID != "" && uid != operatorUID {
-			return false
-		}
-		u, err := osuser.LookupByUID(uid)
-		if err != nil {
-			return false
-		}
-		// Short timeout just in case sudo hangs for some reason.
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		if err := exec.CommandContext(ctx, "sudo", "--other-user="+u.Name, "--list", "tailscale").Run(); err != nil {
-			return false
-		}
-		return true
-
-	default:
-		return false
-	}
-}
-
-func (h *Handler) getUsername() (string, error) {
-	if h.ConnIdentity == nil {
-		h.logf("[unexpected] missing ConnIdentity in LocalAPI Handler")
-		return "", errors.New("missing ConnIdentity")
-	}
-	switch runtime.GOOS {
-	case "windows":
-		tok, err := h.ConnIdentity.WindowsToken()
-		if err != nil {
-			return "", fmt.Errorf("get windows token: %w", err)
-		}
-		defer tok.Close()
-		return tok.Username()
-	case "darwin", "linux":
-		uid, ok := h.ConnIdentity.Creds().UserID()
-		if !ok {
-			return "", errors.New("missing user ID")
-		}
-		u, err := osuser.LookupByUID(uid)
-		if err != nil {
-			return "", fmt.Errorf("lookup user: %w", err)
-		}
-		return u.Username, nil
-	default:
-		return "", errors.New("unsupported OS")
-	}
 }
 
 func (h *Handler) serveCheckIPForwarding(w http.ResponseWriter, r *http.Request) {
@@ -1186,6 +1101,23 @@ func (h *Handler) serveCheckUDPGROForwarding(w http.ResponseWriter, r *http.Requ
 	}
 	var warning string
 	if err := h.b.CheckUDPGROForwarding(); err != nil {
+		warning = err.Error()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Warning string
+	}{
+		Warning: warning,
+	})
+}
+
+func (h *Handler) serveSetUDPGROForwarding(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "UDP GRO forwarding set access denied", http.StatusForbidden)
+		return
+	}
+	var warning string
+	if err := h.b.SetUDPGROForwarding(); err != nil {
 		warning = err.Error()
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1319,7 +1251,7 @@ func (h *Handler) serveLoginInteractive(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "want POST", http.StatusBadRequest)
 		return
 	}
-	h.b.StartLoginInteractive()
+	h.b.StartLoginInteractive(r.Context())
 	w.WriteHeader(http.StatusNoContent)
 	return
 }
@@ -1379,6 +1311,12 @@ func (h *Handler) servePrefs(w http.ResponseWriter, r *http.Request) {
 		mp := new(ipn.MaskedPrefs)
 		if err := json.NewDecoder(r.Body).Decode(mp); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := h.b.MaybeClearAppConnector(mp); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(resJSON{Error: err.Error()})
 			return
 		}
 		var err error
@@ -1624,7 +1562,7 @@ func (h *Handler) serveFilePut(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "PUT":
 		file := ipn.OutgoingFile{
-			ID:           uuid.Must(uuid.NewRandom()).String(),
+			ID:           rands.HexString(30),
 			PeerID:       peerID,
 			Name:         filenameEscaped,
 			DeclaredSize: r.ContentLength,
@@ -1727,10 +1665,17 @@ func (ww *multiFilePostResponseWriter) Write(p []byte) (int, error) {
 }
 
 func (ww *multiFilePostResponseWriter) Flush(w http.ResponseWriter) error {
-	maps.Copy(w.Header(), ww.Header())
-	w.WriteHeader(ww.statusCode)
-	_, err := io.Copy(w, ww.body)
-	return err
+	if ww.header != nil {
+		maps.Copy(w.Header(), ww.header)
+	}
+	if ww.statusCode > 0 {
+		w.WriteHeader(ww.statusCode)
+	}
+	if ww.body != nil {
+		_, err := io.Copy(w, ww.body)
+		return err
+	}
+	return nil
 }
 
 func (h *Handler) singleFilePut(
@@ -1948,8 +1893,10 @@ func (h *Handler) serveDial(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	network := cmp.Or(r.Header.Get("Dial-Network"), "tcp")
+
 	addr := net.JoinHostPort(hostStr, portStr)
-	outConn, err := h.b.Dialer().UserDial(r.Context(), "tcp", addr)
+	outConn, err := h.b.Dialer().UserDial(r.Context(), network, addr)
 	if err != nil {
 		http.Error(w, "dial failure: "+err.Error(), http.StatusBadGateway)
 		return
@@ -2762,6 +2709,87 @@ func (h *Handler) serveUpdateProgress(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(ups)
 }
 
+// serveDNSOSConfig serves the current system DNS configuration as a JSON object, if
+// supported by the OS.
+func (h *Handler) serveDNSOSConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != httpm.GET {
+		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Require write access for privacy reasons.
+	if !h.PermitWrite {
+		http.Error(w, "dns-osconfig dump access denied", http.StatusForbidden)
+		return
+	}
+	bCfg, err := h.b.GetDNSOSConfig()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	nameservers := make([]string, 0, len(bCfg.Nameservers))
+	for _, ns := range bCfg.Nameservers {
+		nameservers = append(nameservers, ns.String())
+	}
+	searchDomains := make([]string, 0, len(bCfg.SearchDomains))
+	for _, sd := range bCfg.SearchDomains {
+		searchDomains = append(searchDomains, sd.WithoutTrailingDot())
+	}
+	matchDomains := make([]string, 0, len(bCfg.MatchDomains))
+	for _, md := range bCfg.MatchDomains {
+		matchDomains = append(matchDomains, md.WithoutTrailingDot())
+	}
+	response := apitype.DNSOSConfig{
+		Nameservers:   nameservers,
+		SearchDomains: searchDomains,
+		MatchDomains:  matchDomains,
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+// serveDNSQuery provides the ability to perform DNS queries using the internal
+// DNS forwarder. This is useful for debugging and testing purposes.
+// URL parameters:
+//   - name: the domain name to query
+//   - type: the DNS record type to query as a number (default if empty: A = '1')
+//
+// The response if successful is a DNSQueryResponse JSON object.
+func (h *Handler) serveDNSQuery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Require write access for privacy reasons.
+	if !h.PermitWrite {
+		http.Error(w, "dns-query access denied", http.StatusForbidden)
+		return
+	}
+	q := r.URL.Query()
+	name := q.Get("name")
+	queryType := q.Get("type")
+	qt := dnsmessage.TypeA
+	if queryType != "" {
+		t, err := dnstype.DNSMessageTypeForString(queryType)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		qt = t
+	}
+
+	res, rrs, err := h.b.QueryDNS(name, qt)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&apitype.DNSQueryResponse{
+		Bytes:     res,
+		Resolvers: rrs,
+	})
+}
+
 // serveDriveServerAddr handles updates of the Taildrive file server address.
 func (h *Handler) serveDriveServerAddr(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "PUT" {
@@ -2810,7 +2838,7 @@ func (h *Handler) serveShares(w http.ResponseWriter, r *http.Request) {
 		}
 		if drive.AllowShareAs() {
 			// share as the connected user
-			username, err := h.getUsername()
+			username, err := h.Actor.Username()
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -2886,3 +2914,18 @@ var (
 	// User-visible LocalAPI endpoints.
 	metricFilePutCalls = clientmetric.NewCounter("localapi_file_put")
 )
+
+// serveSuggestExitNode serves a POST endpoint for returning a suggested exit node.
+func (h *Handler) serveSuggestExitNode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	res, err := h.b.SuggestExitNode()
+	if err != nil {
+		writeErrorJSON(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}

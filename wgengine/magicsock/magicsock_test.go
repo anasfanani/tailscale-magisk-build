@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -34,7 +35,6 @@ import (
 	xmaps "golang.org/x/exp/maps"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/derp"
@@ -46,6 +46,7 @@ import (
 	"tailscale.com/net/connstats"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/ping"
 	"tailscale.com/net/stun/stuntest"
@@ -63,6 +64,7 @@ import (
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/racebuild"
 	"tailscale.com/util/set"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
 	"tailscale.com/wgengine/wgcfg/nmcfg"
@@ -154,6 +156,8 @@ type magicStack struct {
 	tsTun      *tstun.Wrapper          // wrapped tun that implements filtering and wgengine hooks
 	dev        *device.Device          // the wireguard-go Device that connects the previous things
 	wgLogger   *wglog.Logger           // wireguard-go log wrapper
+	netMon     *netmon.Monitor         // always non-nil
+	metrics    *usermetric.Registry
 }
 
 // newMagicStack builds and initializes an idle magicsock and
@@ -167,9 +171,18 @@ func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, der
 func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap, privateKey key.NodePrivate) *magicStack {
 	t.Helper()
 
+	netMon, err := netmon.New(logf)
+	if err != nil {
+		t.Fatalf("netmon.New: %v", err)
+	}
+
+	var reg usermetric.Registry
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
 	conn, err := NewConn(Options{
+		NetMon:                 netMon,
+		Metrics:                &reg,
 		Logf:                   logf,
+		DisablePortMapper:      true,
 		TestOnlyPacketListener: l,
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {
 			epCh <- eps
@@ -184,7 +197,7 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 	}
 
 	tun := tuntest.NewChannelTUN()
-	tsTun := tstun.Wrap(logf, tun.TUN())
+	tsTun := tstun.Wrap(logf, tun.TUN(), &reg)
 	tsTun.SetFilter(filter.NewAllowAllForTest(logf))
 	tsTun.Start()
 
@@ -209,6 +222,8 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 		tsTun:      tsTun,
 		dev:        dev,
 		wgLogger:   wgLogger,
+		netMon:     netMon,
+		metrics:    &reg,
 	}
 }
 
@@ -226,6 +241,7 @@ func (s *magicStack) String() string {
 func (s *magicStack) Close() {
 	s.dev.Close()
 	s.conn.Close()
+	s.netMon.Close()
 }
 
 func (s *magicStack) Public() key.NodePublic {
@@ -319,7 +335,7 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 				peerSet.Add(peer.Key())
 			}
 			m.conn.UpdatePeers(peerSet)
-			wg, err := nmcfg.WGCfg(nm, logf, netmap.AllowSingleHosts, "")
+			wg, err := nmcfg.WGCfg(nm, logf, 0, "")
 			if err != nil {
 				// We're too far from the *testing.T to be graceful,
 				// blow up. Shouldn't happen anyway.
@@ -370,14 +386,23 @@ func TestNewConn(t *testing.T) {
 		}
 	}
 
+	netMon, err := netmon.New(logger.WithPrefix(t.Logf, "... netmon: "))
+	if err != nil {
+		t.Fatalf("netmon.New: %v", err)
+	}
+	defer netMon.Close()
+
 	stunAddr, stunCleanupFn := stuntest.Serve(t)
 	defer stunCleanupFn()
 
 	port := pickPort(t)
 	conn, err := NewConn(Options{
-		Port:          port,
-		EndpointsFunc: epFunc,
-		Logf:          t.Logf,
+		Port:              port,
+		DisablePortMapper: true,
+		EndpointsFunc:     epFunc,
+		Logf:              t.Logf,
+		NetMon:            netMon,
+		Metrics:           new(usermetric.Registry),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -432,7 +457,7 @@ func TestPickDERPFallback(t *testing.T) {
 	tstest.PanicOnLog()
 	tstest.ResourceCheck(t)
 
-	c := newConn()
+	c := newConn(t.Logf)
 	dm := &tailcfg.DERPMap{
 		Regions: map[int]*tailcfg.DERPRegion{
 			1: {},
@@ -452,7 +477,7 @@ func TestPickDERPFallback(t *testing.T) {
 	}
 
 	// Test that it's consistent.
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		b := c.pickDERPFallback()
 		if a != b {
 			t.Fatalf("got inconsistent %d vs %d values", a, b)
@@ -462,8 +487,8 @@ func TestPickDERPFallback(t *testing.T) {
 	// Test that that the pointer value of c is blended in and
 	// distribution over nodes works.
 	got := map[int]int{}
-	for i := 0; i < 50; i++ {
-		c = newConn()
+	for range 50 {
+		c = newConn(t.Logf)
 		c.derpMap = dm
 		got[c.pickDERPFallback()]++
 	}
@@ -494,9 +519,17 @@ func TestDeviceStartStop(t *testing.T) {
 	tstest.PanicOnLog()
 	tstest.ResourceCheck(t)
 
+	netMon, err := netmon.New(logger.WithPrefix(t.Logf, "... netmon: "))
+	if err != nil {
+		t.Fatalf("netmon.New: %v", err)
+	}
+	defer netMon.Close()
+
 	conn, err := NewConn(Options{
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {},
 		Logf:          t.Logf,
+		NetMon:        netMon,
+		Metrics:       new(usermetric.Registry),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -625,7 +658,7 @@ func (localhostListener) ListenPacket(ctx context.Context, network, address stri
 }
 
 func TestTwoDevicePing(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/1277")
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/11762")
 	l, ip := localhostListener{}, netaddr.IPv4(127, 0, 0, 1)
 	n := &devices{
 		m1:     l,
@@ -1158,8 +1191,7 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 }
 
 func TestDiscoMessage(t *testing.T) {
-	c := newConn()
-	c.logf = t.Logf
+	c := newConn(t.Logf)
 	c.privateKey = key.NewNode()
 
 	peer1Pub := c.DiscoPublicKey()
@@ -1240,7 +1272,18 @@ func Test32bitAlignment(t *testing.T) {
 func newTestConn(t testing.TB) *Conn {
 	t.Helper()
 	port := pickPort(t)
+
+	netMon, err := netmon.New(logger.WithPrefix(t.Logf, "... netmon: "))
+	if err != nil {
+		t.Fatalf("netmon.New: %v", err)
+	}
+	t.Cleanup(func() { netMon.Close() })
+
 	conn, err := NewConn(Options{
+		NetMon:                 netMon,
+		HealthTracker:          new(health.Tracker),
+		Metrics:                new(usermetric.Registry),
+		DisablePortMapper:      true,
 		Logf:                   t.Logf,
 		Port:                   port,
 		TestOnlyPacketListener: localhostListener{},
@@ -1407,7 +1450,7 @@ func TestReceiveFromAllocs(t *testing.T) {
 
 func BenchmarkReceiveFrom(b *testing.B) {
 	roundTrip := setUpReceiveFrom(b)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		roundTrip()
 	}
 }
@@ -1434,7 +1477,7 @@ func BenchmarkReceiveFrom_Native(b *testing.B) {
 	}
 
 	buf := make([]byte, 2<<10)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if _, err := sendConn.WriteTo(sendBuf, dstAddr); err != nil {
 			b.Fatalf("WriteTo: %v", err)
 		}
@@ -1483,7 +1526,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		conn.SetNetworkMap(&netmap.NetworkMap{
 			Peers: nodeViews([]*tailcfg.Node{
 				{
@@ -1566,13 +1609,13 @@ func TestRebindStress(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 2000; i++ {
+		for range 2000 {
 			conn.Rebind()
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 2000; i++ {
+		for range 2000 {
 			conn.Rebind()
 		}
 	}()
@@ -1826,7 +1869,7 @@ func TestStressSetNetworkMap(t *testing.T) {
 	prng := rand.New(rand.NewSource(int64(seed)))
 
 	const iters = 1000 // approx 0.5s on an m1 mac
-	for i := 0; i < iters; i++ {
+	for range iters {
 		for j := 0; j < npeers; j++ {
 			// Randomize which peers are present.
 			if prng.Int()&1 == 0 {
@@ -2002,238 +2045,6 @@ func TestBufferedDerpWritesBeforeDrop(t *testing.T) {
 	t.Logf("bufferedDerpWritesBeforeDrop = %d", vv)
 }
 
-func setGSOSize(control *[]byte, gsoSize uint16) {
-	*control = (*control)[:cap(*control)]
-	binary.LittleEndian.PutUint16(*control, gsoSize)
-}
-
-func getGSOSize(control []byte) (int, error) {
-	if len(control) < 2 {
-		return 0, nil
-	}
-	return int(binary.LittleEndian.Uint16(control)), nil
-}
-
-func Test_batchingUDPConn_splitCoalescedMessages(t *testing.T) {
-	c := &batchingUDPConn{
-		setGSOSizeInControl:   setGSOSize,
-		getGSOSizeFromControl: getGSOSize,
-	}
-
-	newMsg := func(n, gso int) ipv6.Message {
-		msg := ipv6.Message{
-			Buffers: [][]byte{make([]byte, 1024)},
-			N:       n,
-			OOB:     make([]byte, 2),
-		}
-		binary.LittleEndian.PutUint16(msg.OOB, uint16(gso))
-		if gso > 0 {
-			msg.NN = 2
-		}
-		return msg
-	}
-
-	cases := []struct {
-		name        string
-		msgs        []ipv6.Message
-		firstMsgAt  int
-		wantNumEval int
-		wantMsgLens []int
-		wantErr     bool
-	}{
-		{
-			name: "second last split last empty",
-			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
-				newMsg(3, 1),
-				newMsg(0, 0),
-			},
-			firstMsgAt:  2,
-			wantNumEval: 3,
-			wantMsgLens: []int{1, 1, 1, 0},
-			wantErr:     false,
-		},
-		{
-			name: "second last no split last empty",
-			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
-				newMsg(1, 0),
-				newMsg(0, 0),
-			},
-			firstMsgAt:  2,
-			wantNumEval: 1,
-			wantMsgLens: []int{1, 0, 0, 0},
-			wantErr:     false,
-		},
-		{
-			name: "second last no split last no split",
-			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
-				newMsg(1, 0),
-				newMsg(1, 0),
-			},
-			firstMsgAt:  2,
-			wantNumEval: 2,
-			wantMsgLens: []int{1, 1, 0, 0},
-			wantErr:     false,
-		},
-		{
-			name: "second last no split last split",
-			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
-				newMsg(1, 0),
-				newMsg(3, 1),
-			},
-			firstMsgAt:  2,
-			wantNumEval: 4,
-			wantMsgLens: []int{1, 1, 1, 1},
-			wantErr:     false,
-		},
-		{
-			name: "second last split last split",
-			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
-				newMsg(2, 1),
-				newMsg(2, 1),
-			},
-			firstMsgAt:  2,
-			wantNumEval: 4,
-			wantMsgLens: []int{1, 1, 1, 1},
-			wantErr:     false,
-		},
-		{
-			name: "second last no split last split overflow",
-			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
-				newMsg(1, 0),
-				newMsg(4, 1),
-			},
-			firstMsgAt:  2,
-			wantNumEval: 4,
-			wantMsgLens: []int{1, 1, 1, 1},
-			wantErr:     true,
-		},
-	}
-
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := c.splitCoalescedMessages(tt.msgs, 2)
-			if err != nil && !tt.wantErr {
-				t.Fatalf("err: %v", err)
-			}
-			if got != tt.wantNumEval {
-				t.Fatalf("got to eval: %d want: %d", got, tt.wantNumEval)
-			}
-			for i, msg := range tt.msgs {
-				if msg.N != tt.wantMsgLens[i] {
-					t.Fatalf("msg[%d].N: %d want: %d", i, msg.N, tt.wantMsgLens[i])
-				}
-			}
-		})
-	}
-}
-
-func Test_batchingUDPConn_coalesceMessages(t *testing.T) {
-	c := &batchingUDPConn{
-		setGSOSizeInControl:   setGSOSize,
-		getGSOSizeFromControl: getGSOSize,
-	}
-
-	cases := []struct {
-		name     string
-		buffs    [][]byte
-		wantLens []int
-		wantGSO  []int
-	}{
-		{
-			name: "one message no coalesce",
-			buffs: [][]byte{
-				make([]byte, 1, 1),
-			},
-			wantLens: []int{1},
-			wantGSO:  []int{0},
-		},
-		{
-			name: "two messages equal len coalesce",
-			buffs: [][]byte{
-				make([]byte, 1, 2),
-				make([]byte, 1, 1),
-			},
-			wantLens: []int{2},
-			wantGSO:  []int{1},
-		},
-		{
-			name: "two messages unequal len coalesce",
-			buffs: [][]byte{
-				make([]byte, 2, 3),
-				make([]byte, 1, 1),
-			},
-			wantLens: []int{3},
-			wantGSO:  []int{2},
-		},
-		{
-			name: "three messages second unequal len coalesce",
-			buffs: [][]byte{
-				make([]byte, 2, 3),
-				make([]byte, 1, 1),
-				make([]byte, 2, 2),
-			},
-			wantLens: []int{3, 2},
-			wantGSO:  []int{2, 0},
-		},
-		{
-			name: "three messages limited cap coalesce",
-			buffs: [][]byte{
-				make([]byte, 2, 4),
-				make([]byte, 2, 2),
-				make([]byte, 2, 2),
-			},
-			wantLens: []int{4, 2},
-			wantGSO:  []int{2, 0},
-		},
-	}
-
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			addr := &net.UDPAddr{
-				IP:   net.ParseIP("127.0.0.1"),
-				Port: 1,
-			}
-			msgs := make([]ipv6.Message, len(tt.buffs))
-			for i := range msgs {
-				msgs[i].Buffers = make([][]byte, 1)
-				msgs[i].OOB = make([]byte, 0, 2)
-			}
-			got := c.coalesceMessages(addr, tt.buffs, msgs)
-			if got != len(tt.wantLens) {
-				t.Fatalf("got len %d want: %d", got, len(tt.wantLens))
-			}
-			for i := 0; i < got; i++ {
-				if msgs[i].Addr != addr {
-					t.Errorf("msgs[%d].Addr != passed addr", i)
-				}
-				gotLen := len(msgs[i].Buffers[0])
-				if gotLen != tt.wantLens[i] {
-					t.Errorf("len(msgs[%d].Buffers[0]) %d != %d", i, gotLen, tt.wantLens[i])
-				}
-				gotGSO, err := getGSOSize(msgs[i].OOB)
-				if err != nil {
-					t.Fatalf("msgs[%d] getGSOSize err: %v", i, err)
-				}
-				if gotGSO != tt.wantGSO[i] {
-					t.Errorf("msgs[%d] gsoSize %d != %d", i, gotGSO, tt.wantGSO[i])
-				}
-			}
-		})
-	}
-}
-
 // newWireguard starts up a new wireguard-go device attached to a test tun, and
 // returns the device, tun and endpoint port. To add peers call device.IpcSet with UAPI instructions.
 func newWireguard(t *testing.T, uapi string, aips []netip.Prefix) (*device.Device, *tuntest.ChannelTUN, uint16) {
@@ -2318,7 +2129,7 @@ func TestIsWireGuardOnlyPeer(t *testing.T) {
 	}
 	m.conn.SetNetworkMap(nm)
 
-	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSingleHosts|netmap.AllowSubnetRoutes, "")
+	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSubnetRoutes, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2380,7 +2191,7 @@ func TestIsWireGuardOnlyPeerWithMasquerade(t *testing.T) {
 	}
 	m.conn.SetNetworkMap(nm)
 
-	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSingleHosts|netmap.AllowSubnetRoutes, "")
+	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSubnetRoutes, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2420,7 +2231,7 @@ func applyNetworkMap(t *testing.T, m *magicStack, nm *netmap.NetworkMap) {
 	m.conn.noV6.Store(true)
 
 	// Turn the network map into a wireguard config (for the tailscale internal wireguard device).
-	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSingleHosts|netmap.AllowSubnetRoutes, "")
+	cfg, err := nmcfg.WGCfg(nm, t.Logf, netmap.AllowSubnetRoutes, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3093,6 +2904,20 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 			want:               1, // no change
 		},
 		{
+			name:               "not_connected_with_report_derp_and_no_current",
+			old:                0,     // no current DERP
+			reportDERP:         21,    // have new DERP
+			connectedToControl: false, // not connected...
+			want:               21,    // ... but want to change to new DERP
+		},
+		{
+			name:               "not_connected_with_fallback_and_no_current",
+			old:                0,     // no current DERP
+			reportDERP:         0,     // no new DERP
+			connectedToControl: false, // not connected...
+			want:               31,    // ... but we fallback to deterministic value
+		},
+		{
 			name:               "connected_no_derp",
 			old:                1,
 			reportDERP:         0,
@@ -3109,21 +2934,22 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 	}
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
-			c := newConn()
-			c.logf = t.Logf
+			ht := new(health.Tracker)
+			c := newConn(t.Logf)
 			c.myDerp = tt.old
 			c.derpMap = derpMap
+			c.health = ht
 
 			report := &netcheck.Report{PreferredDERP: tt.reportDERP}
 
-			oldConnected := health.GetInPollNetMap()
+			oldConnected := ht.GetInPollNetMap()
 			if tt.connectedToControl != oldConnected {
 				if tt.connectedToControl {
-					health.GotStreamedMapResponse()
-					t.Cleanup(health.SetOutOfPollNetMap)
+					ht.GotStreamedMapResponse()
+					t.Cleanup(ht.SetOutOfPollNetMap)
 				} else {
-					health.SetOutOfPollNetMap()
-					t.Cleanup(health.GotStreamedMapResponse)
+					ht.SetOutOfPollNetMap()
+					t.Cleanup(ht.GotStreamedMapResponse)
 				}
 			}
 
@@ -3133,4 +2959,39 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMaybeRebindOnError(t *testing.T) {
+	tstest.PanicOnLog()
+	tstest.ResourceCheck(t)
+
+	err := fmt.Errorf("outer err: %w", syscall.EPERM)
+
+	t.Run("darwin-rebind", func(t *testing.T) {
+		conn := newTestConn(t)
+		defer conn.Close()
+		rebound := conn.maybeRebindOnError("darwin", err)
+		if !rebound {
+			t.Errorf("darwin should rebind on syscall.EPERM")
+		}
+	})
+
+	t.Run("linux-not-rebind", func(t *testing.T) {
+		conn := newTestConn(t)
+		defer conn.Close()
+		rebound := conn.maybeRebindOnError("linux", err)
+		if rebound {
+			t.Errorf("linux should not rebind on syscall.EPERM")
+		}
+	})
+
+	t.Run("no-frequent-rebind", func(t *testing.T) {
+		conn := newTestConn(t)
+		defer conn.Close()
+		conn.lastEPERMRebind.Store(time.Now().Add(-1 * time.Second))
+		rebound := conn.maybeRebindOnError("darwin", err)
+		if rebound {
+			t.Errorf("darwin should not rebind on syscall.EPERM within 5 seconds of last")
+		}
+	})
 }

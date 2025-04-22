@@ -10,7 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/gorilla/csrf"
 )
 
@@ -80,6 +82,7 @@ func TestPostRequestContentTypeValidation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer s.Close()
 
 			req := httptest.NewRequest("POST", "/", nil)
 			req.Header.Set("Content-Type", tt.contentType)
@@ -137,6 +140,7 @@ func TestAPIMuxCrossOriginResourceSharingHeaders(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer s.Close()
 
 			req := httptest.NewRequest(tt.httpMethod, "/", nil)
 			w := httptest.NewRecorder()
@@ -192,6 +196,7 @@ func TestCSRFProtection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer s.Close()
 
 			// construct the test request
 			req := httptest.NewRequest("POST", "/", nil)
@@ -267,6 +272,7 @@ func TestContentSecurityPolicyHeader(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer s.Close()
 
 			req := httptest.NewRequest("GET", "/", nil)
 			w := httptest.NewRecorder()
@@ -307,6 +313,7 @@ func TestCSRFCookieSecureMode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer s.Close()
 
 			req := httptest.NewRequest("GET", "/", nil)
 			w := httptest.NewRecorder()
@@ -355,6 +362,7 @@ func TestRefererPolicy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer s.Close()
 
 			req := httptest.NewRequest("GET", "/", nil)
 			w := httptest.NewRecorder()
@@ -379,6 +387,7 @@ func TestCSPAllowInlineStyles(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer s.Close()
 
 			req := httptest.NewRequest("GET", "/", nil)
 			w := httptest.NewRecorder()
@@ -447,7 +456,7 @@ func TestRouting(t *testing.T) {
 			browserPatterns: []string{"/foo/"},
 			apiPatterns:     []string{"/foo/bar/"},
 			requestPath:     "/foo/bar/baz",
-			want:            "multiple handlers match this request",
+			want:            "api",
 		},
 		{
 			desc:            "no match",
@@ -474,6 +483,7 @@ func TestRouting(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer s.Close()
 
 			req := httptest.NewRequest("GET", tt.requestPath, nil)
 			w := httptest.NewRecorder()
@@ -486,5 +496,140 @@ func TestRouting(t *testing.T) {
 				t.Errorf("got response %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestGetMoreSpecificPattern(t *testing.T) {
+	for _, tt := range []struct {
+		desc string
+		a    string
+		b    string
+		want handlerType
+	}{
+		{
+			desc: "identical",
+			a:    "/foo/bar",
+			b:    "/foo/bar",
+			want: unknownHandler,
+		},
+		{
+			desc: "identical prefix",
+			a:    "/foo/bar/",
+			b:    "/foo/bar/",
+			want: unknownHandler,
+		},
+		{
+			desc: "trailing slash",
+			a:    "/foo",
+			b:    "/foo/", // path.Clean will strip the trailing slash.
+			want: unknownHandler,
+		},
+		{
+			desc: "same prefix",
+			a:    "/foo/bar/quux",
+			b:    "/foo/bar/",
+			want: apiHandler,
+		},
+		{
+			desc: "almost same prefix, but not a path component",
+			a:    "/goat/sheep/cheese",
+			b:    "/goat/sheepcheese/",
+			want: apiHandler,
+		},
+		{
+			desc: "attempt to make less-specific pattern look more specific",
+			a:    "/goat/cat/buddy",
+			b:    "/goat/../../../../../../../cat", // path.Clean catches this foolishness
+			want: apiHandler,
+		},
+		{
+			desc: "2 names for / (1)",
+			a:    "/",
+			b:    "/../../../../../../",
+			want: unknownHandler,
+		},
+		{
+			desc: "2 names for / (2)",
+			a:    "/",
+			b:    "///////",
+			want: unknownHandler,
+		},
+	} {
+		t.Run(tt.desc, func(t *testing.T) {
+			got := checkHandlerType(tt.a, tt.b)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStrictTransportSecurityOptions(t *testing.T) {
+	tests := []struct {
+		name          string
+		options       string
+		secureContext bool
+		expect        string
+	}{
+		{
+			name: "off by default",
+		},
+		{
+			name:          "default HSTS options in the secure context",
+			secureContext: true,
+			expect:        DefaultStrictTransportSecurityOptions,
+		},
+		{
+			name:          "custom options sent in the secure context",
+			options:       DefaultStrictTransportSecurityOptions + "; includeSubDomains",
+			secureContext: true,
+			expect:        DefaultStrictTransportSecurityOptions + "; includeSubDomains",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &http.ServeMux{}
+			h.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte("ok"))
+			}))
+			s, err := NewServer(Config{BrowserMux: h, SecureContext: tt.secureContext, StrictTransportSecurityOptions: tt.options})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+
+			req := httptest.NewRequest("GET", "/", nil)
+			w := httptest.NewRecorder()
+			s.h.Handler.ServeHTTP(w, req)
+			resp := w.Result()
+
+			if cmp.Diff(tt.expect, resp.Header.Get("Strict-Transport-Security")) != "" {
+				t.Fatalf("HSTS want: %q; got: %q", tt.expect, resp.Header.Get("Strict-Transport-Security"))
+			}
+		})
+	}
+}
+
+func TestOverrideHTTPServer(t *testing.T) {
+	s, err := NewServer(Config{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if s.h.IdleTimeout != 0 {
+		t.Fatalf("got %v; want 0", s.h.IdleTimeout)
+	}
+
+	c := http.Server{
+		IdleTimeout: 10 * time.Second,
+	}
+
+	s, err = NewServer(Config{HTTPServer: &c})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	if s.h.IdleTimeout != c.IdleTimeout {
+		t.Fatalf("got %v; want %v", s.h.IdleTimeout, c.IdleTimeout)
 	}
 }

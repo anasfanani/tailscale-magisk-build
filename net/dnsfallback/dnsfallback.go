@@ -28,6 +28,7 @@ import (
 
 	"tailscale.com/atomicfile"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/net/dns/recursive"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
@@ -64,9 +65,10 @@ func MakeLookupFunc(logf logger.Logf, netMon *netmon.Monitor) func(ctx context.C
 // fallbackResolver contains the state and configuration for a DNS resolution
 // function.
 type fallbackResolver struct {
-	logf   logger.Logf
-	netMon *netmon.Monitor // or nil
-	sf     singleflight.Group[string, resolveResult]
+	logf          logger.Logf
+	netMon        *netmon.Monitor // or nil
+	healthTracker *health.Tracker // or nil
+	sf            singleflight.Group[string, resolveResult]
 
 	// for tests
 	waitForCompare bool
@@ -79,7 +81,7 @@ func (fr *fallbackResolver) Lookup(ctx context.Context, host string) ([]netip.Ad
 	// recursive resolver. (tailscale/corp#15261) In the future, we might
 	// change the default (the opt.Bool being unset) to mean enabled.
 	if disableRecursiveResolver() || !optRecursiveResolver().EqualBool(true) {
-		return lookup(ctx, host, fr.logf, fr.netMon)
+		return lookup(ctx, host, fr.logf, fr.healthTracker, fr.netMon)
 	}
 
 	addrsCh := make(chan []netip.Addr, 1)
@@ -99,7 +101,7 @@ func (fr *fallbackResolver) Lookup(ctx context.Context, host string) ([]netip.Ad
 		go fr.compareWithRecursive(ctx, addrsCh, host)
 	}
 
-	addrs, err := lookup(ctx, host, fr.logf, fr.netMon)
+	addrs, err := lookup(ctx, host, fr.logf, fr.healthTracker, fr.netMon)
 	if err != nil {
 		addrsCh <- nil
 		return nil, err
@@ -207,7 +209,7 @@ func (fr *fallbackResolver) compareWithRecursive(
 	}
 }
 
-func lookup(ctx context.Context, host string, logf logger.Logf, netMon *netmon.Monitor) ([]netip.Addr, error) {
+func lookup(ctx context.Context, host string, logf logger.Logf, ht *health.Tracker, netMon *netmon.Monitor) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil && ip.IsValid() {
 		return []netip.Addr{ip}, nil
 	}
@@ -217,7 +219,7 @@ func lookup(ctx context.Context, host string, logf logger.Logf, netMon *netmon.M
 		ip      netip.Addr
 	}
 
-	dm := getDERPMap()
+	dm := GetDERPMap()
 
 	var cands4, cands6 []nameIP
 	for _, dr := range dm.Regions {
@@ -255,7 +257,7 @@ func lookup(ctx context.Context, host string, logf logger.Logf, netMon *netmon.M
 		logf("trying bootstrapDNS(%q, %q) for %q ...", cand.dnsName, cand.ip, host)
 		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
-		dm, err := bootstrapDNSMap(ctx, cand.dnsName, cand.ip, host, logf, netMon)
+		dm, err := bootstrapDNSMap(ctx, cand.dnsName, cand.ip, host, logf, ht, netMon)
 		if err != nil {
 			logf("bootstrapDNS(%q, %q) for %q error: %v", cand.dnsName, cand.ip, host, err)
 			continue
@@ -274,14 +276,17 @@ func lookup(ctx context.Context, host string, logf logger.Logf, netMon *netmon.M
 
 // serverName and serverIP of are, say, "derpN.tailscale.com".
 // queryName is the name being sought (e.g. "controlplane.tailscale.com"), passed as hint.
-func bootstrapDNSMap(ctx context.Context, serverName string, serverIP netip.Addr, queryName string, logf logger.Logf, netMon *netmon.Monitor) (dnsMap, error) {
+//
+// ht may be nil.
+func bootstrapDNSMap(ctx context.Context, serverName string, serverIP netip.Addr, queryName string, logf logger.Logf, ht *health.Tracker, netMon *netmon.Monitor) (dnsMap, error) {
 	dialer := netns.NewDialer(logf, netMon)
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DisableKeepAlives = true // This transport is meant to be used once.
 	tr.Proxy = tshttpproxy.ProxyFromEnvironment
 	tr.DialContext = func(ctx context.Context, netw, addr string) (net.Conn, error) {
 		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(serverIP.String(), "443"))
 	}
-	tr.TLSClientConfig = tlsdial.Config(serverName, tr.TLSClientConfig)
+	tr.TLSClientConfig = tlsdial.Config(serverName, ht, tr.TLSClientConfig)
 	c := &http.Client{Transport: tr}
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+serverName+"/bootstrap-dns?q="+url.QueryEscape(queryName), nil)
 	if err != nil {
@@ -306,9 +311,12 @@ func bootstrapDNSMap(ctx context.Context, serverName string, serverIP netip.Addr
 // https://derp10.tailscale.com/bootstrap-dns
 type dnsMap map[string][]netip.Addr
 
-// getDERPMap returns some DERP map. The DERP servers also run a fallback
-// DNS server.
-func getDERPMap() *tailcfg.DERPMap {
+// GetDERPMap returns a fallback DERP map that is always available, useful for basic
+// bootstrapping purposes. The dynamically updated DERP map in LocalBackend should
+// always be preferred over this. Use this DERP map only when the control plane is
+// unreachable or hasn't been reached yet. The DERP servers in the returned map also
+// run a fallback DNS server.
+func GetDERPMap() *tailcfg.DERPMap {
 	dm := getStaticDERPMap()
 
 	// Merge in any DERP servers from the cached map that aren't in the

@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"tailscale.com/health"
 	"tailscale.com/net/dns/resolvconffile"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
@@ -116,8 +117,9 @@ func restartResolved() error {
 // The caller must call Down before program shutdown
 // or as cleanup if the program terminates unexpectedly.
 type directManager struct {
-	logf logger.Logf
-	fs   wholeFileFS
+	logf   logger.Logf
+	health *health.Tracker
+	fs     wholeFileFS
 	// renameBroken is set if fs.Rename to or from /etc/resolv.conf
 	// fails. This can happen in some container runtimes, where
 	// /etc/resolv.conf is bind-mounted from outside the container,
@@ -140,14 +142,15 @@ type directManager struct {
 }
 
 //lint:ignore U1000 used in manager_{freebsd,openbsd}.go
-func newDirectManager(logf logger.Logf) *directManager {
-	return newDirectManagerOnFS(logf, directFS{})
+func newDirectManager(logf logger.Logf, health *health.Tracker) *directManager {
+	return newDirectManagerOnFS(logf, health, directFS{})
 }
 
-func newDirectManagerOnFS(logf logger.Logf, fs wholeFileFS) *directManager {
+func newDirectManagerOnFS(logf logger.Logf, health *health.Tracker, fs wholeFileFS) *directManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &directManager{
 		logf:     logf,
+		health:   health,
 		fs:       fs,
 		ctx:      ctx,
 		ctxClose: cancel,
@@ -271,6 +274,14 @@ func (m *directManager) rename(old, new string) error {
 	}
 	if err := m.fs.WriteFile(new, bs, 0644); err != nil {
 		return fmt.Errorf("writing to %q in rename of %q: %w", new, old, err)
+	}
+
+	// Explicitly set the permissions on the new file. This ensures that
+	// if we have a umask set which prevents creating world-readable files,
+	// the file will still have the correct permissions once it's renamed
+	// into place. See #12609.
+	if err := m.fs.Chmod(new, 0644); err != nil {
+		return fmt.Errorf("chmod %q in rename of %q: %w", new, old, err)
 	}
 
 	if err := m.fs.Remove(old); err != nil {
@@ -464,6 +475,14 @@ func (m *directManager) atomicWriteFile(fs wholeFileFS, filename string, data []
 	if err := fs.WriteFile(tmpName, data, perm); err != nil {
 		return fmt.Errorf("atomicWriteFile: %w", err)
 	}
+	// Explicitly set the permissions on the temporary file before renaming
+	// it. This ensures that if we have a umask set which prevents creating
+	// world-readable files, the file will still have the correct
+	// permissions once it's renamed into place. See #12609.
+	if err := fs.Chmod(tmpName, perm); err != nil {
+		return fmt.Errorf("atomicWriteFile: Chmod: %w", err)
+	}
+
 	return m.rename(tmpName, filename)
 }
 
@@ -472,10 +491,11 @@ func (m *directManager) atomicWriteFile(fs wholeFileFS, filename string, data []
 //
 // All name parameters are absolute paths.
 type wholeFileFS interface {
-	Stat(name string) (isRegular bool, err error)
-	Rename(oldName, newName string) error
-	Remove(name string) error
+	Chmod(name string, mode os.FileMode) error
 	ReadFile(name string) ([]byte, error)
+	Remove(name string) error
+	Rename(oldName, newName string) error
+	Stat(name string) (isRegular bool, err error)
 	Truncate(name string) error
 	WriteFile(name string, contents []byte, perm os.FileMode) error
 }
@@ -497,6 +517,10 @@ func (fs directFS) Stat(name string) (isRegular bool, err error) {
 		return false, err
 	}
 	return fi.Mode().IsRegular(), nil
+}
+
+func (fs directFS) Chmod(name string, mode os.FileMode) error {
+	return os.Chmod(fs.path(name), mode)
 }
 
 func (fs directFS) Rename(oldName, newName string) error {

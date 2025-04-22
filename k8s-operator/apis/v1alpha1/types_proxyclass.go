@@ -17,13 +17,26 @@ var ProxyClassKind = "ProxyClass"
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=`.status.conditions[?(@.type == "ProxyClassReady")].reason`,description="Status of the ProxyClass."
 
+// ProxyClass describes a set of configuration parameters that can be applied to
+// proxy resources created by the Tailscale Kubernetes operator.
+// To apply a given ProxyClass to resources created for a tailscale Ingress or
+// Service, use tailscale.com/proxy-class=<proxyclass-name> label. To apply a
+// given ProxyClass to resources created for a Connector, use
+// connector.spec.proxyClass field.
+// ProxyClass is a cluster scoped resource.
+// More info:
+// https://tailscale.com/kb/1445/kubernetes-operator-customization#cluster-resource-customization-using-proxyclass-custom-resource
 type ProxyClass struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
+	// Specification of the desired state of the ProxyClass resource.
+	// https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
 	Spec ProxyClassSpec `json:"spec"`
 
 	// +optional
+	// Status of the ProxyClass. This is set and managed automatically.
+	// https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
 	Status ProxyClassStatus `json:"status"`
 }
 
@@ -36,8 +49,33 @@ type ProxyClassList struct {
 }
 
 type ProxyClassSpec struct {
-	// Proxy's StatefulSet spec.
+	// Configuration parameters for the proxy's StatefulSet. Tailscale
+	// Kubernetes operator deploys a StatefulSet for each of the user
+	// configured proxies (Tailscale Ingress, Tailscale Service, Connector).
+	// +optional
 	StatefulSet *StatefulSet `json:"statefulSet"`
+	// Configuration for proxy metrics. Metrics are currently not supported
+	// for egress proxies and for Ingress proxies that have been configured
+	// with tailscale.com/experimental-forward-cluster-traffic-via-ingress
+	// annotation. Note that the metrics are currently considered unstable
+	// and will likely change in breaking ways in the future - we only
+	// recommend that you use those for debugging purposes.
+	// +optional
+	Metrics *Metrics `json:"metrics,omitempty"`
+	// TailscaleConfig contains options to configure the tailscale-specific
+	// parameters of proxies.
+	// +optional
+	TailscaleConfig *TailscaleConfig `json:"tailscale,omitempty"`
+}
+
+type TailscaleConfig struct {
+	// AcceptRoutes can be set to true to make the proxy instance accept
+	// routes advertized by other nodes on the tailnet, such as subnet
+	// routes.
+	// This is equivalent of passing --accept-routes flag to a tailscale Linux client.
+	// https://tailscale.com/kb/1019/subnets#use-your-subnet-routes-from-other-devices
+	// Defaults to false.
+	AcceptRoutes bool `json:"acceptRoutes,omitempty"`
 }
 
 type StatefulSet struct {
@@ -79,6 +117,11 @@ type Pod struct {
 	// https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/#syntax-and-character-set
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
+	// Proxy Pod's affinity rules.
+	// By default, the Tailscale Kubernetes operator does not apply any affinity rules.
+	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#affinity
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
 	// Configuration for the proxy container running tailscale.
 	// +optional
 	TailscaleContainer *Container `json:"tailscaleContainer,omitempty"`
@@ -111,9 +154,48 @@ type Pod struct {
 	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#scheduling
 	// +optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+	// +optional
+}
+
+type Metrics struct {
+	// Setting enable to true will make the proxy serve Tailscale metrics
+	// at <pod-ip>:9001/debug/metrics.
+	// Defaults to false.
+	Enable bool `json:"enable"`
 }
 
 type Container struct {
+	// List of environment variables to set in the container.
+	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#environment-variables
+	// Note that environment variables provided here will take precedence
+	// over Tailscale-specific environment variables set by the operator,
+	// however running proxies with custom values for Tailscale environment
+	// variables (i.e TS_USERSPACE) is not recommended and might break in
+	// the future.
+	// +optional
+	Env []Env `json:"env,omitempty"`
+	// Container image name. By default images are pulled from
+	// docker.io/tailscale/tailscale, but the official images are also
+	// available at ghcr.io/tailscale/tailscale. Specifying image name here
+	// will override any proxy image values specified via the Kubernetes
+	// operator's Helm chart values or PROXY_IMAGE env var in the operator
+	// Deployment.
+	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#image
+	// +optional
+	Image string `json:"image,omitempty"`
+	// Image pull policy. One of Always, Never, IfNotPresent. Defaults to Always.
+	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#image
+	// +kubebuilder:validation:Enum=Always;Never;IfNotPresent
+	// +optional
+	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
+	// Container resource requirements.
+	// By default Tailscale Kubernetes operator does not apply any resource
+	// requirements. The amount of resources required wil depend on the
+	// amount of resources the operator needs to parse, usage patterns and
+	// cluster size.
+	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#resources
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 	// Container security context.
 	// Security context specified here will override the security context by the operator.
 	// By default the operator:
@@ -123,15 +205,26 @@ type Container struct {
 	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#security-context
 	// +optional
 	SecurityContext *corev1.SecurityContext `json:"securityContext,omitempty"`
-	// Container resource requirements.
-	// By default Tailscale Kubernetes operator does not apply any resource
-	// requirements. The amount of resources required wil depend on the
-	// amount of resources the operator needs to parse, usage patterns and
-	// cluster size.
-	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#resources
-	// +optional
-	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }
+
+type Env struct {
+	// Name of the environment variable. Must be a C_IDENTIFIER.
+	Name Name `json:"name"`
+	// Variable references $(VAR_NAME) are expanded using the previously defined
+	//  environment variables in the container and any service environment
+	// variables. If a variable cannot be resolved, the reference in the input
+	// string will be unchanged. Double $$ are reduced to a single $, which
+	// allows for escaping the $(VAR_NAME) syntax: i.e. "$$(VAR_NAME)" will
+	// produce the string literal "$(VAR_NAME)". Escaped references will never
+	// be expanded, regardless of whether the variable exists or not. Defaults
+	// to "".
+	// +optional
+	Value string `json:"value,omitempty"`
+}
+
+// +kubebuilder:validation:Type=string
+// +kubebuilder:validation:Pattern=`^[-._a-zA-Z][-._a-zA-Z0-9]*$`
+type Name string
 
 type ProxyClassStatus struct {
 	// List of status conditions to indicate the status of the ProxyClass.
@@ -139,5 +232,5 @@ type ProxyClassStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	// +optional
-	Conditions []ConnectorCondition `json:"conditions,omitempty"`
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
