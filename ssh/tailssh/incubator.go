@@ -760,6 +760,11 @@ func (ss *sshSession) launchProcess() error {
 	cmd := ss.cmd
 	cmd.Dir = "/"
 	cmd.Env = envForUser(ss.conn.localUser)
+	if runtime.GOOS == "android" {
+		for _, kv := range os.Environ() {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
 	for _, kv := range ss.Environ() {
 		if acceptEnvPair(kv) {
 			cmd.Env = append(cmd.Env, kv)
@@ -1096,6 +1101,15 @@ func shellArgs(isShell bool, cmd string) []string {
 }
 
 func setGroups(groupIDs []int) error {
+	if runtime.GOOS == "android" {
+		if os.Geteuid() == 0 {
+			err := syscall.Setgroups(groupIDs)
+			if err != nil {
+				fmt.Println("Setgroups failed:", err)
+			}
+		}
+		return nil
+	}
 	if runtime.GOOS == "darwin" && len(groupIDs) > 16 {
 		// darwin returns "invalid argument" if more than 16 groups are passed to syscall.Setgroups
 		// some info can be found here:
