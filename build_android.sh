@@ -3,10 +3,20 @@
 
 set -eu
 
+# If $ANDROID_NDK_PATH is not set, use the default path
+if [ -z "${ANDROID_NDK_PATH:-}" ]; then
+    ANDROID_NDK_PATH="/tmp/android-ndk-r27c-linux/toolchains/llvm/prebuilt/linux-x86_64/bin"
+fi
 # Specify the Android NDK path
 if [ ! -d "$ANDROID_NDK_PATH" ]; then
-    echo "Android NDK path not found: $ANDROID_NDK_PATH" // ANDROID_NDK_PATH="/tmp/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin"
-    exit 1
+    echo "Android NDK path not found: $ANDROID_NDK_PATH" # ANDROID_NDK_PATH="/tmp/android-ndk-r27c-linux/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    # exit 1
+    curl -L https://dl.google.com/android/repository/android-ndk-r27c-linux.zip -o /tmp/android-ndk-r27c-linux.zip
+    unzip -q /tmp/android-ndk-r27c-linux.zip -d /tmp
+    mv /tmp/android-ndk-r27c /tmp/android-ndk-r27c-linux
+    rm /tmp/android-ndk-r27c-linux.zip
+    export ANDROID_NDK_PATH="/tmp/android-ndk-r27c-linux/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    echo "Android NDK path set to: $ANDROID_NDK_PATH"
 fi
 
 export PATH="$ANDROID_NDK_PATH:$PATH"
