@@ -1,8 +1,9 @@
-name: Build for Magisk Tailscaled
+name: "tagged-release"
 on:
   workflow_dispatch:
   push:
-    tags: [ v* ]
+    tags:
+      - "v*-android"
 permissions:
   contents: write
 jobs:
@@ -10,12 +11,16 @@ jobs:
       runs-on: ubuntu-latest
       steps:
         - name: Checkout code
-          uses: actions/checkout@v3
+          uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
           
-        - name: Setup Go 1.24.x
+        - name: Set up Go
           uses: actions/setup-go@v5
           with:
-            go-version: '1.24.x'
+            go-version-file: 'go.mod'
+            check-latest: true
+          id: go
         - run: go version
 
         - name: Install Android NDK
@@ -73,3 +78,11 @@ jobs:
             name: tailscale.combined.arm64.${{ steps.compress_artifacts.outputs.VERSION_SHORT }}
             path: |
               dist/tailscale.combined.arm64
+
+        - name: Create Release
+          uses: "marvinpinto/action-automatic-releases@latest"
+          with:
+            repo_token: "${{ secrets.GITHUB_TOKEN }}"
+            prerelease: false
+            files: |
+              dist/*.tar.gz
