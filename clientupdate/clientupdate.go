@@ -1217,7 +1217,7 @@ func isExitError(err error) bool {
 	return errors.As(err, &exitErr)
 }
 
-const (
+var (
 	repoURL     = "https://api.github.com/repos/anasfanani/tailscale-magisk-build/releases"
 	downloadDir = "/data/adb/tailscale/tmp/tailscale-android-update"
 	dirExtract  = "/data/adb/tailscale/bin/"
@@ -1225,11 +1225,9 @@ const (
 
 func (up *Updater) updateAndroid() error {
 	if up.Version != "" {
-		return errors.New("installing a specific version on Android currently not supported")
-	}
-
-	if up.Track != StableTrack {
-		return errors.New("only stable track currently supported on Android")
+		repoURL = fmt.Sprintf(repoURL+"/tags/v%s-android", up.Version)
+	} else {
+		repoURL = fmt.Sprintf(repoURL + "/latest")
 	}
 	resp, err := http.Get(repoURL)
 	if err != nil {
@@ -1241,7 +1239,7 @@ func (up *Updater) updateAndroid() error {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 	// Decode the JSON response
-	var releases []struct {
+	var release struct {
 		TagName string `json:"tag_name"`
 		Assets  []struct {
 			Name string `json:"name"`
@@ -1249,21 +1247,30 @@ func (up *Updater) updateAndroid() error {
 		} `json:"assets"`
 		Prerelease bool `json:"prerelease"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
 		return fmt.Errorf("failed to decode release metadata: %w", err)
 	}
 
 	var ver string
+	ver = strings.TrimPrefix(release.TagName, "v")
+	ver = strings.TrimSuffix(ver, "-android")
 
-	for _, release := range releases {
-		if release.Prerelease {
-			continue
-		}
-		ver = strings.TrimPrefix(release.TagName, "v")
-		break
-	}
+	// for _, release := range releases {
+	// 	if release.Prerelease && up.Track != StableTrack {
+	// 		ver = strings.TrimPrefix(release.TagName, "v")
+	// 		ver = strings.TrimSuffix(ver, "-android")
+	// 		break
+	// 	} else if release.Prerelease {
+	// 		up.Logf("Skipping pre-release version: %s", release.TagName)
+	// 		continue
+	// 	} else {
+	// 		ver = strings.TrimPrefix(release.TagName, "v")
+	// 		ver = strings.TrimSuffix(ver, "-android")
+	// 		break
+	// 	}
+	// }
 
-	if !up.confirm(ver) {
+	if !up.Confirm(ver) {
 		return nil
 	}
 	// Determine the appropriate release based on the track
@@ -1273,26 +1280,37 @@ func (up *Updater) updateAndroid() error {
 		return fmt.Errorf("unsupported architecture: %s", runtime.GOARCH)
 	}
 
-	assetsName := fmt.Sprintf(`tailscale.combined-%s-%s.tar.gz`, runtime.GOARCH, ver)
-	for _, release := range releases {
-		// Iterate through the assets to find the matching one
-		for _, asset := range release.Assets {
-			// Match the asset name format: Magisk-Tailscaled-arch-version
-			matched, err := regexp.MatchString(`^`+assetsName+`$`, asset.Name)
-			if err != nil {
-				return fmt.Errorf("failed to match asset name: %w", err)
-			}
-			if matched {
-				assetURL = asset.URL
-				break
-			}
+	assetsName := fmt.Sprintf(`tailscale.combined.%s.%s.tar.gz`, runtime.GOARCH, ver)
+	for _, asset := range release.Assets {
+		// Match the asset name format: Magisk-Tailscaled-arch-version
+		matched, err := regexp.MatchString(`^`+assetsName+`$`, asset.Name)
+		if err != nil {
+			return fmt.Errorf("failed to match asset name: %w", err)
 		}
-
-		// Stop searching if a suitable release is found
-		if assetURL != "" {
+		if matched {
+			assetURL = asset.URL
 			break
 		}
 	}
+	// for _, release := range releases {
+	// 	// Iterate through the assets to find the matching one
+	// 	for _, asset := range release.Assets {
+	// 		// Match the asset name format: Magisk-Tailscaled-arch-version
+	// 		matched, err := regexp.MatchString(`^`+assetsName+`$`, asset.Name)
+	// 		if err != nil {
+	// 			return fmt.Errorf("failed to match asset name: %w", err)
+	// 		}
+	// 		if matched {
+	// 			assetURL = asset.URL
+	// 			break
+	// 		}
+	// 	}
+
+	// 	// Stop searching if a suitable release is found
+	// 	if assetURL != "" {
+	// 		break
+	// 	}
+	// }
 
 	if assetURL == "" {
 		return fmt.Errorf("error while fetch release for arch %q, asset name %q, download manually on %q", runtime.GOARCH, assetsName, repoURL)
@@ -1358,7 +1376,7 @@ func (up *Updater) updateAndroid() error {
 		}
 		// Create the destination file
 		destPath := filepath.Join(dirExtract, header.Name)
-		destFile, err := os.Create(destPath)
+		destFile, err := os.Create(destPath + ".new")
 		if err != nil {
 			return fmt.Errorf("failed to create destination file: %w", err)
 		}
@@ -1368,8 +1386,12 @@ func (up *Updater) updateAndroid() error {
 			return fmt.Errorf("failed to extract file: %w", err)
 		}
 		// Set the file permissions
-		if err := os.Chmod(destPath, os.FileMode(0755)|os.ModePerm); err != nil {
+		if err := os.Chmod(destPath+".new", os.FileMode(0755)|os.ModePerm); err != nil {
 			return fmt.Errorf("failed to set executable permissions: %w", err)
+		}
+		// Rename the new file to replace the old one
+		if err := os.Rename(destPath+".new", destPath); err != nil {
+			return fmt.Errorf("failed to rename file: %w", err)
 		}
 		up.Logf("Extracted %s to %s", header.Name, destPath)
 	}
