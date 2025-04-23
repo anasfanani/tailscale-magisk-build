@@ -60,7 +60,7 @@ export CGO_ENABLED=1
 ldflags="-X tailscale.com/version.longStamp=${VERSION_LONG} -X tailscale.com/version.shortStamp=${VERSION_SHORT} -X tailscale.com/version.gitCommitStamp=${VERSION_GIT_HASH}"
 ldflags="$ldflags -w -s"
 # Build the binary
-go build -tags="ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube,ts_omit_completion,ts_omit_ssh,ts_omit_wakeonlan,ts_omit_capture" \
+go build -tags="ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube,ts_omit_completion,ts_omit_wakeonlan,ts_omit_capture" \
     --ldflags="$ldflags" \
     -o ./dist/tailscale.combined.$GOARCH \
     -trimpath ./cmd/tailscaled
