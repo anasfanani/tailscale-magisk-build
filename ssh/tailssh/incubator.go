@@ -48,6 +48,7 @@ const (
 	darwin  = "darwin"
 	freebsd = "freebsd"
 	openbsd = "openbsd"
+	android = "android"
 )
 
 func init() {
@@ -780,6 +781,9 @@ func (ss *sshSession) launchProcess() error {
 	cmd.Dir = "/"
 	cmd.Env = envForUser(ss.conn.localUser)
 	if runtime.GOOS == "android" {
+		if home, exists := os.LookupEnv("HOME"); exists {
+			cmd.Dir = home
+		}
 		for _, kv := range os.Environ() {
 			cmd.Env = append(cmd.Env, kv)
 		}
@@ -1105,6 +1109,8 @@ func (ia *incubatorArgs) loginArgs(loginCmdPath string) []string {
 			return []string{loginCmdPath, "-f", ia.localUser, "-p"}
 		}
 		return []string{loginCmdPath, "-f", ia.localUser, "-h", ia.remoteIP, "-p"}
+	case android:
+		return []string{loginCmdPath}
 	case freebsd, openbsd:
 		return []string{loginCmdPath, "-fp", "-h", ia.remoteIP, ia.localUser}
 	}
