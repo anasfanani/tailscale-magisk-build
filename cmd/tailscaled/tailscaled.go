@@ -74,6 +74,8 @@ import (
 // defaultTunName returns the default tun device name for the platform.
 func defaultTunName() string {
 	switch runtime.GOOS {
+	case "android":
+		return "tailscale0,userspace-networking"
 	case "openbsd":
 		return "tun"
 	case "windows":
