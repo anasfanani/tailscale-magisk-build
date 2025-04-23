@@ -26,12 +26,15 @@ import (
 	"sync"
 	"time"
 
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
+	_ "tailscale.com/feature/condregister"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/localapi"
@@ -46,6 +49,7 @@ import (
 	"tailscale.com/net/socks5"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tsd"
+	"tailscale.com/types/bools"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/nettype"
@@ -78,7 +82,7 @@ type Server struct {
 	// If nil, a new FileStore is initialized at `Dir/tailscaled.state`.
 	// See tailscale.com/ipn/store for supported stores.
 	//
-	// Logs will automatically be uploaded to log.tailscale.io,
+	// Logs will automatically be uploaded to log.tailscale.com,
 	// where the configuration file for logging will be saved at
 	// `Dir/tailscaled.log.conf`.
 	Store ipn.StateStore
@@ -133,11 +137,11 @@ type Server struct {
 	hostname         string
 	shutdownCtx      context.Context
 	shutdownCancel   context.CancelFunc
-	proxyCred        string                 // SOCKS5 proxy auth for loopbackListener
-	localAPICred     string                 // basic auth password for loopbackListener
-	loopbackListener net.Listener           // optional loopback for localapi and proxies
-	localAPIListener net.Listener           // in-memory, used by localClient
-	localClient      *tailscale.LocalClient // in-memory
+	proxyCred        string        // SOCKS5 proxy auth for loopbackListener
+	localAPICred     string        // basic auth password for loopbackListener
+	loopbackListener net.Listener  // optional loopback for localapi and proxies
+	localAPIListener net.Listener  // in-memory, used by localClient
+	localClient      *local.Client // in-memory
 	localAPIServer   *http.Server
 	logbuffer        *filch.Filch
 	logtail          *logtail.Logger
@@ -169,7 +173,39 @@ func (s *Server) Dial(ctx context.Context, network, address string) (net.Conn, e
 	if err := s.Start(); err != nil {
 		return nil, err
 	}
+	if err := s.awaitRunning(ctx); err != nil {
+		return nil, err
+	}
 	return s.dialer.UserDial(ctx, network, address)
+}
+
+// awaitRunning waits until the backend is in state Running.
+// If the backend is in state Starting, it blocks until it reaches
+// a terminal state (such as Stopped, NeedsMachineAuth)
+// or the context expires.
+func (s *Server) awaitRunning(ctx context.Context) error {
+	st := s.lb.State()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		switch st {
+		case ipn.Running:
+			return nil
+		case ipn.NeedsLogin, ipn.Starting:
+			// Even after LocalBackend.Start, the state machine is still briefly
+			// in the "NeedsLogin" state. So treat that as also "Starting" and
+			// wait for us to get out of that state.
+			s.lb.WatchNotifications(ctx, ipn.NotifyInitialState, nil, func(n *ipn.Notify) (keepGoing bool) {
+				if n.State != nil {
+					st = *n.State
+				}
+				return st == ipn.NeedsLogin || st == ipn.Starting
+			})
+		default:
+			return fmt.Errorf("tsnet: backend in state %v", st)
+		}
+	}
 }
 
 // HTTPClient returns an HTTP client that is configured to connect over Tailscale.
@@ -188,7 +224,7 @@ func (s *Server) HTTPClient() *http.Client {
 //
 // It will start the server if it has not been started yet. If the server's
 // already been started successfully, it doesn't return an error.
-func (s *Server) LocalClient() (*tailscale.LocalClient, error) {
+func (s *Server) LocalClient() (*local.Client, error) {
 	if err := s.Start(); err != nil {
 		return nil, err
 	}
@@ -239,7 +275,7 @@ func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err er
 		// out the CONNECT code from tailscaled/proxy.go that uses
 		// httputil.ReverseProxy and adding auth support.
 		go func() {
-			lah := localapi.NewHandler(s.lb, s.logf, s.logid)
+			lah := localapi.NewHandler(ipnauth.Self, s.lb, s.logf, s.logid)
 			lah.PermitWrite = true
 			lah.PermitRead = true
 			lah.RequiredPassword = s.localAPICred
@@ -469,6 +505,11 @@ func (s *Server) start() (reterr error) {
 			// directory and hostname when they're not supplied. But we can fall
 			// back to "tsnet" as well.
 			exe = "tsnet"
+		case "ios":
+			// When compiled as a framework (via TailscaleKit in libtailscale),
+			// os.Executable() returns an error, so fall back to "tsnet" there
+			// too.
+			exe = "tsnet"
 		default:
 			return err
 		}
@@ -566,7 +607,9 @@ func (s *Server) start() (reterr error) {
 		// Note: don't just return ns.DialContextTCP or we'll return
 		// *gonet.TCPConn(nil) instead of a nil interface which trips up
 		// callers.
-		tcpConn, err := ns.DialContextTCP(ctx, dst)
+		v4, v6 := s.TailscaleIPs()
+		src := bools.IfElse(dst.Addr().Is6(), v6, v4)
+		tcpConn, err := ns.DialContextTCPWithBind(ctx, src, dst)
 		if err != nil {
 			return nil, err
 		}
@@ -576,7 +619,9 @@ func (s *Server) start() (reterr error) {
 		// Note: don't just return ns.DialContextUDP or we'll return
 		// *gonet.UDPConn(nil) instead of a nil interface which trips up
 		// callers.
-		udpConn, err := ns.DialContextUDP(ctx, dst)
+		v4, v6 := s.TailscaleIPs()
+		src := bools.IfElse(dst.Addr().Is6(), v6, v4)
+		udpConn, err := ns.DialContextUDPWithBind(ctx, src, dst)
 		if err != nil {
 			return nil, err
 		}
@@ -634,7 +679,7 @@ func (s *Server) start() (reterr error) {
 	go s.printAuthURLLoop()
 
 	// Run the localapi handler, to allow fetching LetsEncrypt certs.
-	lah := localapi.NewHandler(lb, tsLogf, s.logid)
+	lah := localapi.NewHandler(ipnauth.Self, lb, tsLogf, s.logid)
 	lah.PermitWrite = true
 	lah.PermitRead = true
 
@@ -642,7 +687,7 @@ func (s *Server) start() (reterr error) {
 	// nettest.Listen provides a in-memory pipe based implementation for net.Conn.
 	lal := memnet.Listen("local-tailscaled.sock:80")
 	s.localAPIListener = lal
-	s.localClient = &tailscale.LocalClient{Dial: lal.Dial}
+	s.localClient = &local.Client{Dial: lal.Dial}
 	s.localAPIServer = &http.Server{Handler: lah}
 	s.lb.ConfigureWebClient(s.localClient)
 	go func() {
@@ -895,6 +940,8 @@ func getTSNetDir(logf logger.Logf, confDir, prog string) (string, error) {
 // APIClient returns a tailscale.Client that can be used to make authenticated
 // requests to the Tailscale control server.
 // It requires the user to set tailscale.I_Acknowledge_This_API_Is_Unstable.
+//
+// Deprecated: use AuthenticatedAPITransport with tailscale.com/client/tailscale/v2 instead.
 func (s *Server) APIClient() (*tailscale.Client, error) {
 	if !tailscale.I_Acknowledge_This_API_Is_Unstable {
 		return nil, errors.New("use of Client without setting I_Acknowledge_This_API_Is_Unstable")
@@ -907,6 +954,41 @@ func (s *Server) APIClient() (*tailscale.Client, error) {
 	c.UserAgent = "tailscale-tsnet"
 	c.HTTPClient = &http.Client{Transport: s.lb.KeyProvingNoiseRoundTripper()}
 	return c, nil
+}
+
+// I_Acknowledge_This_API_Is_Experimental must be set true to use AuthenticatedAPITransport()
+// for now.
+var I_Acknowledge_This_API_Is_Experimental = false
+
+// AuthenticatedAPITransport provides an HTTP transport that can be used with
+// the control server API without needing additional authentication details. It
+// authenticates using the current client's nodekey.
+//
+// It requires the user to set I_Acknowledge_This_API_Is_Experimental.
+//
+// For example:
+//
+//	import "net/http"
+//	import "tailscale.com/client/tailscale/v2"
+//	import "tailscale.com/tsnet"
+//
+//	var s *tsnet.Server
+//	...
+//	rt, err := s.AuthenticatedAPITransport()
+//	// handler err ...
+//	var client tailscale.Client{HTTP: http.Client{
+//	    Timeout: 1*time.Minute,
+//	    UserAgent: "your-useragent-here",
+//	    Transport: rt,
+//	}}
+func (s *Server) AuthenticatedAPITransport() (http.RoundTripper, error) {
+	if !I_Acknowledge_This_API_Is_Experimental {
+		return nil, errors.New("use of AuthenticatedAPITransport without setting I_Acknowledge_This_API_Is_Experimental")
+	}
+	if err := s.Start(); err != nil {
+		return nil, err
+	}
+	return s.lb.KeyProvingNoiseRoundTripper(), nil
 }
 
 // Listen announces only on the Tailscale network.
@@ -1180,7 +1262,8 @@ func (s *Server) listen(network, addr string, lnOn listenOn) (net.Listener, erro
 		keys: keys,
 		addr: addr,
 
-		conn: make(chan net.Conn),
+		closedc: make(chan struct{}),
+		conn:    make(chan net.Conn),
 	}
 	s.mu.Lock()
 	for _, key := range keys {
@@ -1243,19 +1326,21 @@ type listenKey struct {
 }
 
 type listener struct {
-	s      *Server
-	keys   []listenKey
-	addr   string
-	conn   chan net.Conn
-	closed bool // guarded by s.mu
+	s       *Server
+	keys    []listenKey
+	addr    string
+	conn    chan net.Conn // unbuffered, never closed
+	closedc chan struct{} // closed on [listener.Close]
+	closed  bool          // guarded by s.mu
 }
 
 func (ln *listener) Accept() (net.Conn, error) {
-	c, ok := <-ln.conn
-	if !ok {
+	select {
+	case c := <-ln.conn:
+		return c, nil
+	case <-ln.closedc:
 		return nil, fmt.Errorf("tsnet: %w", net.ErrClosed)
 	}
-	return c, nil
 }
 
 func (ln *listener) Addr() net.Addr { return addr{ln} }
@@ -1277,21 +1362,22 @@ func (ln *listener) closeLocked() error {
 			delete(ln.s.listeners, key)
 		}
 	}
-	close(ln.conn)
+	close(ln.closedc)
 	ln.closed = true
 	return nil
 }
 
 func (ln *listener) handle(c net.Conn) {
-	t := time.NewTimer(time.Second)
-	defer t.Stop()
 	select {
 	case ln.conn <- c:
-	case <-t.C:
+		return
+	case <-ln.closedc:
+	case <-ln.s.shutdownCtx.Done():
+	case <-time.After(time.Second):
 		// TODO(bradfitz): this isn't ideal. Think about how
 		// we how we want to do pushback.
-		c.Close()
 	}
+	c.Close()
 }
 
 // Server returns the tsnet Server associated with the listener.

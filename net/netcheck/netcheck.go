@@ -23,7 +23,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tcnksm/go-httpstat"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/envknob"
 	"tailscale.com/net/captivedetection"
@@ -173,23 +172,12 @@ func (r *Report) Clone() *Report {
 		return nil
 	}
 	r2 := *r
-	r2.RegionLatency = cloneDurationMap(r2.RegionLatency)
-	r2.RegionV4Latency = cloneDurationMap(r2.RegionV4Latency)
-	r2.RegionV6Latency = cloneDurationMap(r2.RegionV6Latency)
+	r2.RegionLatency = maps.Clone(r2.RegionLatency)
+	r2.RegionV4Latency = maps.Clone(r2.RegionV4Latency)
+	r2.RegionV6Latency = maps.Clone(r2.RegionV6Latency)
 	r2.GlobalV4Counters = maps.Clone(r2.GlobalV4Counters)
 	r2.GlobalV6Counters = maps.Clone(r2.GlobalV6Counters)
 	return &r2
-}
-
-func cloneDurationMap(m map[int]time.Duration) map[int]time.Duration {
-	if m == nil {
-		return nil
-	}
-	m2 := make(map[int]time.Duration, len(m))
-	for k, v := range m {
-		m2[k] = v
-	}
-	return m2
 }
 
 // Client generates Reports describing the result of both passive and active
@@ -399,6 +387,9 @@ type probePlan map[string][]probe
 func sortRegions(dm *tailcfg.DERPMap, last *Report, preferredDERP int) (prev []*tailcfg.DERPRegion) {
 	prev = make([]*tailcfg.DERPRegion, 0, len(dm.Regions))
 	for _, reg := range dm.Regions {
+		if reg.NoMeasureNoHome {
+			continue
+		}
 		// include an otherwise avoid region if it is the current preferred region
 		if reg.Avoid && reg.RegionID != preferredDERP {
 			continue
@@ -545,7 +536,7 @@ func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan prob
 	plan = make(probePlan)
 
 	for _, reg := range dm.Regions {
-		if len(reg.Nodes) == 0 {
+		if reg.NoMeasureNoHome || len(reg.Nodes) == 0 {
 			continue
 		}
 
@@ -1110,10 +1101,11 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 	return nil
 }
 
+// measureHTTPSLatency measures HTTP request latency to the DERP region, but
+// only returns success if an HTTPS request to the region succeeds.
 func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegion) (time.Duration, netip.Addr, error) {
 	metricHTTPSend.Add(1)
-	var result httpstat.Result
-	ctx, cancel := context.WithTimeout(httpstat.WithHTTPStat(ctx, &result), httpsProbeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, httpsProbeTimeout)
 	defer cancel()
 
 	var ip netip.Addr
@@ -1121,6 +1113,8 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 	dc := derphttp.NewNetcheckClient(c.logf, c.NetMon)
 	defer dc.Close()
 
+	// DialRegionTLS may dial multiple times if a node is not available, as such
+	// it does not have stable timing to measure.
 	tlsConn, tcpConn, node, err := dc.DialRegionTLS(ctx, reg)
 	if err != nil {
 		return 0, ip, err
@@ -1138,6 +1132,8 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 	connc := make(chan *tls.Conn, 1)
 	connc <- tlsConn
 
+	// make an HTTP request to measure, as this enables us to account for MITM
+	// overhead in e.g. corp environments that have HTTP MITM in front of DERP.
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return nil, errors.New("unexpected DialContext dial")
@@ -1153,12 +1149,17 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 	}
 	hc := &http.Client{Transport: tr}
 
+	// This is the request that will be measured, the request and response
+	// should be small enough to fit into a single packet each way unless the
+	// connection has already become unstable.
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+node.HostName+"/derp/latency-check", nil)
 	if err != nil {
 		return 0, ip, err
 	}
 
+	startTime := c.timeNow()
 	resp, err := hc.Do(req)
+	reqDur := c.timeNow().Sub(startTime)
 	if err != nil {
 		return 0, ip, err
 	}
@@ -1175,11 +1176,12 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 	if err != nil {
 		return 0, ip, err
 	}
-	result.End(c.timeNow())
 
-	// TODO: decide best timing heuristic here.
-	// Maybe the server should return the tcpinfo_rtt?
-	return result.ServerProcessing, ip, nil
+	// return the connection duration, not the request duration, as this is the
+	// best approximation of the RTT latency to the node. Note that the
+	// connection setup performs happy-eyeballs and TLS so there are additional
+	// overheads.
+	return reqDur, ip, nil
 }
 
 func (c *Client) measureAllICMPLatency(ctx context.Context, rs *reportState, need []*tailcfg.DERPRegion) error {

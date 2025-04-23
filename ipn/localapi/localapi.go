@@ -68,12 +68,12 @@ import (
 	"tailscale.com/wgengine/magicsock"
 )
 
-type localAPIHandler func(*Handler, http.ResponseWriter, *http.Request)
+type LocalAPIHandler func(*Handler, http.ResponseWriter, *http.Request)
 
 // handler is the set of LocalAPI handlers, keyed by the part of the
 // Request.URL.Path after "/localapi/v0/". If the key ends with a trailing slash
 // then it's a prefix match.
-var handler = map[string]localAPIHandler{
+var handler = map[string]LocalAPIHandler{
 	// The prefix match handlers end with a slash:
 	"cert/":     (*Handler).serveCert,
 	"file-put/": (*Handler).serveFilePut,
@@ -83,13 +83,13 @@ var handler = map[string]localAPIHandler{
 
 	// The other /localapi/v0/NAME handlers are exact matches and contain only NAME
 	// without a trailing slash:
+	"alpha-set-device-attrs":      (*Handler).serveSetDeviceAttrs, // see tailscale/corp#24690
 	"bugreport":                   (*Handler).serveBugReport,
 	"check-ip-forwarding":         (*Handler).serveCheckIPForwarding,
 	"check-prefs":                 (*Handler).serveCheckPrefs,
 	"check-udp-gro-forwarding":    (*Handler).serveCheckUDPGROForwarding,
 	"component-debug-logging":     (*Handler).serveComponentDebugLogging,
 	"debug":                       (*Handler).serveDebug,
-	"debug-capture":               (*Handler).serveDebugCapture,
 	"debug-derp-region":           (*Handler).serveDebugDERPRegion,
 	"debug-dial-types":            (*Handler).serveDebugDialTypes,
 	"debug-log":                   (*Handler).serveDebugLog,
@@ -151,6 +151,14 @@ var handler = map[string]localAPIHandler{
 	"whois":                       (*Handler).serveWhoIs,
 }
 
+// Register registers a new LocalAPI handler for the given name.
+func Register(name string, fn LocalAPIHandler) {
+	if _, ok := handler[name]; ok {
+		panic("duplicate LocalAPI handler registration: " + name)
+	}
+	handler[name] = fn
+}
+
 var (
 	// The clientmetrics package is stateful, but we want to expose a simple
 	// imperative API to local clients, so we need to keep track of
@@ -161,10 +169,9 @@ var (
 	metrics   = map[string]*clientmetric.Metric{}
 )
 
-// NewHandler creates a new LocalAPI HTTP handler. All parameters except netMon
-// are required (if non-nil it's used to do faster interface lookups).
-func NewHandler(b *ipnlocal.LocalBackend, logf logger.Logf, logID logid.PublicID) *Handler {
-	return &Handler{b: b, logf: logf, backendLogID: logID, clock: tstime.StdClock{}}
+// NewHandler creates a new LocalAPI HTTP handler. All parameters are required.
+func NewHandler(actor ipnauth.Actor, b *ipnlocal.LocalBackend, logf logger.Logf, logID logid.PublicID) *Handler {
+	return &Handler{Actor: actor, b: b, logf: logf, backendLogID: logID, clock: tstime.StdClock{}}
 }
 
 type Handler struct {
@@ -193,6 +200,10 @@ type Handler struct {
 	logf         logger.Logf
 	backendLogID logid.PublicID
 	clock        tstime.Clock
+}
+
+func (h *Handler) LocalBackend() *ipnlocal.LocalBackend {
+	return h.b
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -259,7 +270,7 @@ func (h *Handler) validHost(hostname string) bool {
 
 // handlerForPath returns the LocalAPI handler for the provided Request.URI.Path.
 // (the path doesn't include any query parameters)
-func handlerForPath(urlPath string) (h localAPIHandler, ok bool) {
+func handlerForPath(urlPath string) (h LocalAPIHandler, ok bool) {
 	if urlPath == "/" {
 		return (*Handler).serveLocalAPIRoot, true
 	}
@@ -444,6 +455,33 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) serveWhoIs(w http.ResponseWriter, r *http.Request) {
 	h.serveWhoIsWithBackend(w, r, h.b)
+}
+
+// serveSetDeviceAttrs is (as of 2024-12-30) an experimental LocalAPI handler to
+// set device attributes via the control plane.
+//
+// See tailscale/corp#24690.
+func (h *Handler) serveSetDeviceAttrs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if !h.PermitWrite {
+		http.Error(w, "set-device-attrs access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != "PATCH" {
+		http.Error(w, "only PATCH allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.b.SetDeviceAttrs(ctx, req); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	io.WriteString(w, "{}\n")
 }
 
 // localBackendWhoIsMethods is the subset of ipn.LocalBackend as needed
@@ -1069,7 +1107,7 @@ func (h *Handler) serveServeConfig(w http.ResponseWriter, r *http.Request) {
 
 func authorizeServeConfigForGOOSAndUserContext(goos string, configIn *ipn.ServeConfig, h *Handler) error {
 	switch goos {
-	case "windows", "linux", "darwin":
+	case "windows", "linux", "darwin", "illumos", "solaris":
 	default:
 		return nil
 	}
@@ -1089,7 +1127,7 @@ func authorizeServeConfigForGOOSAndUserContext(goos string, configIn *ipn.ServeC
 	switch goos {
 	case "windows":
 		return errors.New("must be a Windows local admin to serve a path")
-	case "linux", "darwin":
+	case "linux", "darwin", "illumos", "solaris":
 		return errors.New("must be root, or be an operator and able to run 'sudo tailscale' to serve a path")
 	default:
 		// We filter goos at the start of the func, this default case
@@ -1342,7 +1380,7 @@ func (h *Handler) servePrefs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var err error
-		prefs, err = h.b.EditPrefs(mp)
+		prefs, err = h.b.EditPrefsAs(mp, h.Actor)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
@@ -2562,8 +2600,8 @@ func (h *Handler) serveProfiles(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case httpm.GET:
 		profiles := h.b.ListProfiles()
-		profileIndex := slices.IndexFunc(profiles, func(p ipn.LoginProfile) bool {
-			return p.ID == profileID
+		profileIndex := slices.IndexFunc(profiles, func(p ipn.LoginProfileView) bool {
+			return p.ID() == profileID
 		})
 		if profileIndex == -1 {
 			http.Error(w, "Profile not found", http.StatusNotFound)
@@ -2659,21 +2697,6 @@ func defBool(a string, def bool) bool {
 		return def
 	}
 	return v
-}
-
-func (h *Handler) serveDebugCapture(w http.ResponseWriter, r *http.Request) {
-	if !h.PermitWrite {
-		http.Error(w, "debug access denied", http.StatusForbidden)
-		return
-	}
-	if r.Method != "POST" {
-		http.Error(w, "POST required", http.StatusMethodNotAllowed)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.(http.Flusher).Flush()
-	h.b.StreamDebugCapture(r.Context(), w)
 }
 
 func (h *Handler) serveDebugLog(w http.ResponseWriter, r *http.Request) {

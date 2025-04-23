@@ -25,7 +25,9 @@ import (
 	"tailscale.com/drive"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/auditlog"
 	"tailscale.com/ipn/conffile"
+	"tailscale.com/ipn/desktop"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
@@ -49,9 +51,11 @@ type System struct {
 	Router         SubSystem[router.Router]
 	Tun            SubSystem[*tstun.Wrapper]
 	StateStore     SubSystem[ipn.StateStore]
+	AuditLogStore  SubSystem[auditlog.LogStore]
 	Netstack       SubSystem[NetstackImpl] // actually a *netstack.Impl
 	DriveForLocal  SubSystem[drive.FileSystemForLocal]
 	DriveForRemote SubSystem[drive.FileSystemForRemote]
+	SessionManager SubSystem[desktop.SessionManager]
 
 	// InitialConfig is initial server config, if any.
 	// It is nil if the node is not in declarative mode.
@@ -104,12 +108,16 @@ func (s *System) Set(v any) {
 		s.MagicSock.Set(v)
 	case ipn.StateStore:
 		s.StateStore.Set(v)
+	case auditlog.LogStore:
+		s.AuditLogStore.Set(v)
 	case NetstackImpl:
 		s.Netstack.Set(v)
 	case drive.FileSystemForLocal:
 		s.DriveForLocal.Set(v)
 	case drive.FileSystemForRemote:
 		s.DriveForRemote.Set(v)
+	case desktop.SessionManager:
+		s.SessionManager.Set(v)
 	default:
 		panic(fmt.Sprintf("unknown type %T", v))
 	}

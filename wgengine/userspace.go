@@ -51,7 +51,6 @@ import (
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
-	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
 	"tailscale.com/wgengine/netlog"
@@ -1581,6 +1580,12 @@ type fwdDNSLinkSelector struct {
 }
 
 func (ls fwdDNSLinkSelector) PickLink(ip netip.Addr) (linkName string) {
+	// sandboxed macOS does not automatically bind to the loopback interface so
+	// we must be explicit about it.
+	if runtime.GOOS == "darwin" && ip.IsLoopback() {
+		return "lo0"
+	}
+
 	if ls.ue.isDNSIPOverTailscale.Load()(ip) {
 		return ls.tunName
 	}
@@ -1594,7 +1599,7 @@ var (
 	metricNumMinorChanges = clientmetric.NewCounter("wgengine_minor_changes")
 )
 
-func (e *userspaceEngine) InstallCaptureHook(cb capture.Callback) {
+func (e *userspaceEngine) InstallCaptureHook(cb packet.CaptureCallback) {
 	e.tundev.InstallCaptureHook(cb)
 	e.magicConn.InstallCaptureHook(cb)
 }

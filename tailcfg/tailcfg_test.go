@@ -10,7 +10,6 @@ import (
 	"reflect"
 	"regexp"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +50,7 @@ func TestHostinfoEqual(t *testing.T) {
 		"ShareeNode",
 		"NoLogsNoSupport",
 		"WireIngress",
+		"IngressEnabled",
 		"AllowsUpdate",
 		"Machine",
 		"GoArch",
@@ -251,87 +251,31 @@ func TestHostinfoEqual(t *testing.T) {
 			&Hostinfo{},
 			false,
 		},
+		{
+			&Hostinfo{IngressEnabled: true},
+			&Hostinfo{},
+			false,
+		},
+		{
+			&Hostinfo{IngressEnabled: true},
+			&Hostinfo{IngressEnabled: true},
+			true,
+		},
+		{
+			&Hostinfo{IngressEnabled: false},
+			&Hostinfo{},
+			true,
+		},
+		{
+			&Hostinfo{IngressEnabled: false},
+			&Hostinfo{IngressEnabled: true},
+			false,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equal(tt.b)
 		if got != tt.want {
 			t.Errorf("%d. Equal = %v; want %v", i, got, tt.want)
-		}
-	}
-}
-
-func TestHostinfoHowEqual(t *testing.T) {
-	tests := []struct {
-		a, b *Hostinfo
-		want []string
-	}{
-		{
-			a:    nil,
-			b:    nil,
-			want: nil,
-		},
-		{
-			a:    new(Hostinfo),
-			b:    nil,
-			want: []string{"nil"},
-		},
-		{
-			a:    nil,
-			b:    new(Hostinfo),
-			want: []string{"nil"},
-		},
-		{
-			a:    new(Hostinfo),
-			b:    new(Hostinfo),
-			want: nil,
-		},
-		{
-			a: &Hostinfo{
-				IPNVersion:  "1",
-				ShieldsUp:   false,
-				RoutableIPs: []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")},
-			},
-			b: &Hostinfo{
-				IPNVersion:  "2",
-				ShieldsUp:   true,
-				RoutableIPs: []netip.Prefix{netip.MustParsePrefix("1.2.3.0/25")},
-			},
-			want: []string{"IPNVersion", "ShieldsUp", "RoutableIPs"},
-		},
-		{
-			a: &Hostinfo{
-				IPNVersion: "1",
-			},
-			b: &Hostinfo{
-				IPNVersion: "2",
-				NetInfo:    new(NetInfo),
-			},
-			want: []string{"IPNVersion", "NetInfo.nil"},
-		},
-		{
-			a: &Hostinfo{
-				IPNVersion: "1",
-				NetInfo: &NetInfo{
-					WorkingIPv6:   "true",
-					HavePortMap:   true,
-					LinkType:      "foo",
-					PreferredDERP: 123,
-					DERPLatency: map[string]float64{
-						"foo": 1.0,
-					},
-				},
-			},
-			b: &Hostinfo{
-				IPNVersion: "2",
-				NetInfo:    &NetInfo{},
-			},
-			want: []string{"IPNVersion", "NetInfo.WorkingIPv6", "NetInfo.HavePortMap", "NetInfo.PreferredDERP", "NetInfo.LinkType", "NetInfo.DERPLatency"},
-		},
-	}
-	for i, tt := range tests {
-		got := tt.a.HowUnequal(tt.b)
-		if !reflect.DeepEqual(got, tt.want) {
-			t.Errorf("%d. got %q; want %q", i, got, tt.want)
 		}
 	}
 }
@@ -367,7 +311,7 @@ func TestNodeEqual(t *testing.T) {
 	nodeHandles := []string{
 		"ID", "StableID", "Name", "User", "Sharer",
 		"Key", "KeyExpiry", "KeySignature", "Machine", "DiscoKey",
-		"Addresses", "AllowedIPs", "Endpoints", "DERP", "Hostinfo",
+		"Addresses", "AllowedIPs", "Endpoints", "LegacyDERPString", "HomeDERP", "Hostinfo",
 		"Created", "Cap", "Tags", "PrimaryRoutes",
 		"LastSeen", "Online", "MachineAuthorized",
 		"Capabilities", "CapMap",
@@ -530,8 +474,13 @@ func TestNodeEqual(t *testing.T) {
 			true,
 		},
 		{
-			&Node{DERP: "foo"},
-			&Node{DERP: "bar"},
+			&Node{LegacyDERPString: "foo"},
+			&Node{LegacyDERPString: "bar"},
+			false,
+		},
+		{
+			&Node{HomeDERP: 1},
+			&Node{HomeDERP: 2},
 			false,
 		},
 		{
@@ -666,7 +615,6 @@ func TestCloneUser(t *testing.T) {
 		u    *User
 	}{
 		{"nil_logins", &User{}},
-		{"zero_logins", &User{Logins: make([]LoginID, 0)}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -697,28 +645,6 @@ func TestCloneNode(t *testing.T) {
 				t.Errorf("not equal")
 			}
 		})
-	}
-}
-
-func TestUserProfileJSONMarshalForMac(t *testing.T) {
-	// Old macOS clients had a bug where they required
-	// UserProfile.Roles to be non-null. Lock that in
-	// 1.0.x/1.2.x clients are gone in the wild.
-	// See mac commit 0242c08a2ca496958027db1208f44251bff8488b (Sep 30).
-	// It was fixed in at least 1.4.x, and perhaps 1.2.x.
-	j, err := json.Marshal(UserProfile{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	const wantSub = `"Roles":[]`
-	if !strings.Contains(string(j), wantSub) {
-		t.Fatalf("didn't contain %#q; got: %s", wantSub, j)
-	}
-
-	// And back:
-	var up UserProfile
-	if err := json.Unmarshal(j, &up); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
 	}
 }
 

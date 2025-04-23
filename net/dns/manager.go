@@ -19,7 +19,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	xmaps "golang.org/x/exp/maps"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/health"
 	"tailscale.com/net/dns/resolver"
@@ -31,10 +30,14 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/slicesx"
 )
 
 var (
 	errFullQueue = errors.New("request queue full")
+	// ErrNoDNSConfig is returned by RecompileDNSConfig when the Manager
+	// has no existing DNS configuration.
+	ErrNoDNSConfig = errors.New("no DNS configuration")
 )
 
 // maxActiveQueries returns the maximal number of DNS requests that can
@@ -91,21 +94,18 @@ func NewManager(logf logger.Logf, oscfg OSConfigurator, health *health.Tracker, 
 	}
 
 	// Rate limit our attempts to correct our DNS configuration.
+	// This is done on incoming queries, we don't want to spam it.
 	limiter := rate.NewLimiter(1.0/5.0, 1)
 
 	// This will recompile the DNS config, which in turn will requery the system
 	// DNS settings. The recovery func should triggered only when we are missing
 	// upstream nameservers and require them to forward a query.
 	m.resolver.SetMissingUpstreamRecovery(func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.config == nil {
-			return
-		}
-
 		if limiter.Allow() {
-			m.logf("DNS resolution failed due to missing upstream nameservers.  Recompiling DNS configuration.")
-			m.setLocked(*m.config)
+			m.logf("resolution failed due to missing upstream nameservers.  Recompiling DNS configuration.")
+			if err := m.RecompileDNSConfig(); err != nil {
+				m.logf("config recompilation failed: %v", err)
+			}
 		}
 	})
 
@@ -116,6 +116,26 @@ func NewManager(logf logger.Logf, oscfg OSConfigurator, health *health.Tracker, 
 
 // Resolver returns the Manager's DNS Resolver.
 func (m *Manager) Resolver() *resolver.Resolver { return m.resolver }
+
+// RecompileDNSConfig sets the DNS config to the current value, which has
+// the side effect of re-querying the OS's interface nameservers.  This should be used
+// on platforms where the interface nameservers can change.  Darwin, for example,
+// where the nameservers aren't always available when we process a major interface
+// change event, or platforms where the nameservers may change while tunnel is up.
+//
+// This should be called if it is determined that [OSConfigurator.GetBaseConfig] may
+// give a better or different result than when [Manager.Set] was last called.  The
+// logic for making that determination is up to the caller.
+//
+// It returns [ErrNoDNSConfig] if the [Manager] has no existing DNS configuration.
+func (m *Manager) RecompileDNSConfig() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.config == nil {
+		return ErrNoDNSConfig
+	}
+	return m.setLocked(*m.config)
+}
 
 func (m *Manager) Set(cfg Config) error {
 	m.mu.Lock()
@@ -204,7 +224,7 @@ func compileHostEntries(cfg Config) (hosts []*HostEntry) {
 	if len(hostsMap) == 0 {
 		return nil
 	}
-	hosts = xmaps.Values(hostsMap)
+	hosts = slicesx.MapValues(hostsMap)
 	slices.SortFunc(hosts, func(a, b *HostEntry) int {
 		if len(a.Hosts) == 0 && len(b.Hosts) == 0 {
 			return 0
@@ -246,8 +266,10 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 	// the OS.
 	rcfg.Hosts = cfg.Hosts
 	routes := map[dnsname.FQDN][]*dnstype.Resolver{} // assigned conditionally to rcfg.Routes below.
+	var propagateHostsToOS bool
 	for suffix, resolvers := range cfg.Routes {
 		if len(resolvers) == 0 {
+			propagateHostsToOS = true
 			rcfg.LocalDomains = append(rcfg.LocalDomains, suffix)
 		} else {
 			routes[suffix] = resolvers
@@ -256,7 +278,7 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 
 	// Similarly, the OS always gets search paths.
 	ocfg.SearchDomains = cfg.SearchDomains
-	if m.goos == "windows" {
+	if propagateHostsToOS && m.goos == "windows" {
 		ocfg.Hosts = compileHostEntries(cfg)
 	}
 

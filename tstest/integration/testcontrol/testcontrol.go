@@ -6,6 +6,7 @@ package testcontrol
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -476,13 +477,22 @@ func (s *Server) AddFakeNode() {
 	// TODO: send updates to other (non-fake?) nodes
 }
 
-func (s *Server) AllUsers() (users []*tailcfg.User) {
+func (s *Server) allUserProfiles() (res []tailcfg.UserProfile) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, u := range s.users {
-		users = append(users, u.Clone())
+	for k, u := range s.users {
+		up := tailcfg.UserProfile{
+			ID:          u.ID,
+			DisplayName: u.DisplayName,
+		}
+		if login, ok := s.logins[k]; ok {
+			up.LoginName = login.LoginName
+			up.ProfilePicURL = cmp.Or(up.ProfilePicURL, login.ProfilePicURL)
+			up.DisplayName = cmp.Or(up.DisplayName, login.DisplayName)
+		}
+		res = append(res, up)
 	}
-	return users
+	return res
 }
 
 func (s *Server) AllNodes() (nodes []*tailcfg.Node) {
@@ -523,9 +533,7 @@ func (s *Server) getUser(nodeKey key.NodePublic) (*tailcfg.User, *tailcfg.Login)
 	}
 	user := &tailcfg.User{
 		ID:          id,
-		LoginName:   loginName,
 		DisplayName: displayName,
-		Logins:      []tailcfg.LoginID{login.ID},
 	}
 	s.users[nodeKey] = user
 	s.logins[nodeKey] = login
@@ -797,7 +805,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 			node.Hostinfo = req.Hostinfo.View()
 			if ni := node.Hostinfo.NetInfo(); ni.Valid() {
 				if ni.PreferredDERP() != 0 {
-					node.DERP = fmt.Sprintf("127.3.3.40:%d", ni.PreferredDERP())
+					node.HomeDERP = ni.PreferredDERP()
 				}
 			}
 		}
@@ -831,15 +839,17 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 
 	w.WriteHeader(200)
 	for {
-		if resBytes, ok := s.takeRawMapMessage(req.NodeKey); ok {
-			if err := s.sendMapMsg(w, compress, resBytes); err != nil {
-				s.logf("sendMapMsg of raw message: %v", err)
-				return
-			}
-			if streaming {
+		// Only send raw map responses to the streaming poll, to avoid a
+		// non-streaming map request beating the streaming poll in a race and
+		// potentially dropping the map response.
+		if streaming {
+			if resBytes, ok := s.takeRawMapMessage(req.NodeKey); ok {
+				if err := s.sendMapMsg(w, compress, resBytes); err != nil {
+					s.logf("sendMapMsg of raw message: %v", err)
+					return
+				}
 				continue
 			}
-			return
 		}
 
 		if s.canGenerateAutomaticMapResponseFor(req.NodeKey) {
@@ -947,7 +957,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 	if dns != nil && s.MagicDNSDomain != "" {
 		dns = dns.Clone()
 		dns.CertDomains = []string{
-			fmt.Sprintf(node.Hostinfo.Hostname() + "." + s.MagicDNSDomain),
+			node.Hostinfo.Hostname() + "." + s.MagicDNSDomain,
 		}
 	}
 
@@ -1001,13 +1011,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 	sort.Slice(res.Peers, func(i, j int) bool {
 		return res.Peers[i].ID < res.Peers[j].ID
 	})
-	for _, u := range s.AllUsers() {
-		res.UserProfiles = append(res.UserProfiles, tailcfg.UserProfile{
-			ID:          u.ID,
-			LoginName:   u.LoginName,
-			DisplayName: u.DisplayName,
-		})
-	}
+	res.UserProfiles = s.allUserProfiles()
 
 	v4Prefix := netip.PrefixFrom(netaddr.IPv4(100, 64, uint8(tailcfg.NodeID(user.ID)>>8), uint8(tailcfg.NodeID(user.ID))), 32)
 	v6Prefix := netip.PrefixFrom(tsaddr.Tailscale4To6(v4Prefix.Addr()), 128)

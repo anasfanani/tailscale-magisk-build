@@ -11,6 +11,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -35,7 +36,7 @@ import (
 
 	"gopkg.in/square/go-jose.v2"
 	"gopkg.in/square/go-jose.v2/jwt"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
@@ -75,7 +76,7 @@ func main() {
 	}
 
 	var (
-		lc          *tailscale.LocalClient
+		lc          *local.Client
 		st          *ipnstate.Status
 		err         error
 		watcherChan chan error
@@ -84,7 +85,7 @@ func main() {
 		lns []net.Listener
 	)
 	if *flagUseLocalTailscaled {
-		lc = &tailscale.LocalClient{}
+		lc = &local.Client{}
 		st, err = lc.StatusWithoutPeers(ctx)
 		if err != nil {
 			log.Fatalf("getting status: %v", err)
@@ -212,7 +213,7 @@ func main() {
 // serveOnLocalTailscaled starts a serve session using an already-running
 // tailscaled instead of starting a fresh tsnet server, making something
 // listening on clientDNSName:dstPort accessible over serve/funnel.
-func serveOnLocalTailscaled(ctx context.Context, lc *tailscale.LocalClient, st *ipnstate.Status, dstPort uint16, shouldFunnel bool) (cleanup func(), watcherChan chan error, err error) {
+func serveOnLocalTailscaled(ctx context.Context, lc *local.Client, st *ipnstate.Status, dstPort uint16, shouldFunnel bool) (cleanup func(), watcherChan chan error, err error) {
 	// In order to support funneling out in local tailscaled mode, we need
 	// to add a serve config to forward the listeners we bound above and
 	// allow those forwarders to be funneled out.
@@ -275,7 +276,7 @@ func serveOnLocalTailscaled(ctx context.Context, lc *tailscale.LocalClient, st *
 }
 
 type idpServer struct {
-	lc          *tailscale.LocalClient
+	lc          *local.Client
 	loopbackURL string
 	serverURL   string // "https://foo.bar.ts.net"
 	funnel      bool
@@ -328,7 +329,7 @@ type authRequest struct {
 // allowRelyingParty validates that a relying party identified either by a
 // known remoteAddr or a valid client ID/secret pair is allowed to proceed
 // with the authorization flow associated with this authRequest.
-func (ar *authRequest) allowRelyingParty(r *http.Request, lc *tailscale.LocalClient) error {
+func (ar *authRequest) allowRelyingParty(r *http.Request, lc *local.Client) error {
 	if ar.localRP {
 		ra, err := netip.ParseAddrPort(r.RemoteAddr)
 		if err != nil {
@@ -345,7 +346,9 @@ func (ar *authRequest) allowRelyingParty(r *http.Request, lc *tailscale.LocalCli
 			clientID = r.FormValue("client_id")
 			clientSecret = r.FormValue("client_secret")
 		}
-		if ar.funnelRP.ID != clientID || ar.funnelRP.Secret != clientSecret {
+		clientIDcmp := subtle.ConstantTimeCompare([]byte(clientID), []byte(ar.funnelRP.ID))
+		clientSecretcmp := subtle.ConstantTimeCompare([]byte(clientSecret), []byte(ar.funnelRP.Secret))
+		if clientIDcmp != 1 || clientSecretcmp != 1 {
 			return fmt.Errorf("tsidp: invalid client credentials")
 		}
 		return nil
@@ -762,6 +765,18 @@ var (
 )
 
 func (s *idpServer) serveOpenIDConfig(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Allow-Method", "GET, OPTIONS")
+	// allow all to prevent errors from client sending their own bespoke headers
+	// and having the server reject the request.
+	h.Set("Access-Control-Allow-Headers", "*")
+
+	// early return for pre-flight OPTIONS requests.
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if r.URL.Path != oidcConfigPath {
 		http.Error(w, "tsidp: not found", http.StatusNotFound)
 		return

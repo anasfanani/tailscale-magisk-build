@@ -32,6 +32,8 @@ type ConfigVAlpha struct {
 	AdvertiseRoutes []netip.Prefix `json:",omitempty"`
 	DisableSNAT     opt.Bool       `json:",omitempty"`
 
+	AdvertiseServices []string `json:",omitempty"`
+
 	AppConnector *AppConnectorPrefs `json:",omitempty"` // advertise app connector; defaults to false (if nil or explicitly set to false)
 
 	NetfilterMode       *string  `json:",omitempty"` // "on", "off", "nodivert"
@@ -142,6 +144,16 @@ func (c *ConfigVAlpha) ToPrefs() (MaskedPrefs, error) {
 	if c.AppConnector != nil {
 		mp.AppConnector = *c.AppConnector
 		mp.AppConnectorSet = true
+	}
+	// Configfile should be the source of truth for whether this node
+	// advertises any services.  We need to ensure that each reload updates
+	// currently advertised services as else the transition from 'some
+	// services are advertised' to 'advertised services are empty/unset in
+	// conffile' would have no effect (especially given that an empty
+	// service slice would be omitted from the JSON config).
+	mp.AdvertiseServicesSet = true
+	if c.AdvertiseServices != nil {
+		mp.AdvertiseServices = c.AdvertiseServices
 	}
 	return mp, nil
 }

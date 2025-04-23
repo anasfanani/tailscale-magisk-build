@@ -21,7 +21,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	xmaps "golang.org/x/exp/maps"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"tailscale.com/disco"
@@ -34,6 +33,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/ringbuffer"
+	"tailscale.com/util/slicesx"
 )
 
 var mtuProbePingSizesV4 []int
@@ -587,7 +587,7 @@ func (de *endpoint) addrForWireGuardSendLocked(now mono.Time) (udpAddr netip.Add
 	needPing := len(de.endpointState) > 1 && now.Sub(oldestPing) > wireguardPingInterval
 
 	if !udpAddr.IsValid() {
-		candidates := xmaps.Keys(de.endpointState)
+		candidates := slicesx.MapKeys(de.endpointState)
 
 		// Randomly select an address to use until we retrieve latency information
 		// and give it a short trustBestAddrUntil time so we avoid flapping between
@@ -948,7 +948,15 @@ func (de *endpoint) send(buffs [][]byte) error {
 	de.mu.Unlock()
 
 	if !udpAddr.IsValid() && !derpAddr.IsValid() {
-		return errNoUDPOrDERP
+		// Make a last ditch effort to see if we have a DERP route for them. If
+		// they contacted us over DERP and we don't know their UDP endpoints or
+		// their DERP home, we can at least assume they're reachable over the
+		// DERP they used to contact us.
+		if rid := de.c.fallbackDERPRegionForPeer(de.publicKey); rid != 0 {
+			derpAddr = netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(rid))
+		} else {
+			return errNoUDPOrDERP
+		}
 	}
 	var err error
 	if udpAddr.IsValid() {
@@ -1359,7 +1367,7 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 		})
 		de.resetLocked()
 	}
-	if n.DERP() == "" {
+	if n.HomeDERP() == 0 {
 		if de.derpAddr.IsValid() {
 			de.debugUpdates.Add(EndpointChange{
 				When: time.Now(),
@@ -1369,7 +1377,7 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 		}
 		de.derpAddr = netip.AddrPort{}
 	} else {
-		newDerp, _ := netip.ParseAddrPort(n.DERP())
+		newDerp := netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(n.HomeDERP()))
 		if de.derpAddr != newDerp {
 			de.debugUpdates.Add(EndpointChange{
 				When: time.Now(),

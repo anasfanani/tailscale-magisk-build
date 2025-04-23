@@ -21,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/types/ptr"
 )
 
@@ -61,10 +62,10 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	proxyClassAllOpts := &tsapi.ProxyClass{
 		Spec: tsapi.ProxyClassSpec{
 			StatefulSet: &tsapi.StatefulSet{
-				Labels:      map[string]string{"foo": "bar"},
+				Labels:      tsapi.Labels{"foo": "bar"},
 				Annotations: map[string]string{"foo.io/bar": "foo"},
 				Pod: &tsapi.Pod{
-					Labels:      map[string]string{"bar": "foo"},
+					Labels:      tsapi.Labels{"bar": "foo"},
 					Annotations: map[string]string{"bar.io/foo": "foo"},
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsUser: ptr.To(int64(0)),
@@ -116,10 +117,10 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	proxyClassJustLabels := &tsapi.ProxyClass{
 		Spec: tsapi.ProxyClassSpec{
 			StatefulSet: &tsapi.StatefulSet{
-				Labels:      map[string]string{"foo": "bar"},
+				Labels:      tsapi.Labels{"foo": "bar"},
 				Annotations: map[string]string{"foo.io/bar": "foo"},
 				Pod: &tsapi.Pod{
-					Labels:      map[string]string{"bar": "foo"},
+					Labels:      tsapi.Labels{"bar": "foo"},
 					Annotations: map[string]string{"bar.io/foo": "foo"},
 				},
 			},
@@ -146,7 +147,6 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 			},
 		}
 	}
-
 	var userspaceProxySS, nonUserspaceProxySS appsv1.StatefulSet
 	if err := yaml.Unmarshal(userspaceProxyYaml, &userspaceProxySS); err != nil {
 		t.Fatalf("unmarshaling userspace proxy template: %v", err)
@@ -157,8 +157,8 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	// Set a couple additional fields so we can test that we don't
 	// mistakenly override those.
 	labels := map[string]string{
-		LabelManaged:    "true",
-		LabelParentName: "foo",
+		kubetypes.LabelManaged: "true",
+		LabelParentName:        "foo",
 	}
 	annots := map[string]string{
 		podAnnotationLastSetClusterIP: "1.2.3.4",
@@ -176,9 +176,9 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	// 1. Test that a ProxyClass with all fields set gets correctly applied
 	// to a Statefulset built from non-userspace proxy template.
 	wantSS := nonUserspaceProxySS.DeepCopy()
-	wantSS.ObjectMeta.Labels = mergeMapKeys(wantSS.ObjectMeta.Labels, proxyClassAllOpts.Spec.StatefulSet.Labels)
-	wantSS.ObjectMeta.Annotations = mergeMapKeys(wantSS.ObjectMeta.Annotations, proxyClassAllOpts.Spec.StatefulSet.Annotations)
-	wantSS.Spec.Template.Labels = proxyClassAllOpts.Spec.StatefulSet.Pod.Labels
+	updateMap(wantSS.ObjectMeta.Labels, proxyClassAllOpts.Spec.StatefulSet.Labels.Parse())
+	updateMap(wantSS.ObjectMeta.Annotations, proxyClassAllOpts.Spec.StatefulSet.Annotations)
+	wantSS.Spec.Template.Labels = proxyClassAllOpts.Spec.StatefulSet.Pod.Labels.Parse()
 	wantSS.Spec.Template.Annotations = proxyClassAllOpts.Spec.StatefulSet.Pod.Annotations
 	wantSS.Spec.Template.Spec.SecurityContext = proxyClassAllOpts.Spec.StatefulSet.Pod.SecurityContext
 	wantSS.Spec.Template.Spec.ImagePullSecrets = proxyClassAllOpts.Spec.StatefulSet.Pod.ImagePullSecrets
@@ -207,9 +207,9 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	// StatefulSet and Pod set gets correctly applied to a Statefulset built
 	// from non-userspace proxy template.
 	wantSS = nonUserspaceProxySS.DeepCopy()
-	wantSS.ObjectMeta.Labels = mergeMapKeys(wantSS.ObjectMeta.Labels, proxyClassJustLabels.Spec.StatefulSet.Labels)
-	wantSS.ObjectMeta.Annotations = mergeMapKeys(wantSS.ObjectMeta.Annotations, proxyClassJustLabels.Spec.StatefulSet.Annotations)
-	wantSS.Spec.Template.Labels = proxyClassJustLabels.Spec.StatefulSet.Pod.Labels
+	updateMap(wantSS.ObjectMeta.Labels, proxyClassJustLabels.Spec.StatefulSet.Labels.Parse())
+	updateMap(wantSS.ObjectMeta.Annotations, proxyClassJustLabels.Spec.StatefulSet.Annotations)
+	wantSS.Spec.Template.Labels = proxyClassJustLabels.Spec.StatefulSet.Pod.Labels.Parse()
 	wantSS.Spec.Template.Annotations = proxyClassJustLabels.Spec.StatefulSet.Pod.Annotations
 	gotSS = applyProxyClassToStatefulSet(proxyClassJustLabels, nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
@@ -219,9 +219,9 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	// 3. Test that a ProxyClass with all fields set gets correctly applied
 	// to a Statefulset built from a userspace proxy template.
 	wantSS = userspaceProxySS.DeepCopy()
-	wantSS.ObjectMeta.Labels = mergeMapKeys(wantSS.ObjectMeta.Labels, proxyClassAllOpts.Spec.StatefulSet.Labels)
-	wantSS.ObjectMeta.Annotations = mergeMapKeys(wantSS.ObjectMeta.Annotations, proxyClassAllOpts.Spec.StatefulSet.Annotations)
-	wantSS.Spec.Template.Labels = proxyClassAllOpts.Spec.StatefulSet.Pod.Labels
+	updateMap(wantSS.ObjectMeta.Labels, proxyClassAllOpts.Spec.StatefulSet.Labels.Parse())
+	updateMap(wantSS.ObjectMeta.Annotations, proxyClassAllOpts.Spec.StatefulSet.Annotations)
+	wantSS.Spec.Template.Labels = proxyClassAllOpts.Spec.StatefulSet.Pod.Labels.Parse()
 	wantSS.Spec.Template.Annotations = proxyClassAllOpts.Spec.StatefulSet.Pod.Annotations
 	wantSS.Spec.Template.Spec.SecurityContext = proxyClassAllOpts.Spec.StatefulSet.Pod.SecurityContext
 	wantSS.Spec.Template.Spec.ImagePullSecrets = proxyClassAllOpts.Spec.StatefulSet.Pod.ImagePullSecrets
@@ -243,9 +243,9 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	// 4. Test that a ProxyClass with custom labels and annotations gets correctly applied
 	// to a Statefulset built from a userspace proxy template.
 	wantSS = userspaceProxySS.DeepCopy()
-	wantSS.ObjectMeta.Labels = mergeMapKeys(wantSS.ObjectMeta.Labels, proxyClassJustLabels.Spec.StatefulSet.Labels)
-	wantSS.ObjectMeta.Annotations = mergeMapKeys(wantSS.ObjectMeta.Annotations, proxyClassJustLabels.Spec.StatefulSet.Annotations)
-	wantSS.Spec.Template.Labels = proxyClassJustLabels.Spec.StatefulSet.Pod.Labels
+	updateMap(wantSS.ObjectMeta.Labels, proxyClassJustLabels.Spec.StatefulSet.Labels.Parse())
+	updateMap(wantSS.ObjectMeta.Annotations, proxyClassJustLabels.Spec.StatefulSet.Annotations)
+	wantSS.Spec.Template.Labels = proxyClassJustLabels.Spec.StatefulSet.Pod.Labels.Parse()
 	wantSS.Spec.Template.Annotations = proxyClassJustLabels.Spec.StatefulSet.Pod.Annotations
 	gotSS = applyProxyClassToStatefulSet(proxyClassJustLabels, userspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
@@ -294,13 +294,6 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	}
 }
 
-func mergeMapKeys(a, b map[string]string) map[string]string {
-	for key, val := range b {
-		a[key] = val
-	}
-	return a
-}
-
 func Test_mergeStatefulSetLabelsOrAnnots(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -311,28 +304,28 @@ func Test_mergeStatefulSetLabelsOrAnnots(t *testing.T) {
 	}{
 		{
 			name:    "no custom labels specified and none present in current labels, return current labels",
-			current: map[string]string{LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
-			want:    map[string]string{LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
+			current: map[string]string{kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
+			want:    map[string]string{kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			managed: tailscaleManagedLabels,
 		},
 		{
 			name:    "no custom labels specified, but some present in current labels, return tailscale managed labels only from the current labels",
-			current: map[string]string{"foo": "bar", "something.io/foo": "bar", LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
-			want:    map[string]string{LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
+			current: map[string]string{"foo": "bar", "something.io/foo": "bar", kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
+			want:    map[string]string{kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			managed: tailscaleManagedLabels,
 		},
 		{
 			name:    "custom labels specified, current labels only contain tailscale managed labels, return a union of both",
-			current: map[string]string{LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
+			current: map[string]string{kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			custom:  map[string]string{"foo": "bar", "something.io/foo": "bar"},
-			want:    map[string]string{"foo": "bar", "something.io/foo": "bar", LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
+			want:    map[string]string{"foo": "bar", "something.io/foo": "bar", kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			managed: tailscaleManagedLabels,
 		},
 		{
 			name:    "custom labels specified, current labels contain tailscale managed labels and custom labels, some of which re not present in the new custom labels, return a union of managed labels and the desired custom labels",
-			current: map[string]string{"foo": "bar", "bar": "baz", "app": "1234", LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
+			current: map[string]string{"foo": "bar", "bar": "baz", "app": "1234", kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			custom:  map[string]string{"foo": "bar", "something.io/foo": "bar"},
-			want:    map[string]string{"foo": "bar", "something.io/foo": "bar", "app": "1234", LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
+			want:    map[string]string{"foo": "bar", "something.io/foo": "bar", "app": "1234", kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			managed: tailscaleManagedLabels,
 		},
 		{
@@ -390,5 +383,12 @@ func Test_mergeStatefulSetLabelsOrAnnots(t *testing.T) {
 				t.Errorf("mergeStatefulSetLabels() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// updateMap updates map a with the values from map b.
+func updateMap(a, b map[string]string) {
+	for key, val := range b {
+		a[key] = val
 	}
 }

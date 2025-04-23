@@ -32,7 +32,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tailscale/golang-x-crypto/acme"
 	"tailscale.com/atomicfile"
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
@@ -40,6 +39,8 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
 	"tailscale.com/ipn/store/mem"
+	"tailscale.com/net/bakedroots"
+	"tailscale.com/tempfork/acme"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/testenv"
 	"tailscale.com/version"
@@ -118,6 +119,9 @@ func (b *LocalBackend) GetCertPEMWithValidity(ctx context.Context, domain string
 	}
 
 	if pair, err := getCertPEMCached(cs, domain, now); err == nil {
+		if envknob.IsCertShareReadOnlyMode() {
+			return pair, nil
+		}
 		// If we got here, we have a valid unexpired cert.
 		// Check whether we should start an async renewal.
 		shouldRenew, err := b.shouldStartDomainRenewal(cs, domain, now, pair, minValidity)
@@ -133,7 +137,7 @@ func (b *LocalBackend) GetCertPEMWithValidity(ctx context.Context, domain string
 		if minValidity == 0 {
 			logf("starting async renewal")
 			// Start renewal in the background, return current valid cert.
-			go b.getCertPEM(context.Background(), cs, logf, traceACME, domain, now, minValidity)
+			b.goTracker.Go(func() { getCertPEM(context.Background(), b, cs, logf, traceACME, domain, now, minValidity) })
 			return pair, nil
 		}
 		// If the caller requested a specific validity duration, fall through
@@ -141,7 +145,11 @@ func (b *LocalBackend) GetCertPEMWithValidity(ctx context.Context, domain string
 		logf("starting sync renewal")
 	}
 
-	pair, err := b.getCertPEM(ctx, cs, logf, traceACME, domain, now, minValidity)
+	if envknob.IsCertShareReadOnlyMode() {
+		return nil, fmt.Errorf("retrieving cached TLS certificate failed and cert store is configured in read-only mode, not attempting to issue a new certificate: %w", err)
+	}
+
+	pair, err := getCertPEM(ctx, b, cs, logf, traceACME, domain, now, minValidity)
 	if err != nil {
 		logf("getCertPEM: %v", err)
 		return nil, err
@@ -249,15 +257,13 @@ type certStore interface {
 	// for now. If they're expired, it returns errCertExpired.
 	// If they don't exist, it returns ipn.ErrStateNotExist.
 	Read(domain string, now time.Time) (*TLSCertKeyPair, error)
-	// WriteCert writes the cert for domain.
-	WriteCert(domain string, cert []byte) error
-	// WriteKey writes the key for domain.
-	WriteKey(domain string, key []byte) error
 	// ACMEKey returns the value previously stored via WriteACMEKey.
 	// It is a PEM encoded ECDSA key.
 	ACMEKey() ([]byte, error)
 	// WriteACMEKey stores the provided PEM encoded ECDSA key.
 	WriteACMEKey([]byte) error
+	// WriteTLSCertAndKey writes the cert and key for domain.
+	WriteTLSCertAndKey(domain string, cert, key []byte) error
 }
 
 var errCertExpired = errors.New("cert expired")
@@ -343,6 +349,13 @@ func (f certFileStore) WriteKey(domain string, key []byte) error {
 	return atomicfile.WriteFile(keyFile(f.dir, domain), key, 0600)
 }
 
+func (f certFileStore) WriteTLSCertAndKey(domain string, cert, key []byte) error {
+	if err := f.WriteKey(domain, key); err != nil {
+		return err
+	}
+	return f.WriteCert(domain, cert)
+}
+
 // certStateStore implements certStore by storing the cert & key files in an ipn.StateStore.
 type certStateStore struct {
 	ipn.StateStore
@@ -352,7 +365,29 @@ type certStateStore struct {
 	testRoots *x509.CertPool
 }
 
+// TLSCertKeyReader is an interface implemented by state stores where it makes
+// sense to read the TLS cert and key in a single operation that can be
+// distinguished from generic state value reads. Currently this is only implemented
+// by the kubestore.Store, which, in some cases, need to read cert and key from a
+// non-cached TLS Secret.
+type TLSCertKeyReader interface {
+	ReadTLSCertAndKey(domain string) ([]byte, []byte, error)
+}
+
 func (s certStateStore) Read(domain string, now time.Time) (*TLSCertKeyPair, error) {
+	// If we're using a store that supports atomic reads, use that
+	if kr, ok := s.StateStore.(TLSCertKeyReader); ok {
+		cert, key, err := kr.ReadTLSCertAndKey(domain)
+		if err != nil {
+			return nil, err
+		}
+		if !validCertPEM(domain, key, cert, s.testRoots, now) {
+			return nil, errCertExpired
+		}
+		return &TLSCertKeyPair{CertPEM: cert, KeyPEM: key, Cached: true}, nil
+	}
+
+	// Otherwise fall back to separate reads
 	certPEM, err := s.ReadState(ipn.StateKey(domain + ".crt"))
 	if err != nil {
 		return nil, err
@@ -381,6 +416,27 @@ func (s certStateStore) ACMEKey() ([]byte, error) {
 
 func (s certStateStore) WriteACMEKey(key []byte) error {
 	return ipn.WriteState(s.StateStore, ipn.StateKey(acmePEMName), key)
+}
+
+// TLSCertKeyWriter is an interface implemented by state stores that can write the TLS
+// cert and key in a single atomic operation. Currently this is only implemented
+// by the kubestore.StoreKube.
+type TLSCertKeyWriter interface {
+	WriteTLSCertAndKey(domain string, cert, key []byte) error
+}
+
+// WriteTLSCertAndKey writes the TLS cert and key for domain to the current
+// LocalBackend's StateStore.
+func (s certStateStore) WriteTLSCertAndKey(domain string, cert, key []byte) error {
+	// If we're using a store that supports atomic writes, use that.
+	if aw, ok := s.StateStore.(TLSCertKeyWriter); ok {
+		return aw.WriteTLSCertAndKey(domain, cert, key)
+	}
+	// Otherwise fall back to separate writes for cert and key.
+	if err := s.WriteKey(domain, key); err != nil {
+		return err
+	}
+	return s.WriteCert(domain, cert)
 }
 
 // TLSCertKeyPair is a TLS public and private key, and whether they were obtained
@@ -419,7 +475,9 @@ func getCertPEMCached(cs certStore, domain string, now time.Time) (p *TLSCertKey
 	return cs.Read(domain, now)
 }
 
-func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger.Logf, traceACME func(any), domain string, now time.Time, minValidity time.Duration) (*TLSCertKeyPair, error) {
+// getCertPem checks if a cert needs to be renewed and if so, renews it.
+// It can be overridden in tests.
+var getCertPEM = func(ctx context.Context, b *LocalBackend, cs certStore, logf logger.Logf, traceACME func(any), domain string, now time.Time, minValidity time.Duration) (*TLSCertKeyPair, error) {
 	acmeMu.Lock()
 	defer acmeMu.Unlock()
 
@@ -442,6 +500,10 @@ func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger
 	ac, err := acmeClient(cs)
 	if err != nil {
 		return nil, err
+	}
+
+	if !isDefaultDirectoryURL(ac.DirectoryURL) {
+		logf("acme: using Directory URL %q", ac.DirectoryURL)
 	}
 
 	a, err := ac.GetReg(ctx, "" /* pre-RFC param */)
@@ -545,9 +607,6 @@ func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger
 	if err := encodeECDSAKey(&privPEM, certPrivKey); err != nil {
 		return nil, err
 	}
-	if err := cs.WriteKey(domain, privPEM.Bytes()); err != nil {
-		return nil, err
-	}
 
 	csr, err := certRequest(certPrivKey, domain, nil)
 	if err != nil {
@@ -555,6 +614,7 @@ func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger
 	}
 
 	logf("requesting cert...")
+	traceACME(csr)
 	der, _, err := ac.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
 	if err != nil {
 		return nil, fmt.Errorf("CreateOrder: %v", err)
@@ -568,7 +628,7 @@ func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger
 			return nil, err
 		}
 	}
-	if err := cs.WriteCert(domain, certPEM.Bytes()); err != nil {
+	if err := cs.WriteTLSCertAndKey(domain, certPEM.Bytes(), privPEM.Bytes()); err != nil {
 		return nil, err
 	}
 	b.domainRenewed(domain)
@@ -577,10 +637,10 @@ func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger
 }
 
 // certRequest generates a CSR for the given common name cn and optional SANs.
-func certRequest(key crypto.Signer, cn string, ext []pkix.Extension, san ...string) ([]byte, error) {
+func certRequest(key crypto.Signer, name string, ext []pkix.Extension) ([]byte, error) {
 	req := &x509.CertificateRequest{
-		Subject:         pkix.Name{CommonName: cn},
-		DNSNames:        san,
+		Subject:         pkix.Name{CommonName: name},
+		DNSNames:        []string{name},
 		ExtraExtensions: ext,
 	}
 	return x509.CreateCertificateRequest(rand.Reader, req, key)
@@ -657,15 +717,16 @@ func acmeClient(cs certStore) (*acme.Client, error) {
 	// LetsEncrypt), we should make sure that they support ARI extension (see
 	// shouldStartDomainRenewalARI).
 	return &acme.Client{
-		Key:       key,
-		UserAgent: "tailscaled/" + version.Long(),
+		Key:          key,
+		UserAgent:    "tailscaled/" + version.Long(),
+		DirectoryURL: envknob.String("TS_DEBUG_ACME_DIRECTORY_URL"),
 	}, nil
 }
 
 // validCertPEM reports whether the given certificate is valid for domain at now.
 //
 // If roots != nil, it is used instead of the system root pool. This is meant
-// to support testing, and production code should pass roots == nil.
+// to support testing; production code should pass roots == nil.
 func validCertPEM(domain string, keyPEM, certPEM []byte, roots *x509.CertPool, now time.Time) bool {
 	if len(keyPEM) == 0 || len(certPEM) == 0 {
 		return false
@@ -688,16 +749,51 @@ func validCertPEM(domain string, keyPEM, certPEM []byte, roots *x509.CertPool, n
 			intermediates.AddCert(cert)
 		}
 	}
+	return validateLeaf(leaf, intermediates, domain, now, roots)
+}
+
+// validateLeaf is a helper for [validCertPEM].
+//
+// If called with roots == nil, it will use the system root pool as well as the
+// baked-in roots. If non-nil, only those roots are used.
+func validateLeaf(leaf *x509.Certificate, intermediates *x509.CertPool, domain string, now time.Time, roots *x509.CertPool) bool {
 	if leaf == nil {
 		return false
 	}
-	_, err = leaf.Verify(x509.VerifyOptions{
+	_, err := leaf.Verify(x509.VerifyOptions{
 		DNSName:       domain,
 		CurrentTime:   now,
 		Roots:         roots,
 		Intermediates: intermediates,
 	})
-	return err == nil
+	if err != nil && roots == nil {
+		// If validation failed and they specified nil for roots (meaning to use
+		// the system roots), then give it another chance to validate using the
+		// binary's baked-in roots (LetsEncrypt). See tailscale/tailscale#14690.
+		return validateLeaf(leaf, intermediates, domain, now, bakedroots.Get())
+	}
+
+	if err == nil {
+		return true
+	}
+
+	// When pointed at a non-prod ACME server, we don't expect to have the CA
+	// in our system or baked-in roots. Verify only throws UnknownAuthorityError
+	// after first checking the leaf cert's expiry, hostnames etc, so we know
+	// that the only reason for an error is to do with constructing a full chain.
+	// Allow this error so that cert caching still works in testing environments.
+	if errors.As(err, &x509.UnknownAuthorityError{}) {
+		acmeURL := envknob.String("TS_DEBUG_ACME_DIRECTORY_URL")
+		if !isDefaultDirectoryURL(acmeURL) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isDefaultDirectoryURL(u string) bool {
+	return u == "" || u == acme.LetsEncryptURL
 }
 
 // validLookingCertDomain reports whether name looks like a valid domain name that

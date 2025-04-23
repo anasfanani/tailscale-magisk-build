@@ -27,6 +27,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/util/slicesx"
 	"tailscale.com/version"
 )
 
@@ -129,7 +130,7 @@ func (e *serveEnv) newFlags(name string, setup func(fs *flag.FlagSet)) *flag.Fla
 }
 
 // localServeClient is an interface conforming to the subset of
-// tailscale.LocalClient. It includes only the methods used by the
+// local.Client. It includes only the methods used by the
 // serve command.
 //
 // The purpose of this interface is to allow tests to provide a mock.
@@ -707,10 +708,7 @@ func (e *serveEnv) printWebStatusTree(sc *ipn.ServeConfig, hp ipn.HostPort) erro
 		return "", ""
 	}
 
-	var mounts []string
-	for k := range sc.Web[hp].Handlers {
-		mounts = append(mounts, k)
-	}
+	mounts := slicesx.MapKeys(sc.Web[hp].Handlers)
 	sort.Slice(mounts, func(i, j int) bool {
 		return len(mounts[i]) < len(mounts[j])
 	})

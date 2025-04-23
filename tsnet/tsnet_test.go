@@ -36,7 +36,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"golang.org/x/net/proxy"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
@@ -120,6 +120,7 @@ func startControl(t *testing.T) (controlURL string, control *testcontrol.Server)
 			Proxied: true,
 		},
 		MagicDNSDomain: "tail-scale.ts.net",
+		Logf:           t.Logf,
 	}
 	control.HTTPTestServer = httptest.NewUnstartedServer(control)
 	control.HTTPTestServer.Start()
@@ -221,7 +222,7 @@ func startServer(t *testing.T, ctx context.Context, controlURL, hostname string)
 		getCertForTesting: testCertRoot.getCert,
 	}
 	if *verboseNodes {
-		s.Logf = log.Printf
+		s.Logf = t.Logf
 	}
 	t.Cleanup(func() { s.Close() })
 
@@ -230,6 +231,46 @@ func startServer(t *testing.T, ctx context.Context, controlURL, hostname string)
 		t.Fatal(err)
 	}
 	return s, status.TailscaleIPs[0], status.Self.PublicKey
+}
+
+func TestDialBlocks(t *testing.T) {
+	tstest.ResourceCheck(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	controlURL, _ := startControl(t)
+
+	// Make one tsnet that blocks until it's up.
+	s1, _, _ := startServer(t, ctx, controlURL, "s1")
+
+	ln, err := s1.Listen("tcp", ":8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	// Then make another tsnet node that will only be woken up
+	// upon the first dial.
+	tmp := filepath.Join(t.TempDir(), "s2")
+	os.MkdirAll(tmp, 0755)
+	s2 := &Server{
+		Dir:               tmp,
+		ControlURL:        controlURL,
+		Hostname:          "s2",
+		Store:             new(mem.Store),
+		Ephemeral:         true,
+		getCertForTesting: testCertRoot.getCert,
+	}
+	if *verboseNodes {
+		s2.Logf = log.Printf
+	}
+	t.Cleanup(func() { s2.Close() })
+
+	c, err := s2.Dial(ctx, "tcp", "s1:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
 }
 
 func TestConn(t *testing.T) {
@@ -494,6 +535,25 @@ func TestListenerCleanup(t *testing.T) {
 	if err := ln.Close(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("second ln.Close error: %v, want net.ErrClosed", err)
 	}
+
+	// Verify that handling a connection from gVisor (from a packet arriving)
+	// after a listener closed doesn't panic (previously: sending on a closed
+	// channel) or hang.
+	c := &closeTrackConn{}
+	ln.(*listener).handle(c)
+	if !c.closed {
+		t.Errorf("c.closed = false, want true")
+	}
+}
+
+type closeTrackConn struct {
+	net.Conn
+	closed bool
+}
+
+func (wc *closeTrackConn) Close() error {
+	wc.closed = true
+	return nil
 }
 
 // tests https://github.com/tailscale/tailscale/issues/6973 -- that we can start a tsnet server,
@@ -605,6 +665,37 @@ func TestFunnel(t *testing.T) {
 	}
 	if string(body) != "hello" {
 		t.Errorf("unexpected body: %q", body)
+	}
+}
+
+func TestListenerClose(t *testing.T) {
+	ctx := context.Background()
+	controlURL, _ := startControl(t)
+
+	s1, _, _ := startServer(t, ctx, controlURL, "s1")
+
+	ln, err := s1.Listen("tcp", ":8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept()
+		if c != nil {
+			c.Close()
+		}
+		errc <- err
+	}()
+
+	ln.Close()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Errorf("unexpected error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for Accept to return")
 	}
 }
 
@@ -1183,7 +1274,7 @@ func waitForCondition(t *testing.T, msg string, waitTime time.Duration, f func()
 }
 
 // mustDirect ensures there is a direct connection between LocalClient 1 and 2
-func mustDirect(t *testing.T, logf logger.Logf, lc1, lc2 *tailscale.LocalClient) {
+func mustDirect(t *testing.T, logf logger.Logf, lc1, lc2 *local.Client) {
 	t.Helper()
 	lastLog := time.Now().Add(-time.Minute)
 	// See https://github.com/tailscale/tailscale/issues/654

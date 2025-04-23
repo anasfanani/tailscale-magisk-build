@@ -20,7 +20,7 @@ import (
 	"go.uber.org/zap"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	ksr "tailscale.com/k8s-operator/sessionrecording"
 	"tailscale.com/kube/kubetypes"
@@ -189,7 +189,7 @@ func runAPIServerProxy(ts *tsnet.Server, rt http.RoundTripper, log *zap.SugaredL
 // LocalAPI and then proxies them to the Kubernetes API.
 type apiserverProxy struct {
 	log *zap.SugaredLogger
-	lc  *tailscale.LocalClient
+	lc  *local.Client
 	rp  *httputil.ReverseProxy
 
 	mode        apiServerProxyMode
@@ -311,7 +311,7 @@ func (h *apiserverProxy) addImpersonationHeadersAsRequired(r *http.Request) {
 
 	// Now add the impersonation headers that we want.
 	if err := addImpersonationHeaders(r, h.log); err != nil {
-		log.Printf("failed to add impersonation headers: " + err.Error())
+		log.Print("failed to add impersonation headers: ", err.Error())
 	}
 }
 

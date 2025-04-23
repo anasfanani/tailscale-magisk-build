@@ -18,9 +18,75 @@ import (
 	"tailscale.com/types/views"
 )
 
-//go:generate go run tailscale.com/cmd/cloner  -clonefunc=false -type=Prefs,ServeConfig,ServiceConfig,TCPPortHandler,HTTPHandler,WebServerConfig
+//go:generate go run tailscale.com/cmd/cloner  -clonefunc=false -type=LoginProfile,Prefs,ServeConfig,ServiceConfig,TCPPortHandler,HTTPHandler,WebServerConfig
 
-// View returns a readonly view of Prefs.
+// View returns a read-only view of LoginProfile.
+func (p *LoginProfile) View() LoginProfileView {
+	return LoginProfileView{ж: p}
+}
+
+// LoginProfileView provides a read-only view over LoginProfile.
+//
+// Its methods should only be called if `Valid()` returns true.
+type LoginProfileView struct {
+	// ж is the underlying mutable value, named with a hard-to-type
+	// character that looks pointy like a pointer.
+	// It is named distinctively to make you think of how dangerous it is to escape
+	// to callers. You must not let callers be able to mutate it.
+	ж *LoginProfile
+}
+
+// Valid reports whether v's underlying value is non-nil.
+func (v LoginProfileView) Valid() bool { return v.ж != nil }
+
+// AsStruct returns a clone of the underlying value which aliases no memory with
+// the original.
+func (v LoginProfileView) AsStruct() *LoginProfile {
+	if v.ж == nil {
+		return nil
+	}
+	return v.ж.Clone()
+}
+
+func (v LoginProfileView) MarshalJSON() ([]byte, error) { return json.Marshal(v.ж) }
+
+func (v *LoginProfileView) UnmarshalJSON(b []byte) error {
+	if v.ж != nil {
+		return errors.New("already initialized")
+	}
+	if len(b) == 0 {
+		return nil
+	}
+	var x LoginProfile
+	if err := json.Unmarshal(b, &x); err != nil {
+		return err
+	}
+	v.ж = &x
+	return nil
+}
+
+func (v LoginProfileView) ID() ProfileID                    { return v.ж.ID }
+func (v LoginProfileView) Name() string                     { return v.ж.Name }
+func (v LoginProfileView) NetworkProfile() NetworkProfile   { return v.ж.NetworkProfile }
+func (v LoginProfileView) Key() StateKey                    { return v.ж.Key }
+func (v LoginProfileView) UserProfile() tailcfg.UserProfile { return v.ж.UserProfile }
+func (v LoginProfileView) NodeID() tailcfg.StableNodeID     { return v.ж.NodeID }
+func (v LoginProfileView) LocalUserID() WindowsUserID       { return v.ж.LocalUserID }
+func (v LoginProfileView) ControlURL() string               { return v.ж.ControlURL }
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _LoginProfileViewNeedsRegeneration = LoginProfile(struct {
+	ID             ProfileID
+	Name           string
+	NetworkProfile NetworkProfile
+	Key            StateKey
+	UserProfile    tailcfg.UserProfile
+	NodeID         tailcfg.StableNodeID
+	LocalUserID    WindowsUserID
+	ControlURL     string
+}{})
+
+// View returns a read-only view of Prefs.
 func (p *Prefs) View() PrefsView {
 	return PrefsView{ж: p}
 }
@@ -36,7 +102,7 @@ type PrefsView struct {
 	ж *Prefs
 }
 
-// Valid reports whether underlying value is non-nil.
+// Valid reports whether v's underlying value is non-nil.
 func (v PrefsView) Valid() bool { return v.ж != nil }
 
 // AsStruct returns a clone of the underlying value which aliases no memory with
@@ -138,7 +204,7 @@ var _PrefsViewNeedsRegeneration = Prefs(struct {
 	Persist                *persist.Persist
 }{})
 
-// View returns a readonly view of ServeConfig.
+// View returns a read-only view of ServeConfig.
 func (p *ServeConfig) View() ServeConfigView {
 	return ServeConfigView{ж: p}
 }
@@ -154,7 +220,7 @@ type ServeConfigView struct {
 	ж *ServeConfig
 }
 
-// Valid reports whether underlying value is non-nil.
+// Valid reports whether v's underlying value is non-nil.
 func (v ServeConfigView) Valid() bool { return v.ж != nil }
 
 // AsStruct returns a clone of the underlying value which aliases no memory with
@@ -195,7 +261,7 @@ func (v ServeConfigView) Web() views.MapFn[HostPort, *WebServerConfig, WebServer
 	})
 }
 
-func (v ServeConfigView) Services() views.MapFn[string, *ServiceConfig, ServiceConfigView] {
+func (v ServeConfigView) Services() views.MapFn[tailcfg.ServiceName, *ServiceConfig, ServiceConfigView] {
 	return views.MapFnOf(v.ж.Services, func(t *ServiceConfig) ServiceConfigView {
 		return t.View()
 	})
@@ -216,13 +282,13 @@ func (v ServeConfigView) ETag() string { return v.ж.ETag }
 var _ServeConfigViewNeedsRegeneration = ServeConfig(struct {
 	TCP         map[uint16]*TCPPortHandler
 	Web         map[HostPort]*WebServerConfig
-	Services    map[string]*ServiceConfig
+	Services    map[tailcfg.ServiceName]*ServiceConfig
 	AllowFunnel map[HostPort]bool
 	Foreground  map[string]*ServeConfig
 	ETag        string
 }{})
 
-// View returns a readonly view of ServiceConfig.
+// View returns a read-only view of ServiceConfig.
 func (p *ServiceConfig) View() ServiceConfigView {
 	return ServiceConfigView{ж: p}
 }
@@ -238,7 +304,7 @@ type ServiceConfigView struct {
 	ж *ServiceConfig
 }
 
-// Valid reports whether underlying value is non-nil.
+// Valid reports whether v's underlying value is non-nil.
 func (v ServiceConfigView) Valid() bool { return v.ж != nil }
 
 // AsStruct returns a clone of the underlying value which aliases no memory with
@@ -287,7 +353,7 @@ var _ServiceConfigViewNeedsRegeneration = ServiceConfig(struct {
 	Tun bool
 }{})
 
-// View returns a readonly view of TCPPortHandler.
+// View returns a read-only view of TCPPortHandler.
 func (p *TCPPortHandler) View() TCPPortHandlerView {
 	return TCPPortHandlerView{ж: p}
 }
@@ -303,7 +369,7 @@ type TCPPortHandlerView struct {
 	ж *TCPPortHandler
 }
 
-// Valid reports whether underlying value is non-nil.
+// Valid reports whether v's underlying value is non-nil.
 func (v TCPPortHandlerView) Valid() bool { return v.ж != nil }
 
 // AsStruct returns a clone of the underlying value which aliases no memory with
@@ -345,7 +411,7 @@ var _TCPPortHandlerViewNeedsRegeneration = TCPPortHandler(struct {
 	TerminateTLS string
 }{})
 
-// View returns a readonly view of HTTPHandler.
+// View returns a read-only view of HTTPHandler.
 func (p *HTTPHandler) View() HTTPHandlerView {
 	return HTTPHandlerView{ж: p}
 }
@@ -361,7 +427,7 @@ type HTTPHandlerView struct {
 	ж *HTTPHandler
 }
 
-// Valid reports whether underlying value is non-nil.
+// Valid reports whether v's underlying value is non-nil.
 func (v HTTPHandlerView) Valid() bool { return v.ж != nil }
 
 // AsStruct returns a clone of the underlying value which aliases no memory with
@@ -401,7 +467,7 @@ var _HTTPHandlerViewNeedsRegeneration = HTTPHandler(struct {
 	Text  string
 }{})
 
-// View returns a readonly view of WebServerConfig.
+// View returns a read-only view of WebServerConfig.
 func (p *WebServerConfig) View() WebServerConfigView {
 	return WebServerConfigView{ж: p}
 }
@@ -417,7 +483,7 @@ type WebServerConfigView struct {
 	ж *WebServerConfig
 }
 
-// Valid reports whether underlying value is non-nil.
+// Valid reports whether v's underlying value is non-nil.
 func (v WebServerConfigView) Valid() bool { return v.ж != nil }
 
 // AsStruct returns a clone of the underlying value which aliases no memory with

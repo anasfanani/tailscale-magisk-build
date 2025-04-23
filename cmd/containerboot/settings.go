@@ -64,16 +64,22 @@ type settings struct {
 	// when setting up rules to proxy cluster traffic to cluster ingress
 	// target.
 	// Deprecated: use PodIPv4, PodIPv6 instead to support dual stack clusters
-	PodIP               string
-	PodIPv4             string
-	PodIPv6             string
-	PodUID              string
-	HealthCheckAddrPort string
-	LocalAddrPort       string
-	MetricsEnabled      bool
-	HealthCheckEnabled  bool
-	DebugAddrPort       string
-	EgressSvcsCfgPath   string
+	PodIP                string
+	PodIPv4              string
+	PodIPv6              string
+	PodUID               string
+	HealthCheckAddrPort  string
+	LocalAddrPort        string
+	MetricsEnabled       bool
+	HealthCheckEnabled   bool
+	DebugAddrPort        string
+	EgressProxiesCfgPath string
+	// CertShareMode is set for Kubernetes Pods running cert share mode.
+	// Possible values are empty (containerboot doesn't run any certs
+	// logic),  'ro' (for Pods that shold never attempt to issue/renew
+	// certs) and 'rw' for Pods that should manage the TLS certs shared
+	// amongst the replicas.
+	CertShareMode string
 }
 
 func configFromEnv() (*settings, error) {
@@ -107,7 +113,7 @@ func configFromEnv() (*settings, error) {
 		MetricsEnabled:                        defaultBool("TS_ENABLE_METRICS", false),
 		HealthCheckEnabled:                    defaultBool("TS_ENABLE_HEALTH_CHECK", false),
 		DebugAddrPort:                         defaultEnv("TS_DEBUG_ADDR_PORT", ""),
-		EgressSvcsCfgPath:                     defaultEnv("TS_EGRESS_SERVICES_CONFIG_PATH", ""),
+		EgressProxiesCfgPath:                  defaultEnv("TS_EGRESS_PROXIES_CONFIG_PATH", ""),
 		PodUID:                                defaultEnv("POD_UID", ""),
 	}
 	podIPs, ok := os.LookupEnv("POD_IPS")
@@ -128,6 +134,17 @@ func configFromEnv() (*settings, error) {
 			cfg.PodIPv6 = parsed.String()
 		}
 	}
+	// If cert share is enabled, set the replica as read or write. Only 0th
+	// replica should be able to write.
+	isInCertShareMode := defaultBool("TS_EXPERIMENTAL_CERT_SHARE", false)
+	if isInCertShareMode {
+		cfg.CertShareMode = "ro"
+		podName := os.Getenv("POD_NAME")
+		if strings.HasSuffix(podName, "-0") {
+			cfg.CertShareMode = "rw"
+		}
+	}
+
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %v", err)
 	}
@@ -186,7 +203,7 @@ func (s *settings) validate() error {
 			return fmt.Errorf("error parsing TS_HEALTHCHECK_ADDR_PORT value %q: %w", s.HealthCheckAddrPort, err)
 		}
 	}
-	if s.localMetricsEnabled() || s.localHealthEnabled() {
+	if s.localMetricsEnabled() || s.localHealthEnabled() || s.EgressProxiesCfgPath != "" {
 		if _, err := netip.ParseAddrPort(s.LocalAddrPort); err != nil {
 			return fmt.Errorf("error parsing TS_LOCAL_ADDR_PORT value %q: %w", s.LocalAddrPort, err)
 		}
@@ -198,6 +215,9 @@ func (s *settings) validate() error {
 	}
 	if s.HealthCheckEnabled && s.HealthCheckAddrPort != "" {
 		return errors.New("TS_HEALTHCHECK_ADDR_PORT is deprecated and will be removed in 1.82.0, use TS_ENABLE_HEALTH_CHECK and optionally TS_LOCAL_ADDR_PORT")
+	}
+	if s.EgressProxiesCfgPath != "" && !(s.InKubernetes && s.KubeSecret != "") {
+		return errors.New("TS_EGRESS_PROXIES_CONFIG_PATH is only supported for Tailscale running on Kubernetes")
 	}
 	return nil
 }
@@ -214,6 +234,7 @@ func (cfg *settings) setupKube(ctx context.Context, kc *kubeClient) error {
 		return fmt.Errorf("some Kubernetes permissions are missing, please check your RBAC configuration: %v", err)
 	}
 	cfg.KubernetesCanPatch = canPatch
+	kc.canPatch = canPatch
 
 	s, err := kc.GetSecret(ctx, cfg.KubeSecret)
 	if err != nil {
@@ -287,7 +308,7 @@ func isOneStepConfig(cfg *settings) bool {
 // as an L3 proxy, proxying to an endpoint provided via one of the config env
 // vars.
 func isL3Proxy(cfg *settings) bool {
-	return cfg.ProxyTargetIP != "" || cfg.ProxyTargetDNSName != "" || cfg.TailnetTargetIP != "" || cfg.TailnetTargetFQDN != "" || cfg.AllowProxyingClusterTrafficViaIngress || cfg.EgressSvcsCfgPath != ""
+	return cfg.ProxyTargetIP != "" || cfg.ProxyTargetDNSName != "" || cfg.TailnetTargetIP != "" || cfg.TailnetTargetFQDN != "" || cfg.AllowProxyingClusterTrafficViaIngress || cfg.EgressProxiesCfgPath != ""
 }
 
 // hasKubeStateStore returns true if the state must be stored in a Kubernetes
@@ -302,6 +323,10 @@ func (cfg *settings) localMetricsEnabled() bool {
 
 func (cfg *settings) localHealthEnabled() bool {
 	return cfg.LocalAddrPort != "" && cfg.HealthCheckEnabled
+}
+
+func (cfg *settings) egressSvcsTerminateEPEnabled() bool {
+	return cfg.LocalAddrPort != "" && cfg.EgressProxiesCfgPath != ""
 }
 
 // defaultEnv returns the value of the given envvar name, or defVal if

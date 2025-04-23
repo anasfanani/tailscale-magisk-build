@@ -44,6 +44,7 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
+	"tailscale.com/ipn/desktop"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dns"
@@ -55,6 +56,7 @@ import (
 	"tailscale.com/util/osdiag"
 	"tailscale.com/util/syspolicy"
 	"tailscale.com/util/winutil"
+	"tailscale.com/util/winutil/gp"
 	"tailscale.com/version"
 	"tailscale.com/wf"
 )
@@ -67,6 +69,22 @@ func init() {
 	}
 	if err := com.StartRuntime(comProcessType); err != nil {
 		log.Printf("wingoes.com.StartRuntime(%d) failed: %v", comProcessType, err)
+	}
+}
+
+// permitPolicyLocks is a function to be called to lift the restriction on acquiring
+// [gp.PolicyLock]s once the service is running.
+// It is safe to be called multiple times.
+var permitPolicyLocks = func() {}
+
+func init() {
+	if isWindowsService() {
+		// We prevent [gp.PolicyLock]s from being acquired until the service enters the running state.
+		// Otherwise, if tailscaled starts due to a GPSI policy installing Tailscale, it may deadlock
+		// while waiting for the write counterpart of the GP lock to be released by Group Policy,
+		// which is itself waiting for the installation to complete and tailscaled to start.
+		// See tailscale/tailscale#14416 for more information.
+		permitPolicyLocks = gp.RestrictPolicyLocks()
 	}
 }
 
@@ -109,13 +127,13 @@ func tstunNewWithWindowsRetries(logf logger.Logf, tunName string) (_ tun.Device,
 	}
 }
 
-func isWindowsService() bool {
+var isWindowsService = sync.OnceValue(func() bool {
 	v, err := svc.IsWindowsService()
 	if err != nil {
 		log.Fatalf("svc.IsWindowsService failed: %v", err)
 	}
 	return v
-}
+})
 
 // syslogf is a logger function that writes to the Windows event log (ie, the
 // one that you see in the Windows Event Viewer). tailscaled may optionally
@@ -179,6 +197,10 @@ func (service *ipnService) Execute(args []string, r <-chan svc.ChangeRequest, ch
 
 	changes <- svc.Status{State: svc.Running, Accepts: svcAccepts}
 	syslogf("Service running")
+
+	// It is safe to allow GP locks to be acquired now that the service
+	// is running.
+	permitPolicyLocks()
 
 	for {
 		select {
@@ -313,6 +335,13 @@ func beWindowsSubprocess() bool {
 	sys.Set(netMon)
 
 	sys.Set(driveimpl.NewFileSystemForRemote(log.Printf))
+
+	if sessionManager, err := desktop.NewSessionManager(log.Printf); err == nil {
+		sys.Set(sessionManager)
+	} else {
+		// Errors creating the session manager are unexpected, but not fatal.
+		log.Printf("[unexpected]: error creating a desktop session manager: %v", err)
+	}
 
 	publicLogID, _ := logid.ParsePublicID(logID)
 	err = startIPNServer(ctx, log.Printf, publicLogID, sys)

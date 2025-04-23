@@ -8,16 +8,17 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	xmaps "golang.org/x/exp/maps"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/appc/appctest"
 	"tailscale.com/tstest"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
+	"tailscale.com/util/slicesx"
 )
 
 func fakeStoreRoutes(*RouteInfo) error { return nil }
@@ -50,7 +51,7 @@ func TestUpdateDomains(t *testing.T) {
 		// domains are explicitly downcased on set.
 		a.UpdateDomains([]string{"UP.EXAMPLE.COM"})
 		a.Wait(ctx)
-		if got, want := xmaps.Keys(a.domains), []string{"up.example.com"}; !slices.Equal(got, want) {
+		if got, want := slicesx.MapKeys(a.domains), []string{"up.example.com"}; !slices.Equal(got, want) {
 			t.Errorf("got %v; want %v", got, want)
 		}
 	}
@@ -69,7 +70,9 @@ func TestUpdateRoutes(t *testing.T) {
 		a.updateDomains([]string{"*.example.com"})
 
 		// This route should be collapsed into the range
-		a.ObserveDNSResponse(dnsResponse("a.example.com.", "192.0.2.1"))
+		if err := a.ObserveDNSResponse(dnsResponse("a.example.com.", "192.0.2.1")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		a.Wait(ctx)
 
 		if !slices.Equal(rc.Routes(), []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")}) {
@@ -77,11 +80,14 @@ func TestUpdateRoutes(t *testing.T) {
 		}
 
 		// This route should not be collapsed or removed
-		a.ObserveDNSResponse(dnsResponse("b.example.com.", "192.0.0.1"))
+		if err := a.ObserveDNSResponse(dnsResponse("b.example.com.", "192.0.0.1")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		a.Wait(ctx)
 
 		routes := []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24"), netip.MustParsePrefix("192.0.0.1/32")}
 		a.updateRoutes(routes)
+		a.Wait(ctx)
 
 		slices.SortFunc(rc.Routes(), prefixCompare)
 		rc.SetRoutes(slices.Compact(rc.Routes()))
@@ -101,6 +107,7 @@ func TestUpdateRoutes(t *testing.T) {
 }
 
 func TestUpdateRoutesUnadvertisesContainedRoutes(t *testing.T) {
+	ctx := context.Background()
 	for _, shouldStore := range []bool{false, true} {
 		rc := &appctest.RouteCollector{}
 		var a *AppConnector
@@ -113,6 +120,7 @@ func TestUpdateRoutesUnadvertisesContainedRoutes(t *testing.T) {
 		rc.SetRoutes([]netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")})
 		routes := []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
 		a.updateRoutes(routes)
+		a.Wait(ctx)
 
 		if !slices.EqualFunc(routes, rc.Routes(), prefixEqual) {
 			t.Fatalf("got %v, want %v", rc.Routes(), routes)
@@ -130,7 +138,9 @@ func TestDomainRoutes(t *testing.T) {
 			a = NewAppConnector(t.Logf, rc, nil, nil)
 		}
 		a.updateDomains([]string{"example.com"})
-		a.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
+		if err := a.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		a.Wait(context.Background())
 
 		want := map[string][]netip.Addr{
@@ -155,7 +165,9 @@ func TestObserveDNSResponse(t *testing.T) {
 		}
 
 		// a has no domains configured, so it should not advertise any routes
-		a.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
+		if err := a.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		if got, want := rc.Routes(), ([]netip.Prefix)(nil); !slices.Equal(got, want) {
 			t.Errorf("got %v; want %v", got, want)
 		}
@@ -163,7 +175,9 @@ func TestObserveDNSResponse(t *testing.T) {
 		wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
 
 		a.updateDomains([]string{"example.com"})
-		a.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
+		if err := a.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		a.Wait(ctx)
 		if got, want := rc.Routes(), wantRoutes; !slices.Equal(got, want) {
 			t.Errorf("got %v; want %v", got, want)
@@ -172,7 +186,9 @@ func TestObserveDNSResponse(t *testing.T) {
 		// a CNAME record chain should result in a route being added if the chain
 		// matches a routed domain.
 		a.updateDomains([]string{"www.example.com", "example.com"})
-		a.ObserveDNSResponse(dnsCNAMEResponse("192.0.0.9", "www.example.com.", "chain.example.com.", "example.com."))
+		if err := a.ObserveDNSResponse(dnsCNAMEResponse("192.0.0.9", "www.example.com.", "chain.example.com.", "example.com.")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		a.Wait(ctx)
 		wantRoutes = append(wantRoutes, netip.MustParsePrefix("192.0.0.9/32"))
 		if got, want := rc.Routes(), wantRoutes; !slices.Equal(got, want) {
@@ -181,7 +197,9 @@ func TestObserveDNSResponse(t *testing.T) {
 
 		// a CNAME record chain should result in a route being added if the chain
 		// even if only found in the middle of the chain
-		a.ObserveDNSResponse(dnsCNAMEResponse("192.0.0.10", "outside.example.org.", "www.example.com.", "example.org."))
+		if err := a.ObserveDNSResponse(dnsCNAMEResponse("192.0.0.10", "outside.example.org.", "www.example.com.", "example.org.")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		a.Wait(ctx)
 		wantRoutes = append(wantRoutes, netip.MustParsePrefix("192.0.0.10/32"))
 		if got, want := rc.Routes(), wantRoutes; !slices.Equal(got, want) {
@@ -190,14 +208,18 @@ func TestObserveDNSResponse(t *testing.T) {
 
 		wantRoutes = append(wantRoutes, netip.MustParsePrefix("2001:db8::1/128"))
 
-		a.ObserveDNSResponse(dnsResponse("example.com.", "2001:db8::1"))
+		if err := a.ObserveDNSResponse(dnsResponse("example.com.", "2001:db8::1")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		a.Wait(ctx)
 		if got, want := rc.Routes(), wantRoutes; !slices.Equal(got, want) {
 			t.Errorf("got %v; want %v", got, want)
 		}
 
 		// don't re-advertise routes that have already been advertised
-		a.ObserveDNSResponse(dnsResponse("example.com.", "2001:db8::1"))
+		if err := a.ObserveDNSResponse(dnsResponse("example.com.", "2001:db8::1")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		a.Wait(ctx)
 		if !slices.Equal(rc.Routes(), wantRoutes) {
 			t.Errorf("rc.Routes(): got %v; want %v", rc.Routes(), wantRoutes)
@@ -207,7 +229,9 @@ func TestObserveDNSResponse(t *testing.T) {
 		pfx := netip.MustParsePrefix("192.0.2.0/24")
 		a.updateRoutes([]netip.Prefix{pfx})
 		wantRoutes = append(wantRoutes, pfx)
-		a.ObserveDNSResponse(dnsResponse("example.com.", "192.0.2.1"))
+		if err := a.ObserveDNSResponse(dnsResponse("example.com.", "192.0.2.1")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		a.Wait(ctx)
 		if !slices.Equal(rc.Routes(), wantRoutes) {
 			t.Errorf("rc.Routes(): got %v; want %v", rc.Routes(), wantRoutes)
@@ -230,7 +254,9 @@ func TestWildcardDomains(t *testing.T) {
 		}
 
 		a.updateDomains([]string{"*.example.com"})
-		a.ObserveDNSResponse(dnsResponse("foo.example.com.", "192.0.0.8"))
+		if err := a.ObserveDNSResponse(dnsResponse("foo.example.com.", "192.0.0.8")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
 		a.Wait(ctx)
 		if got, want := rc.Routes(), []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}; !slices.Equal(got, want) {
 			t.Errorf("routes: got %v; want %v", got, want)
@@ -438,10 +464,16 @@ func TestUpdateDomainRouteRemoval(t *testing.T) {
 		// adding domains doesn't immediately cause any routes to be advertised
 		assertRoutes("update domains", []netip.Prefix{}, []netip.Prefix{})
 
-		a.ObserveDNSResponse(dnsResponse("a.example.com.", "1.2.3.1"))
-		a.ObserveDNSResponse(dnsResponse("a.example.com.", "1.2.3.2"))
-		a.ObserveDNSResponse(dnsResponse("b.example.com.", "1.2.3.3"))
-		a.ObserveDNSResponse(dnsResponse("b.example.com.", "1.2.3.4"))
+		for _, res := range [][]byte{
+			dnsResponse("a.example.com.", "1.2.3.1"),
+			dnsResponse("a.example.com.", "1.2.3.2"),
+			dnsResponse("b.example.com.", "1.2.3.3"),
+			dnsResponse("b.example.com.", "1.2.3.4"),
+		} {
+			if err := a.ObserveDNSResponse(res); err != nil {
+				t.Errorf("ObserveDNSResponse: %v", err)
+			}
+		}
 		a.Wait(ctx)
 		// observing dns responses causes routes to be advertised
 		assertRoutes("observed dns", prefixes("1.2.3.1/32", "1.2.3.2/32", "1.2.3.3/32", "1.2.3.4/32"), []netip.Prefix{})
@@ -487,10 +519,16 @@ func TestUpdateWildcardRouteRemoval(t *testing.T) {
 		// adding domains doesn't immediately cause any routes to be advertised
 		assertRoutes("update domains", []netip.Prefix{}, []netip.Prefix{})
 
-		a.ObserveDNSResponse(dnsResponse("a.example.com.", "1.2.3.1"))
-		a.ObserveDNSResponse(dnsResponse("a.example.com.", "1.2.3.2"))
-		a.ObserveDNSResponse(dnsResponse("1.b.example.com.", "1.2.3.3"))
-		a.ObserveDNSResponse(dnsResponse("2.b.example.com.", "1.2.3.4"))
+		for _, res := range [][]byte{
+			dnsResponse("a.example.com.", "1.2.3.1"),
+			dnsResponse("a.example.com.", "1.2.3.2"),
+			dnsResponse("1.b.example.com.", "1.2.3.3"),
+			dnsResponse("2.b.example.com.", "1.2.3.4"),
+		} {
+			if err := a.ObserveDNSResponse(res); err != nil {
+				t.Errorf("ObserveDNSResponse: %v", err)
+			}
+		}
 		a.Wait(ctx)
 		// observing dns responses causes routes to be advertised
 		assertRoutes("observed dns", prefixes("1.2.3.1/32", "1.2.3.2/32", "1.2.3.3/32", "1.2.3.4/32"), []netip.Prefix{})
@@ -600,5 +638,59 @@ func TestMetricBucketsAreSorted(t *testing.T) {
 	}
 	if !slices.IsSorted(metricStoreRoutesNBuckets) {
 		t.Errorf("metricStoreRoutesNBuckets must be in order")
+	}
+}
+
+// TestUpdateRoutesDeadlock is a regression test for a deadlock in
+// LocalBackend<->AppConnector interaction. When using real LocalBackend as the
+// routeAdvertiser, calls to Advertise/UnadvertiseRoutes can end up calling
+// back into AppConnector via authReconfig. If everything is called
+// synchronously, this results in a deadlock on AppConnector.mu.
+func TestUpdateRoutesDeadlock(t *testing.T) {
+	ctx := context.Background()
+	rc := &appctest.RouteCollector{}
+	a := NewAppConnector(t.Logf, rc, &RouteInfo{}, fakeStoreRoutes)
+
+	advertiseCalled := new(atomic.Bool)
+	unadvertiseCalled := new(atomic.Bool)
+	rc.AdvertiseCallback = func() {
+		// Call something that requires a.mu to be held.
+		a.DomainRoutes()
+		advertiseCalled.Store(true)
+	}
+	rc.UnadvertiseCallback = func() {
+		// Call something that requires a.mu to be held.
+		a.DomainRoutes()
+		unadvertiseCalled.Store(true)
+	}
+
+	a.updateDomains([]string{"example.com"})
+	a.Wait(ctx)
+
+	// Trigger rc.AdveriseRoute.
+	a.updateRoutes(
+		[]netip.Prefix{
+			netip.MustParsePrefix("127.0.0.1/32"),
+			netip.MustParsePrefix("127.0.0.2/32"),
+		},
+	)
+	a.Wait(ctx)
+	// Trigger rc.UnadveriseRoute.
+	a.updateRoutes(
+		[]netip.Prefix{
+			netip.MustParsePrefix("127.0.0.1/32"),
+		},
+	)
+	a.Wait(ctx)
+
+	if !advertiseCalled.Load() {
+		t.Error("AdvertiseRoute was not called")
+	}
+	if !unadvertiseCalled.Load() {
+		t.Error("UnadvertiseRoute was not called")
+	}
+
+	if want := []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}; !slices.Equal(slices.Compact(rc.Routes()), want) {
+		t.Fatalf("got %v, want %v", rc.Routes(), want)
 	}
 }

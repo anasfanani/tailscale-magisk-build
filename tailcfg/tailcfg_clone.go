@@ -26,17 +26,14 @@ func (src *User) Clone() *User {
 	}
 	dst := new(User)
 	*dst = *src
-	dst.Logins = append(src.Logins[:0:0], src.Logins...)
 	return dst
 }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _UserCloneNeedsRegeneration = User(struct {
 	ID            UserID
-	LoginName     string
 	DisplayName   string
 	ProfilePicURL string
-	Logins        []LoginID
 	Created       time.Time
 }{})
 
@@ -102,7 +99,8 @@ var _NodeCloneNeedsRegeneration = Node(struct {
 	Addresses                     []netip.Prefix
 	AllowedIPs                    []netip.Prefix
 	Endpoints                     []netip.AddrPort
-	DERP                          string
+	LegacyDERPString              string
+	HomeDERP                      int
 	Hostinfo                      HostinfoView
 	Created                       time.Time
 	Cap                           CapabilityVersion
@@ -168,6 +166,7 @@ var _HostinfoCloneNeedsRegeneration = Hostinfo(struct {
 	ShareeNode      bool
 	NoLogsNoSupport bool
 	WireIngress     bool
+	IngressEnabled  bool
 	AllowsUpdate    bool
 	Machine         string
 	GoArch          string
@@ -302,7 +301,6 @@ func (src *RegisterResponse) Clone() *RegisterResponse {
 	}
 	dst := new(RegisterResponse)
 	*dst = *src
-	dst.User = *src.User.Clone()
 	dst.NodeKeySignature = append(src.NodeKeySignature[:0:0], src.NodeKeySignature...)
 	return dst
 }
@@ -418,13 +416,14 @@ func (src *DERPRegion) Clone() *DERPRegion {
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _DERPRegionCloneNeedsRegeneration = DERPRegion(struct {
-	RegionID   int
-	RegionCode string
-	RegionName string
-	Latitude   float64
-	Longitude  float64
-	Avoid      bool
-	Nodes      []*DERPNode
+	RegionID        int
+	RegionCode      string
+	RegionName      string
+	Latitude        float64
+	Longitude       float64
+	Avoid           bool
+	NoMeasureNoHome bool
+	Nodes           []*DERPNode
 }{})
 
 // Clone makes a deep copy of DERPMap.
@@ -556,17 +555,17 @@ func (src *SSHPrincipal) Clone() *SSHPrincipal {
 	}
 	dst := new(SSHPrincipal)
 	*dst = *src
-	dst.PubKeys = append(src.PubKeys[:0:0], src.PubKeys...)
+	dst.UnusedPubKeys = append(src.UnusedPubKeys[:0:0], src.UnusedPubKeys...)
 	return dst
 }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _SSHPrincipalCloneNeedsRegeneration = SSHPrincipal(struct {
-	Node      StableNodeID
-	NodeIP    string
-	UserLogin string
-	Any       bool
-	PubKeys   []string
+	Node          StableNodeID
+	NodeIP        string
+	UserLogin     string
+	Any           bool
+	UnusedPubKeys []string
 }{})
 
 // Clone makes a deep copy of ControlDialPlan.
@@ -625,7 +624,6 @@ var _UserProfileCloneNeedsRegeneration = UserProfile(struct {
 	LoginName     string
 	DisplayName   string
 	ProfilePicURL string
-	Roles         emptyStructJSONSlice
 }{})
 
 // Clone duplicates src into dst and reports whether it succeeded.

@@ -81,11 +81,11 @@ func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, 
 
 	// Logging buffers
 	skippedUnselected := new(bytes.Buffer)
-	skippedIPs := new(bytes.Buffer)
 	skippedSubnets := new(bytes.Buffer)
+	skippedExpired := new(bytes.Buffer)
 
 	for _, peer := range nm.Peers {
-		if peer.DiscoKey().IsZero() && peer.DERP() == "" && !peer.IsWireGuardOnly() {
+		if peer.DiscoKey().IsZero() && peer.HomeDERP() == 0 && !peer.IsWireGuardOnly() {
 			// Peer predates both DERP and active discovery, we cannot
 			// communicate with it.
 			logf("[v1] wgcfg: skipped peer %s, doesn't offer DERP or disco", peer.Key().ShortString())
@@ -95,7 +95,16 @@ func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, 
 		// anyway, since control intentionally breaks node keys for
 		// expired peers so that we can't discover endpoints via DERP.
 		if peer.Expired() {
-			logf("[v1] wgcfg: skipped expired peer %s", peer.Key().ShortString())
+			if skippedExpired.Len() >= 1<<10 {
+				if !bytes.HasSuffix(skippedExpired.Bytes(), []byte("...")) {
+					skippedExpired.WriteString("...")
+				}
+			} else {
+				if skippedExpired.Len() > 0 {
+					skippedExpired.WriteString(", ")
+				}
+				fmt.Fprintf(skippedExpired, "%s/%v", peer.StableID(), peer.Key().ShortString())
+			}
 			continue
 		}
 
@@ -106,8 +115,8 @@ func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, 
 		cpeer := &cfg.Peers[len(cfg.Peers)-1]
 
 		didExitNodeWarn := false
-		cpeer.V4MasqAddr = peer.SelfNodeV4MasqAddrForThisPeer()
-		cpeer.V6MasqAddr = peer.SelfNodeV6MasqAddrForThisPeer()
+		cpeer.V4MasqAddr = peer.SelfNodeV4MasqAddrForThisPeer().Clone()
+		cpeer.V6MasqAddr = peer.SelfNodeV6MasqAddrForThisPeer().Clone()
 		cpeer.IsJailed = peer.IsJailed()
 		for _, allowedIP := range peer.AllowedIPs().All() {
 			if allowedIP.Bits() == 0 && peer.StableID() != exitNode {
@@ -137,12 +146,11 @@ func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, 
 	if skippedUnselected.Len() > 0 {
 		logf("[v1] wgcfg: skipped unselected default routes from: %s", skippedUnselected.Bytes())
 	}
-	if skippedIPs.Len() > 0 {
-		logf("[v1] wgcfg: skipped node IPs: %s", skippedIPs)
-	}
 	if skippedSubnets.Len() > 0 {
 		logf("[v1] wgcfg: did not accept subnet routes: %s", skippedSubnets)
 	}
-
+	if skippedExpired.Len() > 0 {
+		logf("[v1] wgcfg: skipped expired peer: %s", skippedExpired)
+	}
 	return cfg, nil
 }

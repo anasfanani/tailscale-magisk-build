@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -27,9 +28,12 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
 )
@@ -61,7 +65,10 @@ type configOpts struct {
 	app                                            string
 	shouldRemoveAuthKey                            bool
 	secretExtraData                                map[string][]byte
-	enableMetrics                                  bool
+	resourceVersion                                string
+
+	enableMetrics        bool
+	serviceMonitorLabels tsapi.Labels
 }
 
 func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.StatefulSet {
@@ -92,7 +99,7 @@ func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.Statef
 			Value: "true",
 		})
 	}
-	annots := make(map[string]string)
+	var annots map[string]string
 	var volumes []corev1.Volume
 	volumes = []corev1.Volume{
 		{
@@ -110,7 +117,7 @@ func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.Statef
 		MountPath: "/etc/tsconfig",
 	}}
 	if opts.confFileHash != "" {
-		annots["tailscale.com/operator-last-set-config-file-hash"] = opts.confFileHash
+		mak.Set(&annots, "tailscale.com/operator-last-set-config-file-hash", opts.confFileHash)
 	}
 	if opts.firewallMode != "" {
 		tsContainer.Env = append(tsContainer.Env, corev1.EnvVar{
@@ -119,13 +126,13 @@ func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.Statef
 		})
 	}
 	if opts.tailnetTargetIP != "" {
-		annots["tailscale.com/operator-last-set-ts-tailnet-target-ip"] = opts.tailnetTargetIP
+		mak.Set(&annots, "tailscale.com/operator-last-set-ts-tailnet-target-ip", opts.tailnetTargetIP)
 		tsContainer.Env = append(tsContainer.Env, corev1.EnvVar{
 			Name:  "TS_TAILNET_TARGET_IP",
 			Value: opts.tailnetTargetIP,
 		})
 	} else if opts.tailnetTargetFQDN != "" {
-		annots["tailscale.com/operator-last-set-ts-tailnet-target-fqdn"] = opts.tailnetTargetFQDN
+		mak.Set(&annots, "tailscale.com/operator-last-set-ts-tailnet-target-fqdn", opts.tailnetTargetFQDN)
 		tsContainer.Env = append(tsContainer.Env, corev1.EnvVar{
 			Name:  "TS_TAILNET_TARGET_FQDN",
 			Value: opts.tailnetTargetFQDN,
@@ -136,13 +143,13 @@ func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.Statef
 			Name:  "TS_DEST_IP",
 			Value: opts.clusterTargetIP,
 		})
-		annots["tailscale.com/operator-last-set-cluster-ip"] = opts.clusterTargetIP
+		mak.Set(&annots, "tailscale.com/operator-last-set-cluster-ip", opts.clusterTargetIP)
 	} else if opts.clusterTargetDNS != "" {
 		tsContainer.Env = append(tsContainer.Env, corev1.EnvVar{
 			Name:  "TS_EXPERIMENTAL_DEST_DNS_NAME",
 			Value: opts.clusterTargetDNS,
 		})
-		annots["tailscale.com/operator-last-set-cluster-dns-name"] = opts.clusterTargetDNS
+		mak.Set(&annots, "tailscale.com/operator-last-set-cluster-dns-name", opts.clusterTargetDNS)
 	}
 	if opts.serveConfig != nil {
 		tsContainer.Env = append(tsContainer.Env, corev1.EnvVar{
@@ -431,14 +438,17 @@ func metricsLabels(opts configOpts) map[string]string {
 
 func expectedServiceMonitor(t *testing.T, opts configOpts) *unstructured.Unstructured {
 	t.Helper()
-	labels := metricsLabels(opts)
+	smLabels := metricsLabels(opts)
+	if len(opts.serviceMonitorLabels) != 0 {
+		smLabels = mergeMapKeys(smLabels, opts.serviceMonitorLabels.Parse())
+	}
 	name := metricsResourceName(opts.stsName)
 	sm := &ServiceMonitor{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
 			Namespace:       opts.tailscaleNamespace,
-			Labels:          labels,
-			ResourceVersion: "1",
+			Labels:          smLabels,
+			ResourceVersion: opts.resourceVersion,
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Service", Name: name, BlockOwnerDeletion: ptr.To(true), Controller: ptr.To(true)}},
 		},
 		TypeMeta: metav1.TypeMeta{
@@ -446,7 +456,7 @@ func expectedServiceMonitor(t *testing.T, opts configOpts) *unstructured.Unstruc
 			APIVersion: "monitoring.coreos.com/v1",
 		},
 		Spec: ServiceMonitorSpec{
-			Selector: metav1.LabelSelector{MatchLabels: labels},
+			Selector: metav1.LabelSelector{MatchLabels: metricsLabels(opts)},
 			Endpoints: []ServiceMonitorEndpoint{{
 				Port: "metrics",
 			}},
@@ -554,10 +564,10 @@ func expectedSecret(t *testing.T, cl client.Client, opts configOpts) *corev1.Sec
 func findGenName(t *testing.T, client client.Client, ns, name, typ string) (full, noSuffix string) {
 	t.Helper()
 	labels := map[string]string{
-		LabelManaged:         "true",
-		LabelParentName:      name,
-		LabelParentNamespace: ns,
-		LabelParentType:      typ,
+		kubetypes.LabelManaged: "true",
+		LabelParentName:        name,
+		LabelParentNamespace:   ns,
+		LabelParentType:        typ,
 	}
 	s, err := getSingleObject[corev1.Secret](context.Background(), client, "operator-ns", labels)
 	if err != nil {
@@ -573,6 +583,21 @@ func mustCreate(t *testing.T, client client.Client, obj client.Object) {
 	t.Helper()
 	if err := client.Create(context.Background(), obj); err != nil {
 		t.Fatalf("creating %q: %v", obj.GetName(), err)
+	}
+}
+func mustCreateAll(t *testing.T, client client.Client, objs ...client.Object) {
+	t.Helper()
+	for _, obj := range objs {
+		mustCreate(t, client, obj)
+	}
+}
+
+func mustDeleteAll(t *testing.T, client client.Client, objs ...client.Object) {
+	t.Helper()
+	for _, obj := range objs {
+		if err := client.Delete(context.Background(), obj); err != nil {
+			t.Fatalf("deleting %q: %v", obj.GetName(), err)
+		}
 	}
 }
 
@@ -612,7 +637,7 @@ func mustUpdateStatus[T any, O ptrObject[T]](t *testing.T, client client.Client,
 // modify func to ensure that they are removed from the cluster object and the
 // object passed as 'want'. If no such modifications are needed, you can pass
 // nil in place of the modify function.
-func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want O, modifier func(O)) {
+func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want O, modifiers ...func(O)) {
 	t.Helper()
 	got := O(new(T))
 	if err := client.Get(context.Background(), types.NamespacedName{
@@ -626,7 +651,7 @@ func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want
 	// so just remove it from both got and want.
 	got.SetResourceVersion("")
 	want.SetResourceVersion("")
-	if modifier != nil {
+	for _, modifier := range modifiers {
 		modifier(want)
 		modifier(got)
 	}
@@ -653,10 +678,11 @@ func expectEqualUnstructured(t *testing.T, client client.Client, want *unstructu
 func expectMissing[T any, O ptrObject[T]](t *testing.T, client client.Client, ns, name string) {
 	t.Helper()
 	obj := O(new(T))
-	if err := client.Get(context.Background(), types.NamespacedName{
+	err := client.Get(context.Background(), types.NamespacedName{
 		Name:      name,
 		Namespace: ns,
-	}, obj); !apierrors.IsNotFound(err) {
+	}, obj)
+	if !apierrors.IsNotFound(err) {
 		t.Fatalf("%s %s/%s unexpectedly present, wanted missing", reflect.TypeOf(obj).Elem().Name(), ns, name)
 	}
 }
@@ -697,6 +723,19 @@ func expectRequeue(t *testing.T, sr reconcile.Reconciler, ns, name string) {
 		t.Fatalf("expected timed requeue, got success")
 	}
 }
+func expectError(t *testing.T, sr reconcile.Reconciler, ns, name string) {
+	t.Helper()
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      name,
+			Namespace: ns,
+		},
+	}
+	_, err := sr.Reconcile(context.Background(), req)
+	if err == nil {
+		t.Error("Reconcile: expected error but did not get one")
+	}
+}
 
 // expectEvents accepts a test recorder and a list of events, tests that expected
 // events are sent down the recorder's channel. Waits for 5s for each event.
@@ -730,6 +769,7 @@ type fakeTSClient struct {
 	sync.Mutex
 	keyRequests []tailscale.KeyCapabilities
 	deleted     []string
+	vipServices map[tailcfg.ServiceName]*tailscale.VIPService
 }
 type fakeTSNetServer struct {
 	certDomains []string
@@ -787,6 +827,15 @@ func (c *fakeTSClient) Deleted() []string {
 // change to the configfile contents).
 func removeHashAnnotation(sts *appsv1.StatefulSet) {
 	delete(sts.Spec.Template.Annotations, podAnnotationLastSetConfigFileHash)
+	if len(sts.Spec.Template.Annotations) == 0 {
+		sts.Spec.Template.Annotations = nil
+	}
+}
+
+func removeResourceReqs(sts *appsv1.StatefulSet) {
+	if sts != nil {
+		sts.Spec.Template.Spec.Resources = nil
+	}
 }
 
 func removeTargetPortsFromSvc(svc *corev1.Service) {
@@ -825,4 +874,51 @@ func removeAuthKeyIfExistsModifier(t *testing.T) func(s *corev1.Secret) {
 			mak.Set(&secret.StringData, "cap-107.hujson", string(b))
 		}
 	}
+}
+
+func (c *fakeTSClient) GetVIPService(ctx context.Context, name tailcfg.ServiceName) (*tailscale.VIPService, error) {
+	c.Lock()
+	defer c.Unlock()
+	if c.vipServices == nil {
+		return nil, &tailscale.ErrResponse{Status: http.StatusNotFound}
+	}
+	svc, ok := c.vipServices[name]
+	if !ok {
+		return nil, &tailscale.ErrResponse{Status: http.StatusNotFound}
+	}
+	return svc, nil
+}
+
+func (c *fakeTSClient) CreateOrUpdateVIPService(ctx context.Context, svc *tailscale.VIPService) error {
+	c.Lock()
+	defer c.Unlock()
+	if c.vipServices == nil {
+		c.vipServices = make(map[tailcfg.ServiceName]*tailscale.VIPService)
+	}
+	c.vipServices[svc.Name] = svc
+	return nil
+}
+
+func (c *fakeTSClient) DeleteVIPService(ctx context.Context, name tailcfg.ServiceName) error {
+	c.Lock()
+	defer c.Unlock()
+	if c.vipServices != nil {
+		delete(c.vipServices, name)
+	}
+	return nil
+}
+
+type fakeLocalClient struct {
+	status *ipnstate.Status
+}
+
+func (f *fakeLocalClient) StatusWithoutPeers(ctx context.Context) (*ipnstate.Status, error) {
+	if f.status == nil {
+		return &ipnstate.Status{
+			Self: &ipnstate.PeerStatus{
+				DNSName: "test-node.test.ts.net.",
+			},
+		}, nil
+	}
+	return f.status, nil
 }

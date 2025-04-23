@@ -58,11 +58,12 @@ func (m *darwinRouteMon) Receive() (message, error) {
 		}
 		msgs, err := func() (msgs []route.Message, err error) {
 			defer func() {
-				// TODO(raggi,#14201): remove once we've got a fix from
-				// golang/go#70528.
+				// #14201: permanent panic protection, as we have been burned by
+				// ParseRIB panics too many times.
 				msg := recover()
 				if msg != nil {
 					msgs = nil
+					m.logf("[unexpected] netmon: panic in route.ParseRIB from % 02x", m.buf[:n])
 					err = fmt.Errorf("panic in route.ParseRIB: %s", msg)
 				}
 			}()

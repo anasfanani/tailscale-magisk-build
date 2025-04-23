@@ -15,8 +15,9 @@ const (
 	AppProxyGroupIngress = "k8s-operator-proxygroup-ingress"
 
 	// Clientmetrics for Tailscale Kubernetes Operator components
-	MetricIngressProxyCount              = "k8s_ingress_proxies"   // L3
-	MetricIngressResourceCount           = "k8s_ingress_resources" // L7
+	MetricIngressProxyCount              = "k8s_ingress_proxies"      // L3
+	MetricIngressResourceCount           = "k8s_ingress_resources"    // L7
+	MetricIngressPGResourceCount         = "k8s_ingress_pg_resources" // L7 on ProxyGroup
 	MetricEgressProxyCount               = "k8s_egress_proxies"
 	MetricConnectorResourceCount         = "k8s_connector_resources"
 	MetricConnectorWithSubnetRouterCount = "k8s_connector_subnetrouter_resources"
@@ -42,4 +43,12 @@ const (
 	// that cluster workloads behind the Ingress can now be accessed via the given DNS name over HTTPS.
 	KeyHTTPSEndpoint string = "https_endpoint"
 	ValueNoHTTPS     string = "no-https"
+
+	// Pod's IPv4 address header key as returned by containerboot health check endpoint.
+	PodIPv4Header string = "Pod-IPv4"
+
+	EgessServicesPreshutdownEP = "/internal-egress-services-preshutdown"
+
+	LabelManaged    = "tailscale.com/managed"
+	LabelSecretType = "tailscale.com/secret-type" // "config", "state" "certs"
 )

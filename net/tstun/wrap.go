@@ -36,7 +36,6 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/usermetric"
-	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/netstack/gro"
 	"tailscale.com/wgengine/wgcfg"
@@ -53,7 +52,8 @@ const PacketStartOffset = device.MessageTransportHeaderSize
 // of a packet that can be injected into a tstun.Wrapper.
 const MaxPacketSize = device.MaxContentSize
 
-const tapDebug = false // for super verbose TAP debugging
+// TAPDebug is whether super verbose TAP debugging is enabled.
+const TAPDebug = false
 
 var (
 	// ErrClosed is returned when attempting an operation on a closed Wrapper.
@@ -207,7 +207,7 @@ type Wrapper struct {
 	// stats maintains per-connection counters.
 	stats atomic.Pointer[connstats.Statistics]
 
-	captureHook syncs.AtomicValue[capture.Callback]
+	captureHook syncs.AtomicValue[packet.CaptureCallback]
 
 	metrics *metrics
 }
@@ -459,7 +459,7 @@ func (t *Wrapper) pollVector() {
 				return
 			}
 			n, err = reader(t.vectorBuffer[:], sizes, readOffset)
-			if t.isTAP && tapDebug {
+			if t.isTAP && TAPDebug {
 				s := fmt.Sprintf("% x", t.vectorBuffer[0][:])
 				for strings.HasSuffix(s, " 00") {
 					s = strings.TrimSuffix(s, " 00")
@@ -792,7 +792,9 @@ func (pc *peerConfigTable) outboundPacketIsJailed(p *packet.Parsed) bool {
 	return c.jailed
 }
 
-type setIPer interface {
+// SetIPer is the interface expected to be implemented by the TAP implementation
+// of tun.Device.
+type SetIPer interface {
 	// SetIP sets the IP addresses of the TAP device.
 	SetIP(ipV4, ipV6 netip.Addr) error
 }
@@ -800,7 +802,7 @@ type setIPer interface {
 // SetWGConfig is called when a new NetworkMap is received.
 func (t *Wrapper) SetWGConfig(wcfg *wgcfg.Config) {
 	if t.isTAP {
-		if sip, ok := t.tdev.(setIPer); ok {
+		if sip, ok := t.tdev.(SetIPer); ok {
 			sip.SetIP(findV4(wcfg.Addresses), findV6(wcfg.Addresses))
 		}
 	}
@@ -874,12 +876,13 @@ func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed, pc *peerConf
 		return filter.Drop, gro
 	}
 
-	if filt.RunOut(p, t.filterFlags) != filter.Accept {
+	if resp, reason := filt.RunOut(p, t.filterFlags); resp != filter.Accept {
 		metricPacketOutDropFilter.Add(1)
-		// TODO(#14280): increment a t.metrics.outboundDroppedPacketsTotal here
-		// once we figure out & document what labels to use for multicast,
-		// link-local-unicast, IP fragments, etc. But they're not
-		// usermetric.ReasonACL.
+		if reason != "" {
+			t.metrics.outboundDroppedPacketsTotal.Add(usermetric.DropLabels{
+				Reason: reason,
+			}, 1)
+		}
 		return filter.Drop, gro
 	}
 
@@ -904,9 +907,23 @@ func (t *Wrapper) IdleDuration() time.Duration {
 	return mono.Since(t.lastActivityAtomic.LoadAtomic())
 }
 
+func (t *Wrapper) awaitStart() {
+	for {
+		select {
+		case <-t.startCh:
+			return
+		case <-time.After(1 * time.Second):
+			// Multiple times while remixing tailscaled I (Brad) have forgotten
+			// to call Start and then wasted far too much time debugging.
+			// I do not wish that debugging on anyone else. Hopefully this'll help:
+			t.logf("tstun: awaiting Wrapper.Start call")
+		}
+	}
+}
+
 func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 	if !t.started.Load() {
-		<-t.startCh
+		t.awaitStart()
 	}
 	// packet from OS read and sent to WG
 	res, ok := <-t.vectorOutbound
@@ -937,7 +954,7 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 			}
 		}
 		if captHook != nil {
-			captHook(capture.FromLocal, t.now(), p.Buffer(), p.CaptureMeta)
+			captHook(packet.FromLocal, t.now(), p.Buffer(), p.CaptureMeta)
 		}
 		if !t.disableFilter {
 			var response filter.Response
@@ -1083,9 +1100,9 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []i
 	return n, err
 }
 
-func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook capture.Callback, pc *peerConfigTable, gro *gro.GRO) (filter.Response, *gro.GRO) {
+func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook packet.CaptureCallback, pc *peerConfigTable, gro *gro.GRO) (filter.Response, *gro.GRO) {
 	if captHook != nil {
-		captHook(capture.FromPeer, t.now(), p.Buffer(), p.CaptureMeta)
+		captHook(packet.FromPeer, t.now(), p.Buffer(), p.CaptureMeta)
 	}
 
 	if p.IPProto == ipproto.TSMP {
@@ -1299,7 +1316,7 @@ func (t *Wrapper) InjectInboundPacketBuffer(pkt *stack.PacketBuffer, buffs [][]b
 	p.Decode(buf)
 	captHook := t.captureHook.Load()
 	if captHook != nil {
-		captHook(capture.SynthesizedToLocal, t.now(), p.Buffer(), p.CaptureMeta)
+		captHook(packet.SynthesizedToLocal, t.now(), p.Buffer(), p.CaptureMeta)
 	}
 
 	invertGSOChecksum(buf, pkt.GSOOptions)
@@ -1431,7 +1448,7 @@ func (t *Wrapper) InjectOutboundPacketBuffer(pkt *stack.PacketBuffer) error {
 	}
 	if capt := t.captureHook.Load(); capt != nil {
 		b := pkt.ToBuffer()
-		capt(capture.SynthesizedToPeer, t.now(), b.Flatten(), packet.CaptureMeta{})
+		capt(packet.SynthesizedToPeer, t.now(), b.Flatten(), packet.CaptureMeta{})
 	}
 
 	t.injectOutbound(tunInjectedRead{packet: pkt})
@@ -1473,6 +1490,6 @@ var (
 	metricPacketOutDropSelfDisco = clientmetric.NewCounter("tstun_out_to_wg_drop_self_disco")
 )
 
-func (t *Wrapper) InstallCaptureHook(cb capture.Callback) {
+func (t *Wrapper) InstallCaptureHook(cb packet.CaptureCallback) {
 	t.captureHook.Store(cb)
 }
