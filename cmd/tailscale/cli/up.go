@@ -164,6 +164,9 @@ func defaultNetfilterMode() string {
 	return "on"
 }
 
+// upArgsT is the type of upArgs, the argument struct for `tailscale up`.
+// As of 2024-10-08, upArgsT is frozen and no new arguments should be
+// added to it. Add new arguments to setArgsT instead.
 type upArgsT struct {
 	qr                     bool
 	reset                  bool
@@ -374,6 +377,12 @@ func updatePrefs(prefs, curPrefs *ipn.Prefs, env upCheckEnv) (simpleUp bool, jus
 	wantSSH, haveSSH := env.upArgs.runSSH, curPrefs.RunSSH
 	if err := presentSSHToggleRisk(wantSSH, haveSSH, env.upArgs.acceptedRisks); err != nil {
 		return false, nil, err
+	}
+
+	if runtime.GOOS == "darwin" && env.upArgs.advertiseConnector {
+		if err := presentRiskToUser(riskMacAppConnector, riskMacAppConnectorMessage, env.upArgs.acceptedRisks); err != nil {
+			return false, nil, err
+		}
 	}
 
 	if env.upArgs.forceReauth && isSSHOverTailscale() {
@@ -1148,10 +1157,10 @@ func resolveAuthKey(ctx context.Context, v, tags string) (string, error) {
 		ClientID:     "some-client-id", // ignored
 		ClientSecret: clientSecret,
 		TokenURL:     baseURL + "/api/v2/oauth/token",
-		Scopes:       []string{"device"},
 	}
 
 	tsClient := tailscale.NewClient("-", nil)
+	tsClient.UserAgent = "tailscale-cli"
 	tsClient.HTTPClient = credentials.Client(ctx)
 	tsClient.BaseURL = baseURL
 

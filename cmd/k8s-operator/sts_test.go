@@ -18,6 +18,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/types/ptr"
@@ -73,6 +74,16 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 					NodeSelector:     map[string]string{"beta.kubernetes.io/os": "linux"},
 					Affinity:         &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{}}},
 					Tolerations:      []corev1.Toleration{{Key: "", Operator: "Exists"}},
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{
+						{
+							WhenUnsatisfiable: "DoNotSchedule",
+							TopologyKey:       "kubernetes.io/hostname",
+							MaxSkew:           3,
+							LabelSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{"foo": "bar"},
+							},
+						},
+					},
 					TailscaleContainer: &tsapi.Container{
 						SecurityContext: &corev1.SecurityContext{
 							Privileged: ptr.To(true),
@@ -114,10 +125,26 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 			},
 		},
 	}
-	proxyClassMetrics := &tsapi.ProxyClass{
-		Spec: tsapi.ProxyClassSpec{
-			Metrics: &tsapi.Metrics{Enable: true},
-		},
+
+	proxyClassWithMetricsDebug := func(metrics bool, debug *bool) *tsapi.ProxyClass {
+		return &tsapi.ProxyClass{
+			Spec: tsapi.ProxyClassSpec{
+				Metrics: &tsapi.Metrics{Enable: metrics},
+				StatefulSet: func() *tsapi.StatefulSet {
+					if debug == nil {
+						return nil
+					}
+
+					return &tsapi.StatefulSet{
+						Pod: &tsapi.Pod{
+							TailscaleContainer: &tsapi.Container{
+								Debug: &tsapi.Debug{Enable: *debug},
+							},
+						},
+					}
+				}(),
+			},
+		}
 	}
 
 	var userspaceProxySS, nonUserspaceProxySS appsv1.StatefulSet
@@ -159,6 +186,7 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	wantSS.Spec.Template.Spec.NodeSelector = proxyClassAllOpts.Spec.StatefulSet.Pod.NodeSelector
 	wantSS.Spec.Template.Spec.Affinity = proxyClassAllOpts.Spec.StatefulSet.Pod.Affinity
 	wantSS.Spec.Template.Spec.Tolerations = proxyClassAllOpts.Spec.StatefulSet.Pod.Tolerations
+	wantSS.Spec.Template.Spec.TopologySpreadConstraints = proxyClassAllOpts.Spec.StatefulSet.Pod.TopologySpreadConstraints
 	wantSS.Spec.Template.Spec.Containers[0].SecurityContext = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleContainer.SecurityContext
 	wantSS.Spec.Template.Spec.InitContainers[0].SecurityContext = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleInitContainer.SecurityContext
 	wantSS.Spec.Template.Spec.Containers[0].Resources = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleContainer.Resources
@@ -172,7 +200,7 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 
 	gotSS := applyProxyClassToStatefulSet(proxyClassAllOpts, nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
-		t.Fatalf("Unexpected result applying ProxyClass with all fields set to a StatefulSet for non-userspace proxy (-got +want):\n%s", diff)
+		t.Errorf("Unexpected result applying ProxyClass with all fields set to a StatefulSet for non-userspace proxy (-got +want):\n%s", diff)
 	}
 
 	// 2. Test that a ProxyClass with custom labels and annotations for
@@ -185,7 +213,7 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	wantSS.Spec.Template.Annotations = proxyClassJustLabels.Spec.StatefulSet.Pod.Annotations
 	gotSS = applyProxyClassToStatefulSet(proxyClassJustLabels, nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
-		t.Fatalf("Unexpected result applying ProxyClass with custom labels and annotations to a StatefulSet for non-userspace proxy (-got +want):\n%s", diff)
+		t.Errorf("Unexpected result applying ProxyClass with custom labels and annotations to a StatefulSet for non-userspace proxy (-got +want):\n%s", diff)
 	}
 
 	// 3. Test that a ProxyClass with all fields set gets correctly applied
@@ -201,6 +229,7 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	wantSS.Spec.Template.Spec.NodeSelector = proxyClassAllOpts.Spec.StatefulSet.Pod.NodeSelector
 	wantSS.Spec.Template.Spec.Affinity = proxyClassAllOpts.Spec.StatefulSet.Pod.Affinity
 	wantSS.Spec.Template.Spec.Tolerations = proxyClassAllOpts.Spec.StatefulSet.Pod.Tolerations
+	wantSS.Spec.Template.Spec.TopologySpreadConstraints = proxyClassAllOpts.Spec.StatefulSet.Pod.TopologySpreadConstraints
 	wantSS.Spec.Template.Spec.Containers[0].SecurityContext = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleContainer.SecurityContext
 	wantSS.Spec.Template.Spec.Containers[0].Resources = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleContainer.Resources
 	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env, []corev1.EnvVar{{Name: "foo", Value: "bar"}, {Name: "TS_USERSPACE", Value: "true"}, {Name: "bar"}}...)
@@ -208,7 +237,7 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	wantSS.Spec.Template.Spec.Containers[0].Image = "ghcr.io/my-repo/tailscale:v0.01testsomething"
 	gotSS = applyProxyClassToStatefulSet(proxyClassAllOpts, userspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
-		t.Fatalf("Unexpected result applying ProxyClass with all options to a StatefulSet for a userspace proxy (-got +want):\n%s", diff)
+		t.Errorf("Unexpected result applying ProxyClass with all options to a StatefulSet for a userspace proxy (-got +want):\n%s", diff)
 	}
 
 	// 4. Test that a ProxyClass with custom labels and annotations gets correctly applied
@@ -220,16 +249,48 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	wantSS.Spec.Template.Annotations = proxyClassJustLabels.Spec.StatefulSet.Pod.Annotations
 	gotSS = applyProxyClassToStatefulSet(proxyClassJustLabels, userspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
-		t.Fatalf("Unexpected result applying ProxyClass with custom labels and annotations to a StatefulSet for a userspace proxy (-got +want):\n%s", diff)
+		t.Errorf("Unexpected result applying ProxyClass with custom labels and annotations to a StatefulSet for a userspace proxy (-got +want):\n%s", diff)
 	}
 
-	// 5. Test that a ProxyClass with metrics enabled gets correctly applied to a StatefulSet.
+	// 5. Metrics enabled defaults to enabling both metrics and debug.
 	wantSS = nonUserspaceProxySS.DeepCopy()
-	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{Name: "TS_TAILSCALED_EXTRA_ARGS", Value: "--debug=$(POD_IP):9001"})
-	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "metrics", Protocol: "TCP", ContainerPort: 9001, HostPort: 9001}}
-	gotSS = applyProxyClassToStatefulSet(proxyClassMetrics, nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
+	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "TS_DEBUG_ADDR_PORT", Value: "$(POD_IP):9001"},
+		corev1.EnvVar{Name: "TS_TAILSCALED_EXTRA_ARGS", Value: "--debug=$(TS_DEBUG_ADDR_PORT)"},
+		corev1.EnvVar{Name: "TS_LOCAL_ADDR_PORT", Value: "$(POD_IP):9002"},
+		corev1.EnvVar{Name: "TS_ENABLE_METRICS", Value: "true"},
+	)
+	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{
+		{Name: "debug", Protocol: "TCP", ContainerPort: 9001},
+		{Name: "metrics", Protocol: "TCP", ContainerPort: 9002},
+	}
+	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(true, nil), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
-		t.Fatalf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
+		t.Errorf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
+	}
+
+	// 6. Enable _just_ metrics by explicitly disabling debug.
+	wantSS = nonUserspaceProxySS.DeepCopy()
+	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "TS_LOCAL_ADDR_PORT", Value: "$(POD_IP):9002"},
+		corev1.EnvVar{Name: "TS_ENABLE_METRICS", Value: "true"},
+	)
+	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "metrics", Protocol: "TCP", ContainerPort: 9002}}
+	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(true, ptr.To(false)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
+	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
+		t.Errorf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
+	}
+
+	// 7. Enable _just_ debug without metrics.
+	wantSS = nonUserspaceProxySS.DeepCopy()
+	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "TS_DEBUG_ADDR_PORT", Value: "$(POD_IP):9001"},
+		corev1.EnvVar{Name: "TS_TAILSCALED_EXTRA_ARGS", Value: "--debug=$(TS_DEBUG_ADDR_PORT)"},
+	)
+	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "debug", Protocol: "TCP", ContainerPort: 9001}}
+	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(false, ptr.To(true)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
+	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
+		t.Errorf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
 	}
 }
 

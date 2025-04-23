@@ -109,9 +109,7 @@ type Wrapper struct {
 	lastActivityAtomic mono.Time // time of last send or receive
 
 	destIPActivity syncs.AtomicValue[map[netip.Addr]func()]
-	//lint:ignore U1000 used in tap_linux.go
-	destMACAtomic syncs.AtomicValue[[6]byte]
-	discoKey      syncs.AtomicValue[key.DiscoPublic]
+	discoKey       syncs.AtomicValue[key.DiscoPublic]
 
 	// timeNow, if non-nil, will be used to obtain the current time.
 	timeNow func() time.Time
@@ -215,24 +213,14 @@ type Wrapper struct {
 }
 
 type metrics struct {
-	inboundDroppedPacketsTotal  *tsmetrics.MultiLabelMap[dropPacketLabel]
-	outboundDroppedPacketsTotal *tsmetrics.MultiLabelMap[dropPacketLabel]
+	inboundDroppedPacketsTotal  *tsmetrics.MultiLabelMap[usermetric.DropLabels]
+	outboundDroppedPacketsTotal *tsmetrics.MultiLabelMap[usermetric.DropLabels]
 }
 
 func registerMetrics(reg *usermetric.Registry) *metrics {
 	return &metrics{
-		inboundDroppedPacketsTotal: usermetric.NewMultiLabelMapWithRegistry[dropPacketLabel](
-			reg,
-			"tailscaled_inbound_dropped_packets_total",
-			"counter",
-			"Counts the number of dropped packets received by the node from other peers",
-		),
-		outboundDroppedPacketsTotal: usermetric.NewMultiLabelMapWithRegistry[dropPacketLabel](
-			reg,
-			"tailscaled_outbound_dropped_packets_total",
-			"counter",
-			"Counts the number of packets dropped while being sent to other peers",
-		),
+		inboundDroppedPacketsTotal:  reg.DroppedPacketsInbound(),
+		outboundDroppedPacketsTotal: reg.DroppedPacketsOutbound(),
 	}
 }
 
@@ -255,12 +243,6 @@ type tunVectorReadResult struct {
 	injected tunInjectedRead
 
 	dataOffset int
-}
-
-type setWrapperer interface {
-	// setWrapper enables the underlying TUN/TAP to have access to the Wrapper.
-	// It MUST be called only once during initialization, other usage is unsafe.
-	setWrapper(*Wrapper)
 }
 
 // Start unblocks any Wrapper.Read calls that have already started
@@ -312,10 +294,6 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool, m *usermetric.Registry)
 	// The buffer starts out consumed.
 	w.bufferConsumed <- struct{}{}
 	w.noteActivity()
-
-	if sw, ok := w.tdev.(setWrapperer); ok {
-		sw.setWrapper(w)
-	}
 
 	return w
 }
@@ -459,12 +437,18 @@ const ethernetFrameSize = 14 // 2 six byte MACs, 2 bytes ethertype
 func (t *Wrapper) pollVector() {
 	sizes := make([]int, len(t.vectorBuffer))
 	readOffset := PacketStartOffset
+	reader := t.tdev.Read
 	if t.isTAP {
-		readOffset = PacketStartOffset - ethernetFrameSize
+		type tapReader interface {
+			ReadEthernet(buffs [][]byte, sizes []int, offset int) (int, error)
+		}
+		if r, ok := t.tdev.(tapReader); ok {
+			readOffset = PacketStartOffset - ethernetFrameSize
+			reader = r.ReadEthernet
+		}
 	}
 
 	for range t.bufferConsumed {
-	DoRead:
 		for i := range t.vectorBuffer {
 			t.vectorBuffer[i] = t.vectorBuffer[i][:cap(t.vectorBuffer[i])]
 		}
@@ -474,7 +458,7 @@ func (t *Wrapper) pollVector() {
 			if t.isClosed() {
 				return
 			}
-			n, err = t.tdev.Read(t.vectorBuffer[:], sizes, readOffset)
+			n, err = reader(t.vectorBuffer[:], sizes, readOffset)
 			if t.isTAP && tapDebug {
 				s := fmt.Sprintf("% x", t.vectorBuffer[0][:])
 				for strings.HasSuffix(s, " 00") {
@@ -485,21 +469,6 @@ func (t *Wrapper) pollVector() {
 		}
 		for i := range sizes[:n] {
 			t.vectorBuffer[i] = t.vectorBuffer[i][:readOffset+sizes[i]]
-		}
-		if t.isTAP {
-			if err == nil {
-				ethernetFrame := t.vectorBuffer[0][readOffset:]
-				if t.handleTAPFrame(ethernetFrame) {
-					goto DoRead
-				}
-			}
-			// Fall through. We got an IP packet.
-			if sizes[0] >= ethernetFrameSize {
-				t.vectorBuffer[0] = t.vectorBuffer[0][:readOffset+sizes[0]-ethernetFrameSize]
-			}
-			if tapDebug {
-				t.logf("tap regular frame: %x", t.vectorBuffer[0][PacketStartOffset:PacketStartOffset+sizes[0]])
-			}
 		}
 		t.sendVectorOutbound(tunVectorReadResult{
 			data:       t.vectorBuffer[:n],
@@ -823,10 +792,19 @@ func (pc *peerConfigTable) outboundPacketIsJailed(p *packet.Parsed) bool {
 	return c.jailed
 }
 
+type setIPer interface {
+	// SetIP sets the IP addresses of the TAP device.
+	SetIP(ipV4, ipV6 netip.Addr) error
+}
+
 // SetWGConfig is called when a new NetworkMap is received.
 func (t *Wrapper) SetWGConfig(wcfg *wgcfg.Config) {
+	if t.isTAP {
+		if sip, ok := t.tdev.(setIPer); ok {
+			sip.SetIP(findV4(wcfg.Addresses), findV6(wcfg.Addresses))
+		}
+	}
 	cfg := peerConfigTableFromWGConfig(wcfg)
-
 	old := t.peerConfig.Swap(cfg)
 	if !reflect.DeepEqual(old, cfg) {
 		t.logf("peer config: %v", cfg)
@@ -898,9 +876,10 @@ func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed, pc *peerConf
 
 	if filt.RunOut(p, t.filterFlags) != filter.Accept {
 		metricPacketOutDropFilter.Add(1)
-		t.metrics.outboundDroppedPacketsTotal.Add(dropPacketLabel{
-			Reason: DropReasonACL,
-		}, 1)
+		// TODO(#14280): increment a t.metrics.outboundDroppedPacketsTotal here
+		// once we figure out & document what labels to use for multicast,
+		// link-local-unicast, IP fragments, etc. But they're not
+		// usermetric.ReasonACL.
 		return filter.Drop, gro
 	}
 
@@ -1170,8 +1149,8 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook ca
 
 	if outcome != filter.Accept {
 		metricPacketInDropFilter.Add(1)
-		t.metrics.inboundDroppedPacketsTotal.Add(dropPacketLabel{
-			Reason: DropReasonACL,
+		t.metrics.inboundDroppedPacketsTotal.Add(usermetric.DropLabels{
+			Reason: usermetric.ReasonACL,
 		}, 1)
 
 		// Tell them, via TSMP, we're dropping them due to the ACL.
@@ -1251,8 +1230,8 @@ func (t *Wrapper) Write(buffs [][]byte, offset int) (int, error) {
 		t.noteActivity()
 		_, err := t.tdevWrite(buffs, offset)
 		if err != nil {
-			t.metrics.inboundDroppedPacketsTotal.Add(dropPacketLabel{
-				Reason: DropReasonError,
+			t.metrics.inboundDroppedPacketsTotal.Add(usermetric.DropLabels{
+				Reason: usermetric.ReasonError,
 			}, int64(len(buffs)))
 		}
 		return len(buffs), err
@@ -1493,20 +1472,6 @@ var (
 	metricPacketOutDropFilter    = clientmetric.NewCounter("tstun_out_to_wg_drop_filter")
 	metricPacketOutDropSelfDisco = clientmetric.NewCounter("tstun_out_to_wg_drop_self_disco")
 )
-
-type DropReason string
-
-const (
-	DropReasonACL   DropReason = "acl"
-	DropReasonError DropReason = "error"
-)
-
-type dropPacketLabel struct {
-	// Reason indicates what we have done with the packet, and has the following values:
-	// - acl (rejected packets because of ACL)
-	// - error (rejected packets because of an error)
-	Reason DropReason
-}
 
 func (t *Wrapper) InstallCaptureHook(cb capture.Callback) {
 	t.captureHook.Store(cb)

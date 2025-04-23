@@ -46,11 +46,11 @@ func main() {
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		TokenURL:     baseURL + "/api/v2/oauth/token",
-		Scopes:       []string{"device"},
 	}
 
 	ctx := context.Background()
 	tsClient := tailscale.NewClient("-", nil)
+	tsClient.UserAgent = "tailscale-get-authkey"
 	tsClient.HTTPClient = credentials.Client(ctx)
 	tsClient.BaseURL = baseURL
 

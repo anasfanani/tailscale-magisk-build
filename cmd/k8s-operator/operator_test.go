@@ -432,6 +432,148 @@ func TestTailnetTargetIPAnnotation(t *testing.T) {
 	expectMissing[corev1.Secret](t, fc, "operator-ns", fullName)
 }
 
+func TestTailnetTargetIPAnnotation_IPCouldNotBeParsed(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger:   zl.Sugar(),
+		clock:    clock,
+		recorder: record.NewFakeRecorder(100),
+	}
+	tailnetTargetIP := "invalid-ip"
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+
+			UID: types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetIP: tailnetTargetIP,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	t0 := conditionTime(clock)
+
+	want := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			UID:       types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetIP: tailnetTargetIP,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
+		},
+		Status: corev1.ServiceStatus{
+			Conditions: []metav1.Condition{{
+				Type:               string(tsapi.ProxyReady),
+				Status:             metav1.ConditionFalse,
+				LastTransitionTime: t0,
+				Reason:             reasonProxyInvalid,
+				Message:            `unable to provision proxy resources: invalid Service: invalid value of annotation tailscale.com/tailnet-ip: "invalid-ip" could not be parsed as a valid IP Address, error: ParseAddr("invalid-ip"): unable to parse IP`,
+			}},
+		},
+	}
+
+	expectEqual(t, fc, want, nil)
+}
+
+func TestTailnetTargetIPAnnotation_InvalidIP(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger:   zl.Sugar(),
+		clock:    clock,
+		recorder: record.NewFakeRecorder(100),
+	}
+	tailnetTargetIP := "999.999.999.999"
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+
+			UID: types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetIP: tailnetTargetIP,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	t0 := conditionTime(clock)
+
+	want := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			UID:       types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetIP: tailnetTargetIP,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
+		},
+		Status: corev1.ServiceStatus{
+			Conditions: []metav1.Condition{{
+				Type:               string(tsapi.ProxyReady),
+				Status:             metav1.ConditionFalse,
+				LastTransitionTime: t0,
+				Reason:             reasonProxyInvalid,
+				Message:            `unable to provision proxy resources: invalid Service: invalid value of annotation tailscale.com/tailnet-ip: "999.999.999.999" could not be parsed as a valid IP Address, error: ParseAddr("999.999.999.999"): IPv4 field has value >255`,
+			}},
+		},
+	}
+
+	expectEqual(t, fc, want, nil)
+}
+
 func TestAnnotations(t *testing.T) {
 	fc := fake.NewFakeClient()
 	ft := &fakeTSClient{}
@@ -1246,7 +1388,7 @@ func TestTailscaledConfigfileHash(t *testing.T) {
 		parentType:      "svc",
 		hostname:        "default-test",
 		clusterTargetIP: "10.20.30.40",
-		confFileHash:    "e09bededa0379920141cbd0b0dbdf9b8b66545877f9e8397423f5ce3e1ba439e",
+		confFileHash:    "acf3467364b0a3ba9b8ee0dd772cb7c2f0bf585e288fa99b7fe4566009ed6041",
 		app:             kubetypes.AppIngressProxy,
 	}
 	expectEqual(t, fc, expectedSTS(t, fc, o), nil)
@@ -1257,7 +1399,7 @@ func TestTailscaledConfigfileHash(t *testing.T) {
 		mak.Set(&svc.Annotations, AnnotationHostname, "another-test")
 	})
 	o.hostname = "another-test"
-	o.confFileHash = "5d754cf55463135ee34aa9821f2fd8483b53eb0570c3740c84a086304f427684"
+	o.confFileHash = "d4cc13f09f55f4f6775689004f9a466723325b84d2b590692796bfe22aeaa389"
 	expectReconciled(t, sr, "default", "test")
 	expectEqual(t, fc, expectedSTS(t, fc, o), nil)
 }

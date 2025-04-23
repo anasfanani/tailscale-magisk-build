@@ -17,6 +17,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,6 +36,8 @@ var defaultProxyClassAnnotations = map[string]string{
 }
 
 func TestProxyGroup(t *testing.T) {
+	const initialCfgHash = "6632726be70cf224049580deb4d317bba065915b5fd415461d60ed621c91b196"
+
 	pc := &tsapi.ProxyClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "default-pc",
@@ -74,12 +77,20 @@ func TestProxyGroup(t *testing.T) {
 		l:        zl.Sugar(),
 		clock:    cl,
 	}
+	crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: serviceMonitorCRD}}
+	opts := configOpts{
+		proxyType:          "proxygroup",
+		stsName:            pg.Name,
+		parentType:         "proxygroup",
+		tailscaleNamespace: "tailscale",
+	}
 
 	t.Run("proxyclass_not_ready", func(t *testing.T) {
 		expectReconciled(t, reconciler, "", pg.Name)
 
 		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "the ProxyGroup's ProxyClass default-pc is not yet in a ready state, waiting...", 0, cl, zl.Sugar())
 		expectEqual(t, fc, pg, nil)
+		expectProxyGroupResources(t, fc, pg, false, "")
 	})
 
 	t.Run("observe_ProxyGroupCreating_status_reason", func(t *testing.T) {
@@ -100,10 +111,11 @@ func TestProxyGroup(t *testing.T) {
 
 		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "0/2 ProxyGroup pods running", 0, cl, zl.Sugar())
 		expectEqual(t, fc, pg, nil)
+		expectProxyGroupResources(t, fc, pg, true, initialCfgHash)
 		if expected := 1; reconciler.proxyGroups.Len() != expected {
 			t.Fatalf("expected %d recorders, got %d", expected, reconciler.proxyGroups.Len())
 		}
-		expectProxyGroupResources(t, fc, pg, true)
+		expectProxyGroupResources(t, fc, pg, true, initialCfgHash)
 		keyReq := tailscale.KeyCapabilities{
 			Devices: tailscale.KeyDeviceCapabilities{
 				Create: tailscale.KeyDeviceCreateCapabilities{
@@ -135,7 +147,7 @@ func TestProxyGroup(t *testing.T) {
 		}
 		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionTrue, reasonProxyGroupReady, reasonProxyGroupReady, 0, cl, zl.Sugar())
 		expectEqual(t, fc, pg, nil)
-		expectProxyGroupResources(t, fc, pg, true)
+		expectProxyGroupResources(t, fc, pg, true, initialCfgHash)
 	})
 
 	t.Run("scale_up_to_3", func(t *testing.T) {
@@ -146,6 +158,7 @@ func TestProxyGroup(t *testing.T) {
 		expectReconciled(t, reconciler, "", pg.Name)
 		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, metav1.ConditionFalse, reasonProxyGroupCreating, "2/3 ProxyGroup pods running", 0, cl, zl.Sugar())
 		expectEqual(t, fc, pg, nil)
+		expectProxyGroupResources(t, fc, pg, true, initialCfgHash)
 
 		addNodeIDToStateSecrets(t, fc, pg)
 		expectReconciled(t, reconciler, "", pg.Name)
@@ -155,7 +168,7 @@ func TestProxyGroup(t *testing.T) {
 			TailnetIPs: []string{"1.2.3.4", "::1"},
 		})
 		expectEqual(t, fc, pg, nil)
-		expectProxyGroupResources(t, fc, pg, true)
+		expectProxyGroupResources(t, fc, pg, true, initialCfgHash)
 	})
 
 	t.Run("scale_down_to_1", func(t *testing.T) {
@@ -163,11 +176,47 @@ func TestProxyGroup(t *testing.T) {
 		mustUpdate(t, fc, "", pg.Name, func(p *tsapi.ProxyGroup) {
 			p.Spec = pg.Spec
 		})
+
 		expectReconciled(t, reconciler, "", pg.Name)
+
 		pg.Status.Devices = pg.Status.Devices[:1] // truncate to only the first device.
 		expectEqual(t, fc, pg, nil)
+		expectProxyGroupResources(t, fc, pg, true, initialCfgHash)
+	})
 
-		expectProxyGroupResources(t, fc, pg, true)
+	t.Run("trigger_config_change_and_observe_new_config_hash", func(t *testing.T) {
+		pc.Spec.TailscaleConfig = &tsapi.TailscaleConfig{
+			AcceptRoutes: true,
+		}
+		mustUpdate(t, fc, "", pc.Name, func(p *tsapi.ProxyClass) {
+			p.Spec = pc.Spec
+		})
+
+		expectReconciled(t, reconciler, "", pg.Name)
+
+		expectEqual(t, fc, pg, nil)
+		expectProxyGroupResources(t, fc, pg, true, "518a86e9fae64f270f8e0ec2a2ea6ca06c10f725035d3d6caca132cd61e42a74")
+	})
+
+	t.Run("enable_metrics", func(t *testing.T) {
+		pc.Spec.Metrics = &tsapi.Metrics{Enable: true}
+		mustUpdate(t, fc, "", pc.Name, func(p *tsapi.ProxyClass) {
+			p.Spec = pc.Spec
+		})
+		expectReconciled(t, reconciler, "", pg.Name)
+		expectEqual(t, fc, expectedMetricsService(opts), nil)
+	})
+	t.Run("enable_service_monitor_no_crd", func(t *testing.T) {
+		pc.Spec.Metrics.ServiceMonitor = &tsapi.ServiceMonitor{Enable: true}
+		mustUpdate(t, fc, "", pc.Name, func(p *tsapi.ProxyClass) {
+			p.Spec.Metrics = pc.Spec.Metrics
+		})
+		expectReconciled(t, reconciler, "", pg.Name)
+	})
+	t.Run("create_crd_expect_service_monitor", func(t *testing.T) {
+		mustCreate(t, fc, crd)
+		expectReconciled(t, reconciler, "", pg.Name)
+		expectEqualUnstructured(t, fc, expectedServiceMonitor(t, opts))
 	})
 
 	t.Run("delete_and_cleanup", func(t *testing.T) {
@@ -177,7 +226,7 @@ func TestProxyGroup(t *testing.T) {
 
 		expectReconciled(t, reconciler, "", pg.Name)
 
-		expectMissing[tsapi.Recorder](t, fc, "", pg.Name)
+		expectMissing[tsapi.ProxyGroup](t, fc, "", pg.Name)
 		if expected := 0; reconciler.proxyGroups.Len() != expected {
 			t.Fatalf("expected %d ProxyGroups, got %d", expected, reconciler.proxyGroups.Len())
 		}
@@ -186,18 +235,19 @@ func TestProxyGroup(t *testing.T) {
 		if diff := cmp.Diff(tsClient.deleted, []string{"nodeid-1", "nodeid-2", "nodeid-0"}); diff != "" {
 			t.Fatalf("unexpected deleted devices (-got +want):\n%s", diff)
 		}
+		expectMissing[corev1.Service](t, reconciler, "tailscale", metricsResourceName(pg.Name))
 		// The fake client does not clean up objects whose owner has been
 		// deleted, so we can't test for the owned resources getting deleted.
 	})
 }
 
-func expectProxyGroupResources(t *testing.T, fc client.WithWatch, pg *tsapi.ProxyGroup, shouldExist bool) {
+func expectProxyGroupResources(t *testing.T, fc client.WithWatch, pg *tsapi.ProxyGroup, shouldExist bool, cfgHash string) {
 	t.Helper()
 
 	role := pgRole(pg, tsNamespace)
 	roleBinding := pgRoleBinding(pg, tsNamespace)
 	serviceAccount := pgServiceAccount(pg, tsNamespace)
-	statefulSet, err := pgStatefulSet(pg, tsNamespace, testProxyImage, "auto", "")
+	statefulSet, err := pgStatefulSet(pg, tsNamespace, testProxyImage, "auto", cfgHash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,9 +257,7 @@ func expectProxyGroupResources(t *testing.T, fc client.WithWatch, pg *tsapi.Prox
 		expectEqual(t, fc, role, nil)
 		expectEqual(t, fc, roleBinding, nil)
 		expectEqual(t, fc, serviceAccount, nil)
-		expectEqual(t, fc, statefulSet, func(ss *appsv1.StatefulSet) {
-			ss.Spec.Template.Annotations[podAnnotationLastSetConfigFileHash] = ""
-		})
+		expectEqual(t, fc, statefulSet, nil)
 	} else {
 		expectMissing[rbacv1.Role](t, fc, role.Namespace, role.Name)
 		expectMissing[rbacv1.RoleBinding](t, fc, roleBinding.Namespace, roleBinding.Name)
@@ -218,11 +266,13 @@ func expectProxyGroupResources(t *testing.T, fc client.WithWatch, pg *tsapi.Prox
 	}
 
 	var expectedSecrets []string
-	for i := range pgReplicas(pg) {
-		expectedSecrets = append(expectedSecrets,
-			fmt.Sprintf("%s-%d", pg.Name, i),
-			fmt.Sprintf("%s-%d-config", pg.Name, i),
-		)
+	if shouldExist {
+		for i := range pgReplicas(pg) {
+			expectedSecrets = append(expectedSecrets,
+				fmt.Sprintf("%s-%d", pg.Name, i),
+				fmt.Sprintf("%s-%d-config", pg.Name, i),
+			)
+		}
 	}
 	expectSecrets(t, fc, expectedSecrets)
 }

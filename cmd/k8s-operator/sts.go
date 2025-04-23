@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 
 	"go.uber.org/zap"
@@ -94,6 +95,12 @@ const (
 	podAnnotationLastSetTailnetTargetFQDN = "tailscale.com/operator-last-set-ts-tailnet-target-fqdn"
 	// podAnnotationLastSetConfigFileHash is sha256 hash of the current tailscaled configuration contents.
 	podAnnotationLastSetConfigFileHash = "tailscale.com/operator-last-set-config-file-hash"
+
+	proxyTypeEgress          = "egress_service"
+	proxyTypeIngressService  = "ingress_service"
+	proxyTypeIngressResource = "ingress_resource"
+	proxyTypeConnector       = "connector"
+	proxyTypeProxyGroup      = "proxygroup"
 )
 
 var (
@@ -122,6 +129,8 @@ type tailscaleSTSConfig struct {
 	Hostname string
 	Tags     []string // if empty, use defaultTags
 
+	proxyType string
+
 	// Connector specifies a configuration of a Connector instance if that's
 	// what this StatefulSet should be created for.
 	Connector *connector
@@ -132,10 +141,13 @@ type tailscaleSTSConfig struct {
 }
 
 type connector struct {
-	// routes is a list of subnet routes that this Connector should expose.
+	// routes is a list of routes that this Connector should advertise either as a subnet router or as an app
+	// connector.
 	routes string
 	// isExitNode defines whether this Connector should act as an exit node.
 	isExitNode bool
+	// isAppConnector defines whether this Connector should act as an app connector.
+	isAppConnector bool
 }
 type tsnetServer interface {
 	CertDomains() []string
@@ -186,22 +198,30 @@ func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.Suga
 	}
 	sts.ProxyClass = proxyClass
 
-	secretName, tsConfigHash, configs, err := a.createOrGetSecret(ctx, logger, sts, hsvc)
+	secretName, tsConfigHash, _, err := a.createOrGetSecret(ctx, logger, sts, hsvc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create or get API key secret: %w", err)
 	}
-	_, err = a.reconcileSTS(ctx, logger, sts, hsvc, secretName, tsConfigHash, configs)
+	_, err = a.reconcileSTS(ctx, logger, sts, hsvc, secretName, tsConfigHash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to reconcile statefulset: %w", err)
 	}
-
+	mo := &metricsOpts{
+		proxyStsName: hsvc.Name,
+		tsNamespace:  hsvc.Namespace,
+		proxyLabels:  hsvc.Labels,
+		proxyType:    sts.proxyType,
+	}
+	if err = reconcileMetricsResources(ctx, logger, mo, sts.ProxyClass, a.Client); err != nil {
+		return nil, fmt.Errorf("failed to ensure metrics resources: %w", err)
+	}
 	return hsvc, nil
 }
 
 // Cleanup removes all resources associated that were created by Provision with
 // the given labels. It returns true when all resources have been removed,
 // otherwise it returns false and the caller should retry later.
-func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, logger *zap.SugaredLogger, labels map[string]string) (done bool, _ error) {
+func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, logger *zap.SugaredLogger, labels map[string]string, typ string) (done bool, _ error) {
 	// Need to delete the StatefulSet first, and delete it with foreground
 	// cascading deletion. That way, the pod that's writing to the Secret will
 	// stop running before we start looking at the Secret's contents, and
@@ -227,21 +247,21 @@ func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, logger *zap.Sugare
 		return false, nil
 	}
 
-	id, _, _, err := a.DeviceInfo(ctx, labels)
+	dev, err := a.DeviceInfo(ctx, labels, logger)
 	if err != nil {
 		return false, fmt.Errorf("getting device info: %w", err)
 	}
-	if id != "" {
-		logger.Debugf("deleting device %s from control", string(id))
-		if err := a.tsClient.DeleteDevice(ctx, string(id)); err != nil {
+	if dev != nil && dev.id != "" {
+		logger.Debugf("deleting device %s from control", string(dev.id))
+		if err := a.tsClient.DeleteDevice(ctx, string(dev.id)); err != nil {
 			errResp := &tailscale.ErrResponse{}
 			if ok := errors.As(err, errResp); ok && errResp.Status == http.StatusNotFound {
-				logger.Debugf("device %s not found, likely because it has already been deleted from control", string(id))
+				logger.Debugf("device %s not found, likely because it has already been deleted from control", string(dev.id))
 			} else {
 				return false, fmt.Errorf("deleting device: %w", err)
 			}
 		} else {
-			logger.Debugf("device %s deleted from control", string(id))
+			logger.Debugf("device %s deleted from control", string(dev.id))
 		}
 	}
 
@@ -253,6 +273,14 @@ func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, logger *zap.Sugare
 		if err := a.DeleteAllOf(ctx, typ, client.InNamespace(a.operatorNamespace), client.MatchingLabels(labels)); err != nil {
 			return false, err
 		}
+	}
+	mo := &metricsOpts{
+		proxyLabels: labels,
+		tsNamespace: a.operatorNamespace,
+		proxyType:   typ,
+	}
+	if err := maybeCleanupMetricsResources(ctx, mo, a.Client); err != nil {
+		return false, fmt.Errorf("error cleaning up metrics resources: %w", err)
 	}
 	return true, nil
 }
@@ -413,40 +441,66 @@ func sanitizeConfigBytes(c ipn.ConfigVAlpha) string {
 // that acts as an operator proxy. It retrieves info from a Kubernetes Secret
 // labeled with the provided labels.
 // Either of device ID, hostname and IPs can be empty string if not found in the Secret.
-func (a *tailscaleSTSReconciler) DeviceInfo(ctx context.Context, childLabels map[string]string) (id tailcfg.StableNodeID, hostname string, ips []string, err error) {
+func (a *tailscaleSTSReconciler) DeviceInfo(ctx context.Context, childLabels map[string]string, logger *zap.SugaredLogger) (dev *device, err error) {
 	sec, err := getSingleObject[corev1.Secret](ctx, a.Client, a.operatorNamespace, childLabels)
 	if err != nil {
-		return "", "", nil, err
+		return dev, err
 	}
 	if sec == nil {
-		return "", "", nil, nil
+		return dev, nil
+	}
+	pod := new(corev1.Pod)
+	if err := a.Get(ctx, types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}, pod); err != nil && !apierrors.IsNotFound(err) {
+		return dev, nil
 	}
 
-	return deviceInfo(sec)
+	return deviceInfo(sec, pod, logger)
 }
 
-func deviceInfo(sec *corev1.Secret) (id tailcfg.StableNodeID, hostname string, ips []string, err error) {
-	id = tailcfg.StableNodeID(sec.Data["device_id"])
+// device contains tailscale state of a proxy device as gathered from its tailscale state Secret.
+type device struct {
+	id       tailcfg.StableNodeID // device's stable ID
+	hostname string               // MagicDNS name of the device
+	ips      []string             // Tailscale IPs of the device
+	// ingressDNSName is the L7 Ingress DNS name. In practice this will be the same value as hostname, but only set
+	// when the device has been configured to serve traffic on it via 'tailscale serve'.
+	ingressDNSName string
+}
+
+func deviceInfo(sec *corev1.Secret, pod *corev1.Pod, log *zap.SugaredLogger) (dev *device, err error) {
+	id := tailcfg.StableNodeID(sec.Data[kubetypes.KeyDeviceID])
 	if id == "" {
-		return "", "", nil, nil
+		return dev, nil
 	}
+	dev = &device{id: id}
 	// Kubernetes chokes on well-formed FQDNs with the trailing dot, so we have
 	// to remove it.
-	hostname = strings.TrimSuffix(string(sec.Data["device_fqdn"]), ".")
-	if hostname == "" {
+	dev.hostname = strings.TrimSuffix(string(sec.Data[kubetypes.KeyDeviceFQDN]), ".")
+	if dev.hostname == "" {
 		// Device ID gets stored and retrieved in a different flow than
 		// FQDN and IPs. A device that acts as Kubernetes operator
-		// proxy, but whose route setup has failed might have an device
+		// proxy, but whose route setup has failed might have a device
 		// ID, but no FQDN/IPs. If so, return the ID, to allow the
 		// operator to clean up such devices.
-		return id, "", nil, nil
+		return dev, nil
 	}
-	if rawDeviceIPs, ok := sec.Data["device_ips"]; ok {
-		if err := json.Unmarshal(rawDeviceIPs, &ips); err != nil {
-			return "", "", nil, err
+	// TODO(irbekrm): we fall back to using the hostname field to determine Ingress's hostname to ensure backwards
+	// compatibility. In 1.82 we can remove this fallback mechanism.
+	dev.ingressDNSName = dev.hostname
+	if proxyCapVer(sec, pod, log) >= 109 {
+		dev.ingressDNSName = strings.TrimSuffix(string(sec.Data[kubetypes.KeyHTTPSEndpoint]), ".")
+		if strings.EqualFold(dev.ingressDNSName, kubetypes.ValueNoHTTPS) {
+			dev.ingressDNSName = ""
 		}
 	}
-	return id, hostname, ips, nil
+	if rawDeviceIPs, ok := sec.Data[kubetypes.KeyDeviceIPs]; ok {
+		ips := make([]string, 0)
+		if err := json.Unmarshal(rawDeviceIPs, &ips); err != nil {
+			return nil, err
+		}
+		dev.ips = ips
+	}
+	return dev, nil
 }
 
 func newAuthKey(ctx context.Context, tsClient tsClient, tags []string) (string, error) {
@@ -473,7 +527,7 @@ var proxyYaml []byte
 //go:embed deploy/manifests/userspace-proxy.yaml
 var userspaceProxyYaml []byte
 
-func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig, headlessSvc *corev1.Service, proxySecret, tsConfigHash string, configs map[tailcfg.CapabilityVersion]ipn.ConfigVAlpha) (*appsv1.StatefulSet, error) {
+func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig, headlessSvc *corev1.Service, proxySecret, tsConfigHash string) (*appsv1.StatefulSet, error) {
 	ss := new(appsv1.StatefulSet)
 	if sts.ServeConfig != nil && sts.ForwardClusterTrafficViaL7IngressProxy != true { // If forwarding cluster traffic via is required we need non-userspace + NET_ADMIN + forwarding
 		if err := yaml.Unmarshal(userspaceProxyYaml, &ss); err != nil {
@@ -517,11 +571,6 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		corev1.EnvVar{
 			Name:  "TS_KUBE_SECRET",
 			Value: proxySecret,
-		},
-		corev1.EnvVar{
-			// Old tailscaled config key is still used for backwards compatibility.
-			Name:  "EXPERIMENTAL_TS_CONFIGFILE_PATH",
-			Value: "/etc/tsconfig/tailscaled",
 		},
 		corev1.EnvVar{
 			// New style is in the form of cap-<capability-version>.hujson.
@@ -668,24 +717,42 @@ func mergeStatefulSetLabelsOrAnnots(current, custom map[string]string, managed [
 	return custom
 }
 
+func debugSetting(pc *tsapi.ProxyClass) bool {
+	if pc == nil ||
+		pc.Spec.StatefulSet == nil ||
+		pc.Spec.StatefulSet.Pod == nil ||
+		pc.Spec.StatefulSet.Pod.TailscaleContainer == nil ||
+		pc.Spec.StatefulSet.Pod.TailscaleContainer.Debug == nil {
+		// This default will change to false in 1.82.0.
+		return pc.Spec.Metrics != nil && pc.Spec.Metrics.Enable
+	}
+
+	return pc.Spec.StatefulSet.Pod.TailscaleContainer.Debug.Enable
+}
+
 func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet, stsCfg *tailscaleSTSConfig, logger *zap.SugaredLogger) *appsv1.StatefulSet {
 	if pc == nil || ss == nil {
 		return ss
 	}
-	if stsCfg != nil && pc.Spec.Metrics != nil && pc.Spec.Metrics.Enable {
-		if stsCfg.TailnetTargetFQDN == "" && stsCfg.TailnetTargetIP == "" && !stsCfg.ForwardClusterTrafficViaL7IngressProxy {
-			enableMetrics(ss, pc)
-		} else if stsCfg.ForwardClusterTrafficViaL7IngressProxy {
+
+	metricsEnabled := pc.Spec.Metrics != nil && pc.Spec.Metrics.Enable
+	debugEnabled := debugSetting(pc)
+	if metricsEnabled || debugEnabled {
+		isEgress := stsCfg != nil && (stsCfg.TailnetTargetFQDN != "" || stsCfg.TailnetTargetIP != "")
+		isForwardingL7Ingress := stsCfg != nil && stsCfg.ForwardClusterTrafficViaL7IngressProxy
+		if isEgress {
 			// TODO (irbekrm): fix this
 			// For Ingress proxies that have been configured with
 			// tailscale.com/experimental-forward-cluster-traffic-via-ingress
 			// annotation, all cluster traffic is forwarded to the
 			// Ingress backend(s).
-			logger.Info("ProxyClass specifies that metrics should be enabled, but this is currently not supported for Ingress proxies that accept cluster traffic.")
-		} else {
+			logger.Info("ProxyClass specifies that metrics should be enabled, but this is currently not supported for egress proxies.")
+		} else if isForwardingL7Ingress {
 			// TODO (irbekrm): fix this
 			// For egress proxies, currently all cluster traffic is forwarded to the tailnet target.
 			logger.Info("ProxyClass specifies that metrics should be enabled, but this is currently not supported for Ingress proxies that accept cluster traffic.")
+		} else {
+			enableEndpoints(ss, metricsEnabled, debugEnabled)
 		}
 	}
 
@@ -718,6 +785,7 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet, 
 	ss.Spec.Template.Spec.NodeSelector = wantsPod.NodeSelector
 	ss.Spec.Template.Spec.Affinity = wantsPod.Affinity
 	ss.Spec.Template.Spec.Tolerations = wantsPod.Tolerations
+	ss.Spec.Template.Spec.TopologySpreadConstraints = wantsPod.TopologySpreadConstraints
 
 	// Update containers.
 	updateContainer := func(overlay *tsapi.Container, base corev1.Container) corev1.Container {
@@ -762,16 +830,58 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet, 
 	return ss
 }
 
-func enableMetrics(ss *appsv1.StatefulSet, pc *tsapi.ProxyClass) {
+func enableEndpoints(ss *appsv1.StatefulSet, metrics, debug bool) {
 	for i, c := range ss.Spec.Template.Spec.Containers {
 		if c.Name == "tailscale" {
-			// Serve metrics on on <pod-ip>:9001/debug/metrics. If
-			// we didn't specify Pod IP here, the proxy would, in
-			// some cases, also listen to its Tailscale IP- we don't
-			// want folks to start relying on this side-effect as a
-			// feature.
-			ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env, corev1.EnvVar{Name: "TS_TAILSCALED_EXTRA_ARGS", Value: "--debug=$(POD_IP):9001"})
-			ss.Spec.Template.Spec.Containers[i].Ports = append(ss.Spec.Template.Spec.Containers[i].Ports, corev1.ContainerPort{Name: "metrics", Protocol: "TCP", HostPort: 9001, ContainerPort: 9001})
+			if debug {
+				ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env,
+					// Serve tailscaled's debug metrics on on
+					// <pod-ip>:9001/debug/metrics. If we didn't specify Pod IP
+					// here, the proxy would, in some cases, also listen to its
+					// Tailscale IP- we don't want folks to start relying on this
+					// side-effect as a feature.
+					corev1.EnvVar{
+						Name:  "TS_DEBUG_ADDR_PORT",
+						Value: "$(POD_IP):9001",
+					},
+					// TODO(tomhjp): Can remove this env var once 1.76.x is no
+					// longer supported.
+					corev1.EnvVar{
+						Name:  "TS_TAILSCALED_EXTRA_ARGS",
+						Value: "--debug=$(TS_DEBUG_ADDR_PORT)",
+					},
+				)
+
+				ss.Spec.Template.Spec.Containers[i].Ports = append(ss.Spec.Template.Spec.Containers[i].Ports,
+					corev1.ContainerPort{
+						Name:          "debug",
+						Protocol:      "TCP",
+						ContainerPort: 9001,
+					},
+				)
+			}
+
+			if metrics {
+				ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env,
+					// Serve client metrics on <pod-ip>:9002/metrics.
+					corev1.EnvVar{
+						Name:  "TS_LOCAL_ADDR_PORT",
+						Value: "$(POD_IP):9002",
+					},
+					corev1.EnvVar{
+						Name:  "TS_ENABLE_METRICS",
+						Value: "true",
+					},
+				)
+				ss.Spec.Template.Spec.Containers[i].Ports = append(ss.Spec.Template.Spec.Containers[i].Ports,
+					corev1.ContainerPort{
+						Name:          "metrics",
+						Protocol:      "TCP",
+						ContainerPort: 9002,
+					},
+				)
+			}
+
 			break
 		}
 	}
@@ -785,15 +895,9 @@ func readAuthKey(secret *corev1.Secret, key string) (*string, error) {
 	return origConf.AuthKey, nil
 }
 
-// tailscaledConfig takes a proxy config, a newly generated auth key if
-// generated and a Secret with the previous proxy state and auth key and
-// returns tailscaled configuration and a hash of that configuration.
-//
-// As of 2024-05-09 it also returns legacy tailscaled config without the
-// later added NoStatefulFilter field to support proxies older than cap95.
-// TODO (irbekrm): remove the legacy config once we no longer need to support
-// versions older than cap94,
-// https://tailscale.com/kb/1236/kubernetes-operator#operator-and-proxies
+// tailscaledConfig takes a proxy config, a newly generated auth key if generated and a Secret with the previous proxy
+// state and auth key and returns tailscaled config files for currently supported proxy versions and a hash of that
+// configuration.
 func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *corev1.Secret) (tailscaledConfigs, error) {
 	conf := &ipn.ConfigVAlpha{
 		Version:             "alpha0",
@@ -801,21 +905,19 @@ func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *co
 		AcceptRoutes:        "false", // AcceptRoutes defaults to true
 		Locked:              "false",
 		Hostname:            &stsC.Hostname,
-		NoStatefulFiltering: "false",
+		NoStatefulFiltering: "true", // Explicitly enforce default value, see #14216
+		AppConnector:        &ipn.AppConnectorPrefs{Advertise: false},
 	}
 
-	// For egress proxies only, we need to ensure that stateful filtering is
-	// not in place so that traffic from cluster can be forwarded via
-	// Tailscale IPs.
-	if stsC.TailnetTargetFQDN != "" || stsC.TailnetTargetIP != "" {
-		conf.NoStatefulFiltering = "true"
-	}
 	if stsC.Connector != nil {
 		routes, err := netutil.CalcAdvertiseRoutes(stsC.Connector.routes, stsC.Connector.isExitNode)
 		if err != nil {
 			return nil, fmt.Errorf("error calculating routes: %w", err)
 		}
 		conf.AdvertiseRoutes = routes
+		if stsC.Connector.isAppConnector {
+			conf.AppConnector.Advertise = true
+		}
 	}
 	if shouldAcceptRoutes(stsC.ProxyClass) {
 		conf.AcceptRoutes = "true"
@@ -830,11 +932,13 @@ func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *co
 		}
 		conf.AuthKey = key
 	}
+
 	capVerConfigs := make(map[tailcfg.CapabilityVersion]ipn.ConfigVAlpha)
+	capVerConfigs[107] = *conf
+
+	// AppConnector config option is only understood by clients of capver 107 and newer.
+	conf.AppConnector = nil
 	capVerConfigs[95] = *conf
-	// legacy config should not contain NoStatefulFiltering field.
-	conf.NoStatefulFiltering.Clear()
-	capVerConfigs[94] = *conf
 	return capVerConfigs, nil
 }
 
@@ -1006,4 +1110,24 @@ func nameForService(svc *corev1.Service) string {
 
 func isValidFirewallMode(m string) bool {
 	return m == "auto" || m == "nftables" || m == "iptables"
+}
+
+// proxyCapVer accepts a proxy state Secret and a proxy Pod returns the capability version of a proxy Pod.
+// This is best effort - if the capability version can not (currently) be determined, it returns -1.
+func proxyCapVer(sec *corev1.Secret, pod *corev1.Pod, log *zap.SugaredLogger) tailcfg.CapabilityVersion {
+	if sec == nil || pod == nil {
+		return tailcfg.CapabilityVersion(-1)
+	}
+	if len(sec.Data[kubetypes.KeyCapVer]) == 0 || len(sec.Data[kubetypes.KeyPodUID]) == 0 {
+		return tailcfg.CapabilityVersion(-1)
+	}
+	capVer, err := strconv.Atoi(string(sec.Data[kubetypes.KeyCapVer]))
+	if err != nil {
+		log.Infof("[unexpected]: unexpected capability version in proxy's state Secret, expected an integer, got %q", string(sec.Data[kubetypes.KeyCapVer]))
+		return tailcfg.CapabilityVersion(-1)
+	}
+	if !strings.EqualFold(string(pod.ObjectMeta.UID), string(sec.Data[kubetypes.KeyPodUID])) {
+		return tailcfg.CapabilityVersion(-1)
+	}
+	return tailcfg.CapabilityVersion(capVer)
 }

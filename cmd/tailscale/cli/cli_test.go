@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -946,6 +947,10 @@ func TestPrefFlagMapping(t *testing.T) {
 			// Handled by the tailscale share subcommand, we don't want a CLI
 			// flag for this.
 			continue
+		case "AdvertiseServices":
+			// Handled by the tailscale advertise subcommand, we don't want a
+			// CLI flag for this.
+			continue
 		case "InternalExitNodePrior":
 			// Used internally by LocalBackend as part of exit node usage toggling.
 			// No CLI flag for this.
@@ -1474,5 +1479,35 @@ func TestParseNLArgs(t *testing.T) {
 				t.Errorf("disablements = %v, want %v", disablements, tc.wantDisablements)
 			}
 		})
+	}
+}
+
+func TestHelpAlias(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	tstest.Replace[io.Writer](t, &Stdout, &stdout)
+	tstest.Replace[io.Writer](t, &Stderr, &stderr)
+
+	gotExit0 := false
+	defer func() {
+		if !gotExit0 {
+			t.Error("expected os.Exit(0) to be called")
+			return
+		}
+		if !strings.Contains(stderr.String(), "SUBCOMMANDS") {
+			t.Errorf("expected help output to contain SUBCOMMANDS; got stderr=%q; stdout=%q", stderr.String(), stdout.String())
+		}
+	}()
+	defer func() {
+		if e := recover(); e != nil {
+			if strings.Contains(fmt.Sprint(e), "unexpected call to os.Exit(0)") {
+				gotExit0 = true
+			} else {
+				t.Errorf("unexpected panic: %v", e)
+			}
+		}
+	}()
+	err := Run([]string{"help"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 }

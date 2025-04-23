@@ -53,6 +53,10 @@ spec:
               jsonPath: .status.isExitNode
               name: IsExitNode
               type: string
+            - description: Whether this Connector instance is an app connector.
+              jsonPath: .status.isAppConnector
+              name: IsAppConnector
+              type: string
             - description: Status of the deployed Connector resources.
               jsonPath: .status.conditions[?(@.type == "ConnectorReady")].reason
               name: Status
@@ -91,10 +95,40 @@ spec:
                             More info:
                             https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
                         properties:
+                            appConnector:
+                                description: |-
+                                    AppConnector defines whether the Connector device should act as a Tailscale app connector. A Connector that is
+                                    configured as an app connector cannot be a subnet router or an exit node. If this field is unset, the
+                                    Connector does not act as an app connector.
+                                    Note that you will need to manually configure the permissions and the domains for the app connector via the
+                                    Admin panel.
+                                    Note also that the main tested and supported use case of this config option is to deploy an app connector on
+                                    Kubernetes to access SaaS applications available on the public internet. Using the app connector to expose
+                                    cluster workloads or other internal workloads to tailnet might work, but this is not a use case that we have
+                                    tested or optimised for.
+                                    If you are using the app connector to access SaaS applications because you need a predictable egress IP that
+                                    can be whitelisted, it is also your responsibility to ensure that cluster traffic from the connector flows
+                                    via that predictable IP, for example by enforcing that cluster egress traffic is routed via an egress NAT
+                                    device with a static IP address.
+                                    https://tailscale.com/kb/1281/app-connectors
+                                properties:
+                                    routes:
+                                        description: |-
+                                            Routes are optional preconfigured routes for the domains routed via the app connector.
+                                            If not set, routes for the domains will be discovered dynamically.
+                                            If set, the app connector will immediately be able to route traffic using the preconfigured routes, but may
+                                            also dynamically discover other routes.
+                                            https://tailscale.com/kb/1332/apps-best-practices#preconfiguration
+                                        items:
+                                            format: cidr
+                                            type: string
+                                        minItems: 1
+                                        type: array
+                                type: object
                             exitNode:
                                 description: |-
-                                    ExitNode defines whether the Connector node should act as a
-                                    Tailscale exit node. Defaults to false.
+                                    ExitNode defines whether the Connector device should act as a Tailscale exit node. Defaults to false.
+                                    This field is mutually exclusive with the appConnector field.
                                     https://tailscale.com/kb/1103/exit-nodes
                                 type: boolean
                             hostname:
@@ -115,9 +149,11 @@ spec:
                                 type: string
                             subnetRouter:
                                 description: |-
-                                    SubnetRouter defines subnet routes that the Connector node should
-                                    expose to tailnet. If unset, none are exposed.
+                                    SubnetRouter defines subnet routes that the Connector device should
+                                    expose to tailnet as a Tailscale subnet router.
                                     https://tailscale.com/kb/1019/subnets/
+                                    If this field is unset, the device does not get configured as a Tailscale subnet router.
+                                    This field is mutually exclusive with the appConnector field.
                                 properties:
                                     advertiseRoutes:
                                         description: |-
@@ -151,8 +187,10 @@ spec:
                                 type: array
                         type: object
                         x-kubernetes-validations:
-                            - message: A Connector needs to be either an exit node or a subnet router, or both.
-                              rule: has(self.subnetRouter) || self.exitNode == true
+                            - message: A Connector needs to have at least one of exit node, subnet router or app connector configured.
+                              rule: has(self.subnetRouter) || (has(self.exitNode) && self.exitNode == true) || has(self.appConnector)
+                            - message: The appConnector field is mutually exclusive with exitNode and subnetRouter fields.
+                              rule: '!((has(self.subnetRouter) || (has(self.exitNode)  && self.exitNode == true)) && has(self.appConnector))'
                     status:
                         description: |-
                             ConnectorStatus describes the status of the Connector. This is set
@@ -225,6 +263,9 @@ spec:
                                     If MagicDNS is enabled in your tailnet, it is the MagicDNS name of the
                                     node.
                                 type: string
+                            isAppConnector:
+                                description: IsAppConnector is set to true if the Connector acts as an app connector.
+                                type: boolean
                             isExitNode:
                                 description: IsExitNode is set to true if the Connector acts as an exit node.
                                 type: boolean
@@ -499,12 +540,38 @@ spec:
                                     enable:
                                         description: |-
                                             Setting enable to true will make the proxy serve Tailscale metrics
-                                            at <pod-ip>:9001/debug/metrics.
+                                            at <pod-ip>:9002/metrics.
+                                            A metrics Service named <proxy-statefulset>-metrics will also be created in the operator's namespace and will
+                                            serve the metrics at <service-ip>:9002/metrics.
+
+                                            In 1.78.x and 1.80.x, this field also serves as the default value for
+                                            .spec.statefulSet.pod.tailscaleContainer.debug.enable. From 1.82.0, both
+                                            fields will independently default to false.
+
                                             Defaults to false.
                                         type: boolean
+                                    serviceMonitor:
+                                        description: |-
+                                            Enable to create a Prometheus ServiceMonitor for scraping the proxy's Tailscale metrics.
+                                            The ServiceMonitor will select the metrics Service that gets created when metrics are enabled.
+                                            The ingested metrics for each Service monitor will have labels to identify the proxy:
+                                            ts_proxy_type: ingress_service|ingress_resource|connector|proxygroup
+                                            ts_proxy_parent_name: name of the parent resource (i.e name of the Connector, Tailscale Ingress, Tailscale Service or ProxyGroup)
+                                            ts_proxy_parent_namespace: namespace of the parent resource (if the parent resource is not cluster scoped)
+                                            job: ts_<proxy type>_[<parent namespace>]_<parent_name>
+                                        properties:
+                                            enable:
+                                                description: If Enable is set to true, a Prometheus ServiceMonitor will be created. Enable can only be set to true if metrics are enabled.
+                                                type: boolean
+                                        required:
+                                            - enable
+                                        type: object
                                 required:
                                     - enable
                                 type: object
+                                x-kubernetes-validations:
+                                    - message: ServiceMonitor can only be enabled if metrics are enabled
+                                      rule: '!(has(self.serviceMonitor) && self.serviceMonitor.enable  && !self.enable)'
                             statefulSet:
                                 description: |-
                                     Configuration parameters for the proxy's StatefulSet. Tailscale
@@ -1675,6 +1742,25 @@ spec:
                                             tailscaleContainer:
                                                 description: Configuration for the proxy container running tailscale.
                                                 properties:
+                                                    debug:
+                                                        description: |-
+                                                            Configuration for enabling extra debug information in the container.
+                                                            Not recommended for production use.
+                                                        properties:
+                                                            enable:
+                                                                description: |-
+                                                                    Enable tailscaled's HTTP pprof endpoints at <pod-ip>:9001/debug/pprof/
+                                                                    and internal debug metrics endpoint at <pod-ip>:9001/debug/metrics, where
+                                                                    9001 is a container port named "debug". The endpoints and their responses
+                                                                    may change in backwards incompatible ways in the future, and should not
+                                                                    be considered stable.
+
+                                                                    In 1.78.x and 1.80.x, this setting will default to the value of
+                                                                    .spec.metrics.enable, and requests to the "metrics" port matching the
+                                                                    mux pattern /debug/ will be forwarded to the "debug" port. In 1.82.x,
+                                                                    this setting will default to false, and no requests will be proxied.
+                                                                type: boolean
+                                                        type: object
                                                     env:
                                                         description: |-
                                                             List of environment variables to set in the container.
@@ -1786,11 +1872,12 @@ spec:
                                                     securityContext:
                                                         description: |-
                                                             Container security context.
-                                                            Security context specified here will override the security context by the operator.
-                                                            By default the operator:
-                                                            - sets 'privileged: true' for the init container
-                                                            - set NET_ADMIN capability for tailscale container for proxies that
-                                                            are created for Services or Connector.
+                                                            Security context specified here will override the security context set by the operator.
+                                                            By default the operator sets the Tailscale container and the Tailscale init container to privileged
+                                                            for proxies created for Tailscale ingress and egress Service, Connector and ProxyGroup.
+                                                            You can reduce the permissions of the Tailscale container to cap NET_ADMIN by
+                                                            installing device plugin in your cluster and configuring the proxies tun device to be created
+                                                            by the device plugin, see  https://github.com/tailscale/tailscale/issues/10814#issuecomment-2479977752
                                                             https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#security-context
                                                         properties:
                                                             allowPrivilegeEscalation:
@@ -1979,6 +2066,25 @@ spec:
                                             tailscaleInitContainer:
                                                 description: Configuration for the proxy init container that enables forwarding.
                                                 properties:
+                                                    debug:
+                                                        description: |-
+                                                            Configuration for enabling extra debug information in the container.
+                                                            Not recommended for production use.
+                                                        properties:
+                                                            enable:
+                                                                description: |-
+                                                                    Enable tailscaled's HTTP pprof endpoints at <pod-ip>:9001/debug/pprof/
+                                                                    and internal debug metrics endpoint at <pod-ip>:9001/debug/metrics, where
+                                                                    9001 is a container port named "debug". The endpoints and their responses
+                                                                    may change in backwards incompatible ways in the future, and should not
+                                                                    be considered stable.
+
+                                                                    In 1.78.x and 1.80.x, this setting will default to the value of
+                                                                    .spec.metrics.enable, and requests to the "metrics" port matching the
+                                                                    mux pattern /debug/ will be forwarded to the "debug" port. In 1.82.x,
+                                                                    this setting will default to false, and no requests will be proxied.
+                                                                type: boolean
+                                                        type: object
                                                     env:
                                                         description: |-
                                                             List of environment variables to set in the container.
@@ -2090,11 +2196,12 @@ spec:
                                                     securityContext:
                                                         description: |-
                                                             Container security context.
-                                                            Security context specified here will override the security context by the operator.
-                                                            By default the operator:
-                                                            - sets 'privileged: true' for the init container
-                                                            - set NET_ADMIN capability for tailscale container for proxies that
-                                                            are created for Services or Connector.
+                                                            Security context specified here will override the security context set by the operator.
+                                                            By default the operator sets the Tailscale container and the Tailscale init container to privileged
+                                                            for proxies created for Tailscale ingress and egress Service, Connector and ProxyGroup.
+                                                            You can reduce the permissions of the Tailscale container to cap NET_ADMIN by
+                                                            installing device plugin in your cluster and configuring the proxies tun device to be created
+                                                            by the device plugin, see  https://github.com/tailscale/tailscale/issues/10814#issuecomment-2479977752
                                                             https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#security-context
                                                         properties:
                                                             allowPrivilegeEscalation:
@@ -2321,6 +2428,182 @@ spec:
                                                                 Value is the taint value the toleration matches to.
                                                                 If the operator is Exists, the value should be empty, otherwise just a regular string.
                                                             type: string
+                                                    type: object
+                                                type: array
+                                            topologySpreadConstraints:
+                                                description: |-
+                                                    Proxy Pod's topology spread constraints.
+                                                    By default Tailscale Kubernetes operator does not apply any topology spread constraints.
+                                                    https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/
+                                                items:
+                                                    description: TopologySpreadConstraint specifies how to spread matching pods among the given topology.
+                                                    properties:
+                                                        labelSelector:
+                                                            description: |-
+                                                                LabelSelector is used to find matching pods.
+                                                                Pods that match this label selector are counted to determine the number of pods
+                                                                in their corresponding topology domain.
+                                                            properties:
+                                                                matchExpressions:
+                                                                    description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                                                    items:
+                                                                        description: |-
+                                                                            A label selector requirement is a selector that contains values, a key, and an operator that
+                                                                            relates the key and values.
+                                                                        properties:
+                                                                            key:
+                                                                                description: key is the label key that the selector applies to.
+                                                                                type: string
+                                                                            operator:
+                                                                                description: |-
+                                                                                    operator represents a key's relationship to a set of values.
+                                                                                    Valid operators are In, NotIn, Exists and DoesNotExist.
+                                                                                type: string
+                                                                            values:
+                                                                                description: |-
+                                                                                    values is an array of string values. If the operator is In or NotIn,
+                                                                                    the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                                                                    the values array must be empty. This array is replaced during a strategic
+                                                                                    merge patch.
+                                                                                items:
+                                                                                    type: string
+                                                                                type: array
+                                                                                x-kubernetes-list-type: atomic
+                                                                        required:
+                                                                            - key
+                                                                            - operator
+                                                                        type: object
+                                                                    type: array
+                                                                    x-kubernetes-list-type: atomic
+                                                                matchLabels:
+                                                                    additionalProperties:
+                                                                        type: string
+                                                                    description: |-
+                                                                        matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                                                        map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                                                        operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                                                    type: object
+                                                            type: object
+                                                            x-kubernetes-map-type: atomic
+                                                        matchLabelKeys:
+                                                            description: |-
+                                                                MatchLabelKeys is a set of pod label keys to select the pods over which
+                                                                spreading will be calculated. The keys are used to lookup values from the
+                                                                incoming pod labels, those key-value labels are ANDed with labelSelector
+                                                                to select the group of existing pods over which spreading will be calculated
+                                                                for the incoming pod. The same key is forbidden to exist in both MatchLabelKeys and LabelSelector.
+                                                                MatchLabelKeys cannot be set when LabelSelector isn't set.
+                                                                Keys that don't exist in the incoming pod labels will
+                                                                be ignored. A null or empty list means only match against labelSelector.
+
+                                                                This is a beta field and requires the MatchLabelKeysInPodTopologySpread feature gate to be enabled (enabled by default).
+                                                            items:
+                                                                type: string
+                                                            type: array
+                                                            x-kubernetes-list-type: atomic
+                                                        maxSkew:
+                                                            description: |-
+                                                                MaxSkew describes the degree to which pods may be unevenly distributed.
+                                                                When `whenUnsatisfiable=DoNotSchedule`, it is the maximum permitted difference
+                                                                between the number of matching pods in the target topology and the global minimum.
+                                                                The global minimum is the minimum number of matching pods in an eligible domain
+                                                                or zero if the number of eligible domains is less than MinDomains.
+                                                                For example, in a 3-zone cluster, MaxSkew is set to 1, and pods with the same
+                                                                labelSelector spread as 2/2/1:
+                                                                In this case, the global minimum is 1.
+                                                                | zone1 | zone2 | zone3 |
+                                                                |  P P  |  P P  |   P   |
+                                                                - if MaxSkew is 1, incoming pod can only be scheduled to zone3 to become 2/2/2;
+                                                                scheduling it onto zone1(zone2) would make the ActualSkew(3-1) on zone1(zone2)
+                                                                violate MaxSkew(1).
+                                                                - if MaxSkew is 2, incoming pod can be scheduled onto any zone.
+                                                                When `whenUnsatisfiable=ScheduleAnyway`, it is used to give higher precedence
+                                                                to topologies that satisfy it.
+                                                                It's a required field. Default value is 1 and 0 is not allowed.
+                                                            format: int32
+                                                            type: integer
+                                                        minDomains:
+                                                            description: |-
+                                                                MinDomains indicates a minimum number of eligible domains.
+                                                                When the number of eligible domains with matching topology keys is less than minDomains,
+                                                                Pod Topology Spread treats "global minimum" as 0, and then the calculation of Skew is performed.
+                                                                And when the number of eligible domains with matching topology keys equals or greater than minDomains,
+                                                                this value has no effect on scheduling.
+                                                                As a result, when the number of eligible domains is less than minDomains,
+                                                                scheduler won't schedule more than maxSkew Pods to those domains.
+                                                                If value is nil, the constraint behaves as if MinDomains is equal to 1.
+                                                                Valid values are integers greater than 0.
+                                                                When value is not nil, WhenUnsatisfiable must be DoNotSchedule.
+
+                                                                For example, in a 3-zone cluster, MaxSkew is set to 2, MinDomains is set to 5 and pods with the same
+                                                                labelSelector spread as 2/2/2:
+                                                                | zone1 | zone2 | zone3 |
+                                                                |  P P  |  P P  |  P P  |
+                                                                The number of domains is less than 5(MinDomains), so "global minimum" is treated as 0.
+                                                                In this situation, new pod with the same labelSelector cannot be scheduled,
+                                                                because computed skew will be 3(3 - 0) if new Pod is scheduled to any of the three zones,
+                                                                it will violate MaxSkew.
+                                                            format: int32
+                                                            type: integer
+                                                        nodeAffinityPolicy:
+                                                            description: |-
+                                                                NodeAffinityPolicy indicates how we will treat Pod's nodeAffinity/nodeSelector
+                                                                when calculating pod topology spread skew. Options are:
+                                                                - Honor: only nodes matching nodeAffinity/nodeSelector are included in the calculations.
+                                                                - Ignore: nodeAffinity/nodeSelector are ignored. All nodes are included in the calculations.
+
+                                                                If this value is nil, the behavior is equivalent to the Honor policy.
+                                                                This is a beta-level feature default enabled by the NodeInclusionPolicyInPodTopologySpread feature flag.
+                                                            type: string
+                                                        nodeTaintsPolicy:
+                                                            description: |-
+                                                                NodeTaintsPolicy indicates how we will treat node taints when calculating
+                                                                pod topology spread skew. Options are:
+                                                                - Honor: nodes without taints, along with tainted nodes for which the incoming pod
+                                                                has a toleration, are included.
+                                                                - Ignore: node taints are ignored. All nodes are included.
+
+                                                                If this value is nil, the behavior is equivalent to the Ignore policy.
+                                                                This is a beta-level feature default enabled by the NodeInclusionPolicyInPodTopologySpread feature flag.
+                                                            type: string
+                                                        topologyKey:
+                                                            description: |-
+                                                                TopologyKey is the key of node labels. Nodes that have a label with this key
+                                                                and identical values are considered to be in the same topology.
+                                                                We consider each <key, value> as a "bucket", and try to put balanced number
+                                                                of pods into each bucket.
+                                                                We define a domain as a particular instance of a topology.
+                                                                Also, we define an eligible domain as a domain whose nodes meet the requirements of
+                                                                nodeAffinityPolicy and nodeTaintsPolicy.
+                                                                e.g. If TopologyKey is "kubernetes.io/hostname", each Node is a domain of that topology.
+                                                                And, if TopologyKey is "topology.kubernetes.io/zone", each zone is a domain of that topology.
+                                                                It's a required field.
+                                                            type: string
+                                                        whenUnsatisfiable:
+                                                            description: |-
+                                                                WhenUnsatisfiable indicates how to deal with a pod if it doesn't satisfy
+                                                                the spread constraint.
+                                                                - DoNotSchedule (default) tells the scheduler not to schedule it.
+                                                                - ScheduleAnyway tells the scheduler to schedule the pod in any location,
+                                                                  but giving higher precedence to topologies that would help reduce the
+                                                                  skew.
+                                                                A constraint is considered "Unsatisfiable" for an incoming pod
+                                                                if and only if every possible node assignment for that pod would violate
+                                                                "MaxSkew" on some topology.
+                                                                For example, in a 3-zone cluster, MaxSkew is set to 1, and pods with the same
+                                                                labelSelector spread as 3/1/1:
+                                                                | zone1 | zone2 | zone3 |
+                                                                | P P P |   P   |   P   |
+                                                                If WhenUnsatisfiable is set to DoNotSchedule, incoming pod can only be scheduled
+                                                                to zone2(zone3) to become 3/2/1(3/1/2) as ActualSkew(2-1) on zone2(zone3) satisfies
+                                                                MaxSkew(1). In other words, the cluster can still be imbalanced, but scheduler
+                                                                won't make it *more* imbalanced.
+                                                                It's a required field.
+                                                            type: string
+                                                    required:
+                                                        - maxSkew
+                                                        - topologyKey
+                                                        - whenUnsatisfiable
                                                     type: object
                                                 type: array
                                         type: object
@@ -4386,6 +4669,16 @@ rules:
         - list
         - watch
         - update
+    - apiGroups:
+        - apiextensions.k8s.io
+      resourceNames:
+        - servicemonitors.monitoring.coreos.com
+      resources:
+        - customresourcedefinitions
+      verbs:
+        - get
+        - list
+        - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -4466,6 +4759,16 @@ rules:
         - update
         - list
         - watch
+    - apiGroups:
+        - monitoring.coreos.com
+      resources:
+        - servicemonitors
+      verbs:
+        - get
+        - list
+        - update
+        - create
+        - delete
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -4486,6 +4789,14 @@ rules:
         - patch
         - update
         - watch
+    - apiGroups:
+        - ""
+      resources:
+        - events
+      verbs:
+        - create
+        - patch
+        - get
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -4558,6 +4869,14 @@ spec:
                       value: "false"
                     - name: PROXY_FIREWALL_MODE
                       value: auto
+                    - name: POD_NAME
+                      valueFrom:
+                        fieldRef:
+                            fieldPath: metadata.name
+                    - name: POD_UID
+                      valueFrom:
+                        fieldRef:
+                            fieldPath: metadata.uid
                   image: tailscale/k8s-operator:unstable
                   imagePullPolicy: Always
                   name: operator

@@ -28,6 +28,9 @@ func newTestClient(t testing.TB) *Client {
 	c := &Client{
 		NetMon: netmon.NewStatic(),
 		Logf:   t.Logf,
+		TimeNow: func() time.Time {
+			return time.Unix(1729624521, 0)
+		},
 	}
 	return c
 }
@@ -38,7 +41,7 @@ func TestBasic(t *testing.T) {
 
 	c := newTestClient(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	if err := c.Standalone(ctx, "127.0.0.1:0"); err != nil {
@@ -51,6 +54,9 @@ func TestBasic(t *testing.T) {
 	}
 	if !r.UDP {
 		t.Error("want UDP")
+	}
+	if r.Now.IsZero() {
+		t.Error("Now is zero")
 	}
 	if len(r.RegionLatency) != 1 {
 		t.Errorf("expected 1 key in DERPLatency; got %+v", r.RegionLatency)
@@ -117,7 +123,7 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 
 	c := newTestClient(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	r, err := c.GetReport(ctx, dm, nil)
@@ -129,6 +135,14 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 	r.PCP = ""
 
 	want := newReport()
+
+	// The Now field can't be compared with reflect.DeepEqual; check using
+	// the Equal method and then overwrite it so that the comparison below
+	// succeeds.
+	if !r.Now.Equal(c.TimeNow()) {
+		t.Errorf("Now = %v; want %v", r.Now, c.TimeNow())
+	}
+	want.Now = r.Now
 
 	// The IPv4CanSend flag gets set differently across platforms.
 	// On Windows this test detects false, while on Linux detects true.
@@ -187,6 +201,7 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 		steps       []step
 		homeParams  *tailcfg.DERPHomeParams
 		opts        *GetReportOpts
+		forcedDERP  int // if non-zero, force this DERP to be the preferred one
 		wantDERP    int // want PreferredDERP on final step
 		wantPrevLen int // wanted len(c.prev)
 	}{
@@ -343,12 +358,74 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 			wantPrevLen: 3,
 			wantDERP:    2, // moved to d2 since d1 is gone
 		},
+		{
+			name: "preferred_derp_hysteresis_no_switch_pct",
+			steps: []step{
+				{0 * time.Second, report("d1", 34*time.Millisecond, "d2", 35*time.Millisecond)},
+				{1 * time.Second, report("d1", 34*time.Millisecond, "d2", 23*time.Millisecond)},
+			},
+			wantPrevLen: 2,
+			wantDERP:    1, // diff is 11ms, but d2 is greater than 2/3s of d1
+		},
+		{
+			name: "forced_two",
+			steps: []step{
+				{time.Second, report("d1", 2, "d2", 3)},
+				{2 * time.Second, report("d1", 4, "d2", 3)},
+			},
+			forcedDERP:  2,
+			wantPrevLen: 2,
+			wantDERP:    2,
+		},
+		{
+			name: "forced_two_unavailable",
+			steps: []step{
+				{time.Second, report("d1", 2, "d2", 1)},
+				{2 * time.Second, report("d1", 4)},
+			},
+			forcedDERP:  2,
+			wantPrevLen: 2,
+			wantDERP:    1,
+		},
+		{
+			name: "forced_two_no_probe_recent_activity",
+			steps: []step{
+				{time.Second, report("d1", 2)},
+				{2 * time.Second, report("d1", 4)},
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
+					1: startTime,
+					2: startTime.Add(time.Second),
+				}),
+			},
+			forcedDERP:  2,
+			wantPrevLen: 2,
+			wantDERP:    2,
+		},
+		{
+			name: "forced_two_no_probe_no_recent_activity",
+			steps: []step{
+				{time.Second, report("d1", 2)},
+				{PreferredDERPFrameTime + time.Second, report("d1", 4)},
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
+					1: startTime,
+					2: startTime,
+				}),
+			},
+			forcedDERP:  2,
+			wantPrevLen: 2,
+			wantDERP:    1,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fakeTime := startTime
 			c := &Client{
-				TimeNow: func() time.Time { return fakeTime },
+				TimeNow:            func() time.Time { return fakeTime },
+				ForcePreferredDERP: tt.forcedDERP,
 			}
 			dm := &tailcfg.DERPMap{HomeParams: tt.homeParams}
 			rs := &reportState{
@@ -864,8 +941,8 @@ func TestNodeAddrResolve(t *testing.T) {
 			c.UseDNSCache = tt
 
 			t.Run("IPv4", func(t *testing.T) {
-				ap := c.nodeAddr(ctx, dn, probeIPv4)
-				if !ap.IsValid() {
+				ap, ok := c.nodeAddrPort(ctx, dn, dn.STUNPort, probeIPv4)
+				if !ok {
 					t.Fatal("expected valid AddrPort")
 				}
 				if !ap.Addr().Is4() {
@@ -879,8 +956,8 @@ func TestNodeAddrResolve(t *testing.T) {
 					t.Skipf("IPv6 may not work on this machine")
 				}
 
-				ap := c.nodeAddr(ctx, dn, probeIPv6)
-				if !ap.IsValid() {
+				ap, ok := c.nodeAddrPort(ctx, dn, dn.STUNPort, probeIPv6)
+				if !ok {
 					t.Fatal("expected valid AddrPort")
 				}
 				if !ap.Addr().Is6() {
@@ -889,8 +966,8 @@ func TestNodeAddrResolve(t *testing.T) {
 				t.Logf("got IPv6 addr: %v", ap)
 			})
 			t.Run("IPv6 Failure", func(t *testing.T) {
-				ap := c.nodeAddr(ctx, dnV4Only, probeIPv6)
-				if ap.IsValid() {
+				ap, ok := c.nodeAddrPort(ctx, dnV4Only, dn.STUNPort, probeIPv6)
+				if ok {
 					t.Fatalf("expected no addr but got: %v", ap)
 				}
 				t.Logf("correctly got invalid addr")
@@ -908,5 +985,32 @@ func TestReportTimeouts(t *testing.T) {
 	}
 	if ReportTimeout < httpsProbeTimeout {
 		t.Errorf("ReportTimeout (%v) cannot be less than httpsProbeTimeout (%v)", ReportTimeout, httpsProbeTimeout)
+	}
+}
+
+func TestNoUDPNilGetReportOpts(t *testing.T) {
+	blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to open blackhole STUN listener: %v", err)
+	}
+	defer blackhole.Close()
+
+	dm := stuntest.DERPMapOf(blackhole.LocalAddr().String())
+	for _, region := range dm.Regions {
+		for _, n := range region.Nodes {
+			n.STUNOnly = false // exercise ICMP & HTTPS probing
+		}
+	}
+
+	c := newTestClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r, err := c.GetReport(ctx, dm, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.UDP {
+		t.Fatal("unexpected working UDP")
 	}
 }

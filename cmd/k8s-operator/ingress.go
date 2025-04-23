@@ -76,7 +76,15 @@ func (a *IngressReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return reconcile.Result{}, a.maybeCleanup(ctx, logger, ing)
 	}
 
-	return reconcile.Result{}, a.maybeProvision(ctx, logger, ing)
+	if err := a.maybeProvision(ctx, logger, ing); err != nil {
+		if strings.Contains(err.Error(), optimisticLockErrorMsg) {
+			logger.Infof("optimistic lock error, retrying: %s", err)
+		} else {
+			return reconcile.Result{}, err
+		}
+	}
+
+	return reconcile.Result{}, nil
 }
 
 func (a *IngressReconciler) maybeCleanup(ctx context.Context, logger *zap.SugaredLogger, ing *networkingv1.Ingress) error {
@@ -90,7 +98,7 @@ func (a *IngressReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 		return nil
 	}
 
-	if done, err := a.ssr.Cleanup(ctx, logger, childResourceLabels(ing.Name, ing.Namespace, "ingress")); err != nil {
+	if done, err := a.ssr.Cleanup(ctx, logger, childResourceLabels(ing.Name, ing.Namespace, "ingress"), proxyTypeIngressResource); err != nil {
 		return fmt.Errorf("failed to cleanup: %w", err)
 	} else if !done {
 		logger.Debugf("cleanup not done yet, waiting for next reconcile")
@@ -268,6 +276,7 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		Tags:                tags,
 		ChildResourceLabels: crl,
 		ProxyClassName:      proxyClass,
+		proxyType:           proxyTypeIngressResource,
 	}
 
 	if val := ing.GetAnnotations()[AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy]; val == "true" {
@@ -278,12 +287,12 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return fmt.Errorf("failed to provision: %w", err)
 	}
 
-	_, tsHost, _, err := a.ssr.DeviceInfo(ctx, crl)
+	dev, err := a.ssr.DeviceInfo(ctx, crl, logger)
 	if err != nil {
-		return fmt.Errorf("failed to get device ID: %w", err)
+		return fmt.Errorf("failed to retrieve Ingress HTTPS endpoint status: %w", err)
 	}
-	if tsHost == "" {
-		logger.Debugf("no Tailscale hostname known yet, waiting for proxy pod to finish auth")
+	if dev == nil || dev.ingressDNSName == "" {
+		logger.Debugf("no Ingress DNS name known yet, waiting for proxy Pod initialize and start serving Ingress")
 		// No hostname yet. Wait for the proxy pod to auth.
 		ing.Status.LoadBalancer.Ingress = nil
 		if err := a.Status().Update(ctx, ing); err != nil {
@@ -292,10 +301,10 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return nil
 	}
 
-	logger.Debugf("setting ingress hostname to %q", tsHost)
+	logger.Debugf("setting Ingress hostname to %q", dev.ingressDNSName)
 	ing.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{
 		{
-			Hostname: tsHost,
+			Hostname: dev.ingressDNSName,
 			Ports: []networkingv1.IngressPortStatus{
 				{
 					Protocol: "TCP",

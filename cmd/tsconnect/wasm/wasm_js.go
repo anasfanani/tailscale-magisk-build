@@ -108,13 +108,14 @@ func newIPN(jsConfig js.Value) map[string]any {
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
 		HealthTracker: sys.HealthTracker(),
+		Metrics:       sys.UserMetricsRegistry(),
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	sys.Set(eng)
 
-	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), dialer, sys.DNSManager.Get(), sys.ProxyMapper(), nil)
+	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), dialer, sys.DNSManager.Get(), sys.ProxyMapper())
 	if err != nil {
 		log.Fatalf("netstack.Create: %v", err)
 	}
@@ -127,6 +128,9 @@ func newIPN(jsConfig js.Value) map[string]any {
 	}
 	dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		return ns.DialContextTCP(ctx, dst)
+	}
+	dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+		return ns.DialContextUDP(ctx, dst)
 	}
 	sys.NetstackRouter.Set(true)
 	sys.Tun.Get().Start()
@@ -268,8 +272,8 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 						name = p.Hostinfo().Hostname()
 					}
 					addrs := make([]string, p.Addresses().Len())
-					for i := range p.Addresses().Len() {
-						addrs[i] = p.Addresses().At(i).Addr().String()
+					for i, ap := range p.Addresses().All() {
+						addrs[i] = ap.Addr().String()
 					}
 					return jsNetMapPeerNode{
 						jsNetMapNode: jsNetMapNode{
@@ -585,8 +589,8 @@ func mapSlice[T any, M any](a []T, f func(T) M) []M {
 
 func mapSliceView[T any, M any](a views.Slice[T], f func(T) M) []M {
 	n := make([]M, a.Len())
-	for i := range a.Len() {
-		n[i] = f(a.At(i))
+	for i, v := range a.All() {
+		n[i] = f(v)
 	}
 	return n
 }

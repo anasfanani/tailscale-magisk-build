@@ -313,6 +313,9 @@ func (c *Client) preferIPv6() bool {
 var dialWebsocketFunc func(ctx context.Context, urlStr string) (net.Conn, error)
 
 func useWebsockets() bool {
+	if !canWebsockets {
+		return false
+	}
 	if runtime.GOOS == "js" {
 		return true
 	}
@@ -383,7 +386,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	var node *tailcfg.DERPNode // nil when using c.url to dial
 	var idealNodeInRegion bool
 	switch {
-	case useWebsockets():
+	case canWebsockets && useWebsockets():
 		var urlStr string
 		if c.url != nil {
 			urlStr = c.url.String()
@@ -498,7 +501,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	req.Header.Set("Connection", "Upgrade")
 	if !idealNodeInRegion && reg != nil {
 		// This is purely informative for now (2024-07-06) for stats:
-		req.Header.Set("Ideal-Node", reg.Nodes[0].Name)
+		req.Header.Set(derp.IdealNodeHeader, reg.Nodes[0].Name)
 		// TODO(bradfitz,raggi): start a time.AfterFunc for 30m-1h or so to
 		// dialNode(reg.Nodes[0]) and see if we can even TCP connect to it. If
 		// so, TLS handshake it as well (which is mixed up in this massive

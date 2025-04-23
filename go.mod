@@ -46,7 +46,7 @@ require (
 	github.com/golang/snappy v0.0.4
 	github.com/golangci/golangci-lint v1.57.1
 	github.com/google/go-cmp v0.6.0
-	github.com/google/go-containerregistry v0.18.0
+	github.com/google/go-containerregistry v0.20.2
 	github.com/google/gopacket v1.1.19
 	github.com/google/nftables v0.2.1-0.20240414091927-5e242ec57806
 	github.com/google/uuid v1.6.0
@@ -59,7 +59,7 @@ require (
 	github.com/josharian/native v1.1.1-0.20230202152459-5c7d0dd6ab86
 	github.com/jsimonetti/rtnetlink v1.4.0
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
-	github.com/klauspost/compress v1.17.4
+	github.com/klauspost/compress v1.17.11
 	github.com/kortschak/wol v0.0.0-20200729010619-da482cc4850a
 	github.com/mattn/go-colorable v0.1.13
 	github.com/mattn/go-isatty v0.0.20
@@ -84,12 +84,12 @@ require (
 	github.com/tailscale/golang-x-crypto v0.0.0-20240604161659-3fde5e568aa4
 	github.com/tailscale/goupnp v1.0.1-0.20210804011211-c64d0f06ea05
 	github.com/tailscale/hujson v0.0.0-20221223112325-20486734a56a
-	github.com/tailscale/mkctr v0.0.0-20240628074852-17ca944da6ba
+	github.com/tailscale/mkctr v0.0.0-20241111153353-1a38f6676f10
 	github.com/tailscale/netlink v1.1.1-0.20240822203006-4d49adab4de7
 	github.com/tailscale/peercred v0.0.0-20240214030740-b535050b2aa4
 	github.com/tailscale/web-client-prebuilt v0.0.0-20240226180453-5db17b287bf1
 	github.com/tailscale/wf v0.0.0-20240214030419-6fbb0a674ee6
-	github.com/tailscale/wireguard-go v0.0.0-20240905161824-799c1978fafc
+	github.com/tailscale/wireguard-go v0.0.0-20241113014420-4e883d38c8d3
 	github.com/tailscale/xnet v0.0.0-20240729143630-8497ac4dab2e
 	github.com/tc-hib/winres v0.2.1
 	github.com/tcnksm/go-httpstat v0.2.0
@@ -100,14 +100,14 @@ require (
 	go.uber.org/zap v1.27.0
 	go4.org/mem v0.0.0-20220726221520-4f986261bf13
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
-	golang.org/x/crypto v0.25.0
+	golang.org/x/crypto v0.30.0
 	golang.org/x/exp v0.0.0-20240119083558-1b970713d09a
 	golang.org/x/mod v0.19.0
-	golang.org/x/net v0.27.0
+	golang.org/x/net v0.32.0
 	golang.org/x/oauth2 v0.16.0
-	golang.org/x/sync v0.7.0
-	golang.org/x/sys v0.22.0
-	golang.org/x/term v0.22.0
+	golang.org/x/sync v0.10.0
+	golang.org/x/sys v0.28.0
+	golang.org/x/term v0.27.0
 	golang.org/x/time v0.5.0
 	golang.org/x/tools v0.23.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
@@ -130,7 +130,7 @@ require (
 	github.com/Antonboom/testifylint v1.2.0 // indirect
 	github.com/GaijinEntertainment/go-exhaustruct/v3 v3.2.0 // indirect
 	github.com/Masterminds/sprig v2.22.0+incompatible // indirect
-	github.com/Microsoft/go-winio v0.6.1 // indirect
+	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/OpenPeeDeeP/depguard/v2 v2.2.0 // indirect
 	github.com/alecthomas/go-check-sumtype v0.1.4 // indirect
 	github.com/alexkohler/nakedret/v2 v2.0.4 // indirect
@@ -143,7 +143,7 @@ require (
 	github.com/cyphar/filepath-securejoin v0.2.4 // indirect
 	github.com/dave/astrid v0.0.0-20170323122508-8c2895878b14 // indirect
 	github.com/dave/brenda v1.1.0 // indirect
-	github.com/docker/go-connections v0.4.0 // indirect
+	github.com/docker/go-connections v0.5.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/ghostiam/protogetter v0.3.5 // indirect
@@ -165,10 +165,10 @@ require (
 	github.com/ykadowak/zerologlint v0.1.5 // indirect
 	go-simpler.org/musttag v0.9.0 // indirect
 	go-simpler.org/sloglint v0.5.0 // indirect
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.47.0 // indirect
-	go.opentelemetry.io/otel v1.22.0 // indirect
-	go.opentelemetry.io/otel/metric v1.22.0 // indirect
-	go.opentelemetry.io/otel/trace v1.22.0 // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.57.0 // indirect
+	go.opentelemetry.io/otel v1.32.0 // indirect
+	go.opentelemetry.io/otel/metric v1.32.0 // indirect
+	go.opentelemetry.io/otel/trace v1.32.0 // indirect
 	go.uber.org/automaxprocs v1.5.3 // indirect
 	golang.org/x/xerrors v0.0.0-20240716161551-93cc26a95ae9 // indirect
 )
@@ -225,10 +225,10 @@ require (
 	github.com/daixiang0/gci v0.12.3 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/denis-tingaikin/go-header v0.5.0 // indirect
-	github.com/docker/cli v25.0.0+incompatible // indirect
+	github.com/docker/cli v27.3.1+incompatible // indirect
 	github.com/docker/distribution v2.8.3+incompatible // indirect
-	github.com/docker/docker v26.1.4+incompatible // indirect
-	github.com/docker/docker-credential-helpers v0.8.1 // indirect
+	github.com/docker/docker v27.3.1+incompatible // indirect
+	github.com/docker/docker-credential-helpers v0.8.2 // indirect
 	github.com/emicklei/go-restful/v3 v3.11.2 // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
 	github.com/ettle/strcase v0.2.0 // indirect
@@ -327,7 +327,7 @@ require (
 	github.com/nunnatsa/ginkgolinter v0.16.1 // indirect
 	github.com/olekukonko/tablewriter v0.0.5 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
-	github.com/opencontainers/image-spec v1.1.0-rc6 // indirect
+	github.com/opencontainers/image-spec v1.1.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/pjbgf/sha1cd v0.3.0 // indirect
@@ -381,7 +381,7 @@ require (
 	github.com/ultraware/funlen v0.1.0 // indirect
 	github.com/ultraware/whitespace v0.1.0 // indirect
 	github.com/uudashr/gocognit v1.1.2 // indirect
-	github.com/vbatts/tar-split v0.11.5 // indirect
+	github.com/vbatts/tar-split v0.11.6 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
 	github.com/yagipy/maintidx v1.0.0 // indirect
@@ -391,7 +391,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20240314144324-c7f7c6466f7f // indirect
 	golang.org/x/image v0.18.0 // indirect
-	golang.org/x/text v0.16.0 // indirect
+	golang.org/x/text v0.21.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
 	google.golang.org/appengine v1.6.8 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
@@ -401,7 +401,7 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1
 	howett.net/plist v1.0.0 // indirect
-	k8s.io/apiextensions-apiserver v0.30.3 // indirect
+	k8s.io/apiextensions-apiserver v0.30.3
 	k8s.io/klog/v2 v2.130.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20240228011516-70dd3763d340 // indirect
 	k8s.io/utils v0.0.0-20240711033017-18e509b52bc8

@@ -14,11 +14,15 @@ import (
 
 	"tailscale.com/metrics"
 	"tailscale.com/tsweb/varz"
+	"tailscale.com/util/set"
 )
 
 // Registry tracks user-facing metrics of various Tailscale subsystems.
 type Registry struct {
 	vars expvar.Map
+
+	// m contains common metrics owned by the registry.
+	m Metrics
 }
 
 // NewMultiLabelMapWithRegistry creates and register a new
@@ -102,4 +106,14 @@ func (r *Registry) String() string {
 	})
 
 	return sb.String()
+}
+
+// Metrics returns the name of all the metrics in the registry.
+func (r *Registry) MetricNames() []string {
+	ret := make(set.Set[string])
+	r.vars.Do(func(kv expvar.KeyValue) {
+		ret.Add(kv.Key)
+	})
+
+	return ret.Slice()
 }

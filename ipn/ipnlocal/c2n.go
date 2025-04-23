@@ -77,6 +77,9 @@ var c2nHandlers = map[methodAndPath]c2nHandler{
 
 	// Linux netfilter.
 	req("POST /netfilter-kind"): handleC2NSetNetfilterKind,
+
+	// VIP services.
+	req("GET /vip-services"): handleC2NVIPServicesGet,
 }
 
 type c2nHandler func(*LocalBackend, http.ResponseWriter, *http.Request)
@@ -269,6 +272,12 @@ func handleC2NSetNetfilterKind(b *LocalBackend, w http.ResponseWriter, r *http.R
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func handleC2NVIPServicesGet(b *LocalBackend, w http.ResponseWriter, r *http.Request) {
+	b.logf("c2n: GET /vip-services received")
+
+	json.NewEncoder(w).Encode(b.VIPServices())
+}
+
 func handleC2NUpdateGet(b *LocalBackend, w http.ResponseWriter, r *http.Request) {
 	b.logf("c2n: GET /update received")
 
@@ -332,12 +341,10 @@ func handleC2NPostureIdentityGet(b *LocalBackend, w http.ResponseWriter, r *http
 	}
 
 	if choice.ShouldEnable(b.Prefs().PostureChecking()) {
-		sns, err := posture.GetSerialNumbers(b.logf)
+		res.SerialNumbers, err = posture.GetSerialNumbers(b.logf)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			b.logf("c2n: GetSerialNumbers returned error: %v", err)
 		}
-		res.SerialNumbers = sns
 
 		// TODO(tailscale/corp#21371, 2024-07-10): once this has landed in a stable release
 		// and looks good in client metrics, remove this parameter and always report MAC
@@ -351,6 +358,8 @@ func handleC2NPostureIdentityGet(b *LocalBackend, w http.ResponseWriter, r *http
 	} else {
 		res.PostureDisabled = true
 	}
+
+	b.logf("c2n: posture identity disabled=%v reported %d serials %d hwaddrs", res.PostureDisabled, len(res.SerialNumbers), len(res.IfaceHardwareAddrs))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(res)

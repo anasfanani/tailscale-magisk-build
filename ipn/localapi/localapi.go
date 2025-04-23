@@ -62,7 +62,8 @@ import (
 	"tailscale.com/util/osdiag"
 	"tailscale.com/util/progresstracking"
 	"tailscale.com/util/rands"
-	"tailscale.com/util/testenv"
+	"tailscale.com/util/syspolicy/rsop"
+	"tailscale.com/util/syspolicy/setting"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/magicsock"
 )
@@ -77,6 +78,7 @@ var handler = map[string]localAPIHandler{
 	"cert/":     (*Handler).serveCert,
 	"file-put/": (*Handler).serveFilePut,
 	"files/":    (*Handler).serveFiles,
+	"policy/":   (*Handler).servePolicy,
 	"profiles/": (*Handler).serveProfiles,
 
 	// The other /localapi/v0/NAME handlers are exact matches and contain only NAME
@@ -98,6 +100,7 @@ var handler = map[string]localAPIHandler{
 	"derpmap":                     (*Handler).serveDERPMap,
 	"dev-set-state-store":         (*Handler).serveDevSetStateStore,
 	"dial":                        (*Handler).serveDial,
+	"disconnect-control":          (*Handler).disconnectControl,
 	"dns-osconfig":                (*Handler).serveDNSOSConfig,
 	"dns-query":                   (*Handler).serveDNSQuery,
 	"drive/fileserver-address":    (*Handler).serveDriveServerAddr,
@@ -560,6 +563,7 @@ func (h *Handler) serveLogTap(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	metricDebugMetricsCalls.Add(1)
 	// Require write access out of paranoia that the metrics
 	// might contain something sensitive.
 	if !h.PermitWrite {
@@ -570,15 +574,10 @@ func (h *Handler) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	clientmetric.WritePrometheusExpositionFormat(w)
 }
 
-// TODO(kradalby): Remove this once we have landed on a final set of
-// metrics to export to clients and consider the metrics stable.
-var debugUsermetricsEndpoint = envknob.RegisterBool("TS_DEBUG_USER_METRICS")
-
+// serveUserMetrics returns user-facing metrics in Prometheus text
+// exposition format.
 func (h *Handler) serveUserMetrics(w http.ResponseWriter, r *http.Request) {
-	if !testenv.InTest() && !debugUsermetricsEndpoint() {
-		http.Error(w, "usermetrics debug flag not enabled", http.StatusForbidden)
-		return
-	}
+	metricUserMetricsCalls.Add(1)
 	h.b.UserMetricsRegistry().Handler(w, r)
 }
 
@@ -635,6 +634,13 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 		}
 	case "pick-new-derp":
 		err = h.b.DebugPickNewDERP()
+	case "force-prefer-derp":
+		var n int
+		err = json.NewDecoder(r.Body).Decode(&n)
+		if err != nil {
+			break
+		}
+		h.b.DebugForcePreferDERP(n)
 	case "":
 		err = fmt.Errorf("missing parameter 'action'")
 	default:
@@ -956,6 +962,22 @@ func (h *Handler) servePprof(w http.ResponseWriter, r *http.Request) {
 	servePprofFunc(w, r)
 }
 
+// disconnectControl is the handler for local API /disconnect-control endpoint that shuts down control client, so that
+// node no longer communicates with control. Doing this makes control consider this node inactive. This can be used
+// before shutting down a replica of HA subnet  router or app connector deployments to ensure that control tells the
+// peers to switch over to another replica whilst still maintaining th existing peer connections.
+func (h *Handler) disconnectControl(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	h.b.DisconnectControl()
+}
+
 func (h *Handler) reloadConfig(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
 		http.Error(w, "access denied", http.StatusForbidden)
@@ -1231,7 +1253,7 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	ctx := r.Context()
 	enc := json.NewEncoder(w)
-	h.b.WatchNotifications(ctx, mask, f.Flush, func(roNotify *ipn.Notify) (keepGoing bool) {
+	h.b.WatchNotificationsAs(ctx, h.Actor, mask, f.Flush, func(roNotify *ipn.Notify) (keepGoing bool) {
 		err := enc.Encode(roNotify)
 		if err != nil {
 			h.logf("json.Encode: %v", err)
@@ -1251,7 +1273,7 @@ func (h *Handler) serveLoginInteractive(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "want POST", http.StatusBadRequest)
 		return
 	}
-	h.b.StartLoginInteractive(r.Context())
+	h.b.StartLoginInteractiveAs(r.Context(), h.Actor)
 	w.WriteHeader(http.StatusNoContent)
 	return
 }
@@ -1337,6 +1359,53 @@ func (h *Handler) servePrefs(w http.ResponseWriter, r *http.Request) {
 	e := json.NewEncoder(w)
 	e.SetIndent("", "\t")
 	e.Encode(prefs)
+}
+
+func (h *Handler) servePolicy(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitRead {
+		http.Error(w, "policy access denied", http.StatusForbidden)
+		return
+	}
+
+	suffix, ok := strings.CutPrefix(r.URL.EscapedPath(), "/localapi/v0/policy/")
+	if !ok {
+		http.Error(w, "misconfigured", http.StatusInternalServerError)
+		return
+	}
+
+	var scope setting.PolicyScope
+	if suffix == "" {
+		scope = setting.DefaultScope()
+	} else if err := scope.UnmarshalText([]byte(suffix)); err != nil {
+		http.Error(w, fmt.Sprintf("%q is not a valid scope", suffix), http.StatusBadRequest)
+		return
+	}
+
+	policy, err := rsop.PolicyFor(scope)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var effectivePolicy *setting.Snapshot
+	switch r.Method {
+	case "GET":
+		effectivePolicy = policy.Get()
+	case "POST":
+		effectivePolicy, err = policy.Reload()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	default:
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	e := json.NewEncoder(w)
+	e.SetIndent("", "\t")
+	e.Encode(effectivePolicy)
 }
 
 type resJSON struct {
@@ -2912,7 +2981,9 @@ var (
 	metricInvalidRequests = clientmetric.NewCounter("localapi_invalid_requests")
 
 	// User-visible LocalAPI endpoints.
-	metricFilePutCalls = clientmetric.NewCounter("localapi_file_put")
+	metricFilePutCalls      = clientmetric.NewCounter("localapi_file_put")
+	metricDebugMetricsCalls = clientmetric.NewCounter("localapi_debugmetric_requests")
+	metricUserMetricsCalls  = clientmetric.NewCounter("localapi_usermetric_requests")
 )
 
 // serveSuggestExitNode serves a POST endpoint for returning a suggested exit node.

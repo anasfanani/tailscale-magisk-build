@@ -25,7 +25,7 @@ import (
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/lineread"
+	"tailscale.com/util/lineiter"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
@@ -231,12 +231,12 @@ func desktop() (ret opt.Bool) {
 	}
 
 	seenDesktop := false
-	lineread.File("/proc/net/unix", func(line []byte) error {
+	for lr := range lineiter.File("/proc/net/unix") {
+		line, _ := lr.Value()
 		seenDesktop = seenDesktop || mem.Contains(mem.B(line), mem.S(" @/tmp/dbus-"))
 		seenDesktop = seenDesktop || mem.Contains(mem.B(line), mem.S(".X11-unix"))
 		seenDesktop = seenDesktop || mem.Contains(mem.B(line), mem.S("/wayland-1"))
-		return nil
-	})
+	}
 	ret.Set(seenDesktop)
 
 	// Only cache after a minute - compositors might not have started yet.
@@ -280,13 +280,22 @@ func getEnvType() EnvType {
 	return ""
 }
 
-// inContainer reports whether we're running in a container.
+// inContainer reports whether we're running in a container. Best-effort only,
+// there's no foolproof way to detect this, but the build tag should catch all
+// official builds from 1.78.0.
 func inContainer() opt.Bool {
 	if runtime.GOOS != "linux" {
 		return ""
 	}
 	var ret opt.Bool
 	ret.Set(false)
+	if packageType != nil && packageType() == "container" {
+		// Go build tag ts_package_container was set during build.
+		ret.Set(true)
+		return ret
+	}
+	// Only set if using docker's container runtime. Not guaranteed by
+	// documentation, but it's been in place for a long time.
 	if _, err := os.Stat("/.dockerenv"); err == nil {
 		ret.Set(true)
 		return ret
@@ -296,21 +305,21 @@ func inContainer() opt.Bool {
 		ret.Set(true)
 		return ret
 	}
-	lineread.File("/proc/1/cgroup", func(line []byte) error {
+	for lr := range lineiter.File("/proc/1/cgroup") {
+		line, _ := lr.Value()
 		if mem.Contains(mem.B(line), mem.S("/docker/")) ||
 			mem.Contains(mem.B(line), mem.S("/lxc/")) {
 			ret.Set(true)
-			return io.EOF // arbitrary non-nil error to stop loop
+			break
 		}
-		return nil
-	})
-	lineread.File("/proc/mounts", func(line []byte) error {
+	}
+	for lr := range lineiter.File("/proc/mounts") {
+		line, _ := lr.Value()
 		if mem.Contains(mem.B(line), mem.S("lxcfs /proc/cpuinfo fuse.lxcfs")) {
 			ret.Set(true)
-			return io.EOF
+			break
 		}
-		return nil
-	})
+	}
 	return ret
 }
 
@@ -362,7 +371,7 @@ func inFlyDotIo() bool {
 }
 
 func inReplit() bool {
-	// https://docs.replit.com/programming-ide/getting-repl-metadata
+	// https://docs.replit.com/replit-workspace/configuring-repl#environment-variables
 	if os.Getenv("REPL_OWNER") != "" && os.Getenv("REPL_SLUG") != "" {
 		return true
 	}

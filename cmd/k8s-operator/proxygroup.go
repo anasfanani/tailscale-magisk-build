@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/pkg/errors"
@@ -45,9 +46,12 @@ const (
 	reasonProxyGroupReady          = "ProxyGroupReady"
 	reasonProxyGroupCreating       = "ProxyGroupCreating"
 	reasonProxyGroupInvalid        = "ProxyGroupInvalid"
+
+	// Copied from k8s.io/apiserver/pkg/registry/generic/registry/store.go@cccad306d649184bf2a0e319ba830c53f65c445c
+	optimisticLockErrorMsg = "the object has been modified; please apply your changes to the latest version and try again"
 )
 
-var gaugeProxyGroupResources = clientmetric.NewGauge(kubetypes.MetricProxyGroupCount)
+var gaugeProxyGroupResources = clientmetric.NewGauge(kubetypes.MetricProxyGroupEgressCount)
 
 // ProxyGroupReconciler ensures cluster resources for a ProxyGroup definition.
 type ProxyGroupReconciler struct {
@@ -110,7 +114,7 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 	oldPGStatus := pg.Status.DeepCopy()
 	setStatusReady := func(pg *tsapi.ProxyGroup, status metav1.ConditionStatus, reason, message string) (reconcile.Result, error) {
 		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, status, reason, message, pg.Generation, r.clock, logger)
-		if !apiequality.Semantic.DeepEqual(oldPGStatus, pg.Status) {
+		if !apiequality.Semantic.DeepEqual(oldPGStatus, &pg.Status) {
 			// An error encountered here should get returned by the Reconcile function.
 			if updateErr := r.Client.Status().Update(ctx, pg); updateErr != nil {
 				err = errors.Wrap(err, updateErr.Error())
@@ -166,9 +170,17 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 	}
 
 	if err = r.maybeProvision(ctx, pg, proxyClass); err != nil {
-		err = fmt.Errorf("error provisioning ProxyGroup resources: %w", err)
-		r.recorder.Eventf(pg, corev1.EventTypeWarning, reasonProxyGroupCreationFailed, err.Error())
-		return setStatusReady(pg, metav1.ConditionFalse, reasonProxyGroupCreationFailed, err.Error())
+		reason := reasonProxyGroupCreationFailed
+		msg := fmt.Sprintf("error provisioning ProxyGroup resources: %s", err)
+		if strings.Contains(err.Error(), optimisticLockErrorMsg) {
+			reason = reasonProxyGroupCreating
+			msg = fmt.Sprintf("optimistic lock error, retrying: %s", err)
+			err = nil
+			logger.Info(msg)
+		} else {
+			r.recorder.Eventf(pg, corev1.EventTypeWarning, reason, msg)
+		}
+		return setStatusReady(pg, metav1.ConditionFalse, reason, msg)
 	}
 
 	desiredReplicas := int(pgReplicas(pg))
@@ -259,6 +271,15 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 	}); err != nil {
 		return fmt.Errorf("error provisioning StatefulSet: %w", err)
 	}
+	mo := &metricsOpts{
+		tsNamespace:  r.tsNamespace,
+		proxyStsName: pg.Name,
+		proxyLabels:  pgLabels(pg.Name, nil),
+		proxyType:    "proxygroup",
+	}
+	if err := reconcileMetricsResources(ctx, logger, mo, proxyClass, r.Client); err != nil {
+		return fmt.Errorf("error reconciling metrics resources: %w", err)
+	}
 
 	if err := r.cleanupDanglingResources(ctx, pg); err != nil {
 		return fmt.Errorf("error cleaning up dangling resources: %w", err)
@@ -327,6 +348,14 @@ func (r *ProxyGroupReconciler) maybeCleanup(ctx context.Context, pg *tsapi.Proxy
 		}
 	}
 
+	mo := &metricsOpts{
+		proxyLabels: pgLabels(pg.Name, nil),
+		tsNamespace: r.tsNamespace,
+		proxyType:   "proxygroup"}
+	if err := maybeCleanupMetricsResources(ctx, mo, r.Client); err != nil {
+		return false, fmt.Errorf("error cleaning up metrics resources: %w", err)
+	}
+
 	logger.Infof("cleaned up ProxyGroup resources")
 	r.mu.Lock()
 	r.proxyGroups.Remove(pg.UID)
@@ -353,7 +382,7 @@ func (r *ProxyGroupReconciler) deleteTailnetDevice(ctx context.Context, id tailc
 
 func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, pg *tsapi.ProxyGroup, proxyClass *tsapi.ProxyClass) (hash string, err error) {
 	logger := r.logger(pg.Name)
-	var allConfigs []tailscaledConfigs
+	var configSHA256Sum string
 	for i := range pgReplicas(pg) {
 		cfgSecret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
@@ -389,7 +418,6 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 		if err != nil {
 			return "", fmt.Errorf("error creating tailscaled config: %w", err)
 		}
-		allConfigs = append(allConfigs, configs)
 
 		for cap, cfg := range configs {
 			cfgJSON, err := json.Marshal(cfg)
@@ -397,6 +425,32 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 				return "", fmt.Errorf("error marshalling tailscaled config: %w", err)
 			}
 			mak.Set(&cfgSecret.StringData, tsoperator.TailscaledConfigFileName(cap), string(cfgJSON))
+		}
+
+		// The config sha256 sum is a value for a hash annotation used to trigger
+		// pod restarts when tailscaled config changes. Any config changes apply
+		// to all replicas, so it is sufficient to only hash the config for the
+		// first replica.
+		//
+		// In future, we're aiming to eliminate restarts altogether and have
+		// pods dynamically reload their config when it changes.
+		if i == 0 {
+			sum := sha256.New()
+			for _, cfg := range configs {
+				// Zero out the auth key so it doesn't affect the sha256 hash when we
+				// remove it from the config after the pods have all authed. Otherwise
+				// all the pods will need to restart immediately after authing.
+				cfg.AuthKey = nil
+				b, err := json.Marshal(cfg)
+				if err != nil {
+					return "", err
+				}
+				if _, err := sum.Write(b); err != nil {
+					return "", err
+				}
+			}
+
+			configSHA256Sum = fmt.Sprintf("%x", sum.Sum(nil))
 		}
 
 		if existingCfgSecret != nil {
@@ -412,16 +466,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 		}
 	}
 
-	sum := sha256.New()
-	b, err := json.Marshal(allConfigs)
-	if err != nil {
-		return "", err
-	}
-	if _, err := sum.Write(b); err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("%x", sum.Sum(nil)), nil
+	return configSHA256Sum, nil
 }
 
 func pgTailscaledConfig(pg *tsapi.ProxyGroup, class *tsapi.ProxyClass, idx int32, authKey string, oldSecret *corev1.Secret) (tailscaledConfigs, error) {
