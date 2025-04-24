@@ -85,10 +85,10 @@ func lookup(usernameOrUID string, std lookupStd, wantShell bool) (*user.User, st
 		defer cancel()
 		var shell string
 		if wantShell {
-			if out, err := exec.CommandContext(ctx, "which", "bash").Output(); err == nil {
-				shell = strings.TrimSpace(string(out))
-			} else if out, err := exec.CommandContext(ctx, "which", "sh").Output(); err == nil {
-				shell = strings.TrimSpace(string(out))
+			if out, err := exec.LookPath("bash"); err == nil {
+				shell = out
+			} else if out, err := exec.LookPath("sh"); err == nil {
+				shell = out
 			} else {
 				shell = "/system/bin/sh"
 			}
