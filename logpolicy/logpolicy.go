@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 	"tailscale.com/atomicfile"
 	"tailscale.com/envknob"
@@ -246,6 +247,15 @@ func LogsDir(logf logger.Logf) string {
 	}
 
 	cacheDir, err := os.UserCacheDir()
+	if _, exists := os.LookupEnv("ANDROID_DATA"); exists {
+		if tmp := os.TempDir(); tmp != "" {
+			if err := unix.Access(tmp, unix.W_OK); err == nil {
+				cacheDir = tmp
+			} else {
+				logf("logpolicy: temp directory %q is not writable: %v", tmp, err)
+			}
+		}
+	}
 	if err == nil {
 		d := filepath.Join(cacheDir, "Tailscale")
 		logf("logpolicy: using UserCacheDir, %q", d)
