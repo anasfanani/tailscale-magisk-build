@@ -35,6 +35,18 @@ func GetGroupIds(user *user.User) ([]string, error) {
 		return []string{"0"}, nil
 	}
 
+	if runtime.GOOS == "android" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if out, err := exec.CommandContext(ctx, "id", "-Gz").Output(); err == nil {
+			if len(out) > 0 {
+				return parseGroupIds(out), nil
+			}
+		}
+
+		return []string{"0"}, nil
+	}
+
 	if ids, err := getGroupIdsWithId(user.Username); err == nil {
 		return ids, nil
 	}
