@@ -48,6 +48,7 @@ import (
 
 const (
 	linux   = "linux"
+	android = "android"
 	darwin  = "darwin"
 	freebsd = "freebsd"
 	openbsd = "openbsd"
@@ -837,6 +838,14 @@ func (ss *sshSession) launchProcess() error {
 
 	cmd := ss.cmd
 	cmd.Env = envForUser(ss.conn.localUser)
+	if runtime.GOOS == "android" {
+		if home, exists := os.LookupEnv("HOME"); exists {
+			cmd.Dir = home
+		}
+		for _, kv := range os.Environ() {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
 	for _, kv := range ss.Environ() {
 		if acceptEnvPair(kv) {
 			cmd.Env = append(cmd.Env, kv)
@@ -1158,6 +1167,8 @@ func (ia *incubatorArgs) loginArgs(loginCmdPath string) []string {
 			return []string{loginCmdPath, "-f", ia.localUser, "-p"}
 		}
 		return []string{loginCmdPath, "-f", ia.localUser, "-h", ia.remoteIP, "-p"}
+	case android:
+		return []string{loginCmdPath}
 	case freebsd, openbsd:
 		return []string{loginCmdPath, "-fp", "-h", ia.remoteIP, ia.localUser}
 	}
@@ -1185,6 +1196,16 @@ func setGroups(groupIDs []int) error {
 		// some permissions thing isn't working, due to some arbitrary group ordering, but it at least allows
 		// this to work for more things than it previously did.
 		groupIDs = groupIDs[:16]
+	}
+
+	if runtime.GOOS == "android" {
+		if os.Geteuid() == 0 {
+			err := syscall.Setgroups(groupIDs)
+			if err != nil {
+				fmt.Println("Setgroups failed:", err)
+			}
+		}
+		return nil
 	}
 
 	err := syscall.Setgroups(groupIDs)
