@@ -2,7 +2,12 @@ module tailscale.com
 
 go 1.24.0
 
+// link: github.com/wlynxg/anet: invalid reference to net.zoneCache
+// https://github.com/wlynxg/anet/pull/9#issuecomment-2563993852
+replace github.com/wlynxg/anet => github.com/BieHDC/anet v0.0.6-0.20241226223613-d47f8b766b3c
+
 require (
+	github.com/wlynxg/anet v0.0.5
 	filippo.io/mkcert v1.4.4
 	fyne.io/systray v1.11.1-0.20250317195939-bcf6eed85e7a
 	github.com/Kodeworks/golang-image-ico v0.0.0-20141118225523-73f0f4cfade9
