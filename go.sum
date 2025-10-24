@@ -59,6 +59,8 @@ github.com/Antonboom/testifylint v1.2.0 h1:015bxD8zc5iY8QwTp4+RG9I4kIbqwvGX9TrBb
 github.com/Antonboom/testifylint v1.2.0/go.mod h1:rkmEqjqVnHDRNsinyN6fPSLnoajzFwsCcguJgwADBkw=
 github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 h1:L/gRVlceqvL25UVaW/CKtUDjefjrs0SPonmDGUVOYP0=
 github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
+github.com/BieHDC/anet v0.0.6-0.20241226223613-d47f8b766b3c h1:0cB1UoFP+vGtqo1sPGJCvPNMshWp4OkXz4JisC11pZA=
+github.com/BieHDC/anet v0.0.6-0.20241226223613-d47f8b766b3c/go.mod h1:eay5PRQr7fIVAMbTbchTnO9gG65Hg/uYGdc7mguHxoA=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c h1:pxW6RcqyfI9/kWtOwnv/G+AzdKuy2ZrqINhenH4HyNs=
 github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=

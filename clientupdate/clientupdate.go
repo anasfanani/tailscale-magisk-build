@@ -181,6 +181,8 @@ func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
 	switch runtime.GOOS {
 	case "windows":
 		return up.updateWindows, true
+	case "android":
+		return up.updateAndroid, true
 	case "linux":
 		switch distro.Get() {
 		case distro.NixOS:
