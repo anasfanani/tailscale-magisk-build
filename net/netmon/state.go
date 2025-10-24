@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/wlynxg/anet"
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/net/netaddr"
@@ -153,6 +154,10 @@ func (i Interface) IsUp() bool       { return isUp(i.Interface) }
 func (i Interface) Addrs() ([]net.Addr, error) {
 	if i.AltAddrs != nil {
 		return i.AltAddrs, nil
+	}
+	// use the netmon package to get the addresses
+	if runtime.GOOS == "android" {
+		return anet.InterfaceAddrs()
 	}
 	return i.Interface.Addrs()
 }
@@ -708,6 +713,18 @@ func GetInterfaceList() (InterfaceList, error) {
 func netInterfaces() ([]Interface, error) {
 	if altNetInterfaces != nil {
 		return altNetInterfaces()
+	}
+	// Use the netmon package to get the addresses
+	if runtime.GOOS == "android" {
+		ifs, err := anet.Interfaces()
+		if err != nil {
+			return nil, err
+		}
+		ret := make([]Interface, len(ifs))
+		for i := range ifs {
+			ret[i].Interface = &ifs[i]
+		}
+		return ret, nil
 	}
 	ifs, err := net.Interfaces()
 	if err != nil {

@@ -19,6 +19,17 @@ import (
 // an error. It will first try to use the 'id' command to get the group IDs,
 // and if that fails, it will fall back to the user.GroupIds method.
 func GetGroupIds(user *user.User) ([]string, error) {
+	if runtime.GOOS == "android" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if out, err := exec.CommandContext(ctx, "id", "-Gz").Output(); err == nil {
+			if len(out) > 0 {
+				return parseGroupIds(out), nil
+			}
+		}
+
+		return []string{"0"}, nil
+	}
 	if runtime.GOOS != "linux" {
 		return user.GroupIds()
 	}

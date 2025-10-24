@@ -48,6 +48,7 @@ const (
 	darwin  = "darwin"
 	freebsd = "freebsd"
 	openbsd = "openbsd"
+	android = "android"
 )
 
 func init() {
@@ -779,6 +780,14 @@ func (ss *sshSession) launchProcess() error {
 	cmd := ss.cmd
 	cmd.Dir = "/"
 	cmd.Env = envForUser(ss.conn.localUser)
+	if runtime.GOOS == "android" {
+		if home, exists := os.LookupEnv("HOME"); exists {
+			cmd.Dir = home
+		}
+		for _, kv := range os.Environ() {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
 	for _, kv := range ss.Environ() {
 		if acceptEnvPair(kv) {
 			cmd.Env = append(cmd.Env, kv)
@@ -1100,6 +1109,8 @@ func (ia *incubatorArgs) loginArgs(loginCmdPath string) []string {
 			return []string{loginCmdPath, "-f", ia.localUser, "-p"}
 		}
 		return []string{loginCmdPath, "-f", ia.localUser, "-h", ia.remoteIP, "-p"}
+	case android:
+		return []string{loginCmdPath}
 	case freebsd, openbsd:
 		return []string{loginCmdPath, "-fp", "-h", ia.remoteIP, ia.localUser}
 	}
@@ -1119,6 +1130,15 @@ func shellArgs(isShell bool, cmd string) []string {
 }
 
 func setGroups(groupIDs []int) error {
+	if runtime.GOOS == "android" {
+		if os.Geteuid() == 0 {
+			err := syscall.Setgroups(groupIDs)
+			if err != nil {
+				fmt.Println("Setgroups failed:", err)
+			}
+		}
+		return nil
+	}
 	if runtime.GOOS == darwin && len(groupIDs) > 16 {
 		// darwin returns "invalid argument" if more than 16 groups are passed to syscall.Setgroups
 		// some info can be found here:

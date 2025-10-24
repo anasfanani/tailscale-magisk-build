@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"os"
 	"os/exec"
 	"os/user"
 	"runtime"
@@ -73,6 +74,63 @@ func lookup(usernameOrUID string, std lookupStd, wantShell bool) (*user.User, st
 				Username: "root",
 				Name:     "Gokrazy",
 				HomeDir:  "/",
+			}, shell, nil
+		}
+		return u, shell, nil
+	}
+
+	// No getent on Android. So hard-code the login shell.
+	if runtime.GOOS == "android" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var shell string
+		if wantShell {
+			if out, err := exec.LookPath("bash"); err == nil {
+				shell = out
+			} else if out, err := exec.LookPath("sh"); err == nil {
+				shell = out
+			} else {
+				shell = "/system/bin/sh"
+			}
+		}
+
+		out, err := exec.CommandContext(ctx, "id", "-u").Output()
+		var Uid string
+		if err != nil {
+			Uid = "0"
+		} else {
+			Uid = strings.TrimSpace(string(out))
+		}
+
+		var Gid string
+		if out, err := exec.CommandContext(ctx, "id", "-g").Output(); err == nil {
+			Gid = strings.TrimSpace(string(out))
+		} else {
+			Gid = "0"
+		}
+
+		var Username string
+		if out, err := exec.CommandContext(ctx, "id", "-n", "u").Output(); err == nil {
+			Username = strings.TrimSpace(string(out))
+		} else {
+			Username = "root"
+		}
+
+		var HomeDir string
+		if out, err := os.UserHomeDir(); err == nil {
+			HomeDir = strings.TrimSpace(string(out))
+		} else {
+			HomeDir = "/"
+		}
+
+		u, err := std(usernameOrUID)
+		if err != nil {
+			return &user.User{
+				Uid:      Uid,
+				Gid:      Gid,
+				Username: Username,
+				Name:     "Android",
+				HomeDir:  HomeDir,
 			}, shell, nil
 		}
 		return u, shell, nil
