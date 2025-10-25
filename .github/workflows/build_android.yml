@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - "v*-android"
+      - "v*-android-pre"
 permissions:
   contents: write
 jobs:
   build:
       runs-on: ubuntu-latest
       steps:
+        - name: Determine release type
+          id: release_type
+          run: |
+            if [[ "${{ github.ref_name }}" == *"-pre" ]]; then
+              echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            else
+              echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            fi
         - name: Checkout code
           uses: actions/checkout@v4
           with:
@@ -83,6 +92,6 @@ jobs:
           uses: "marvinpinto/action-automatic-releases@latest"
           with:
             repo_token: "${{ secrets.GITHUB_TOKEN }}"
-            prerelease: false
+            prerelease: ${{ steps.release_type.outputs.is_prerelease }}
             files: |
               dist/*.tgz
