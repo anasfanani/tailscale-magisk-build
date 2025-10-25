@@ -163,7 +163,7 @@ func findAndroidAsset(release struct {
 		return "", fmt.Errorf("unsupported architecture: %s", runtime.GOARCH)
 	}
 
-	assetsName := fmt.Sprintf(`tailscale.combined.%s.%s.tar.gz`, runtime.GOARCH, ver)
+	assetsName := fmt.Sprintf(`tailscale_%s_%s.tgz`, ver, runtime.GOARCH)
 	for _, asset := range release.Assets {
 		matched, err := regexp.MatchString(`^`+assetsName+`$`, asset.Name)
 		if err != nil {
@@ -193,7 +193,7 @@ func downloadAndroidAsset(assetURL, downloadDir, ver string) (downloadPath strin
 		return "", fmt.Errorf("failed to create download directory: %w", err)
 	}
 
-	assetsName := fmt.Sprintf(`tailscale.combined.%s.%s.tar.gz`, runtime.GOARCH, ver)
+	assetsName := fmt.Sprintf(`tailscale_%s_%s.tgz`, ver, runtime.GOARCH)
 	downloadPath = filepath.Join(downloadDir, assetsName)
 	out, err := os.Create(downloadPath)
 	if err != nil {
@@ -236,7 +236,13 @@ func extractAndInstallAndroid(downloadPath, dirExtract string, logf func(string,
 			continue
 		}
 
-		destPath := filepath.Join(dirExtract, header.Name)
+		// Only extract tailscaled binary
+		if header.Name != "tailscaled" {
+			continue
+		}
+
+		// Install as "tailscaled" in the extract directory
+		destPath := filepath.Join(dirExtract, "tailscaled")
 		destFile, err := os.Create(destPath + ".new")
 		if err != nil {
 			return fmt.Errorf("failed to create destination file: %w", err)
