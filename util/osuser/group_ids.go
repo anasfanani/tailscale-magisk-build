@@ -23,7 +23,7 @@ func GetGroupIds(user *user.User) ([]string, error) {
 		return nil, nil
 	}
 
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
 		return user.GroupIds()
 	}
 
