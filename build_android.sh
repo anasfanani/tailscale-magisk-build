@@ -77,8 +77,9 @@ ldflags="$ldflags -w -s"
 # Build the binary
 go build -tags="ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube,ts_omit_completion,ts_omit_wakeonlan,ts_omit_capture" \
     --ldflags="$ldflags" \
-    -o ./dist/tailscale.combined.$GOARCH \
+    -o ./dist/tailscaled.$GOARCH \
     -trimpath ./cmd/tailscaled
 
-echo "Build completed: $(file ./dist/tailscale.combined.$GOARCH)"
-echo "File size: $(du -h ./dist/tailscale.combined.$GOARCH | cut -f1)"
+chmod +x ./dist/tailscaled.$GOARCH
+echo "Build completed: $(file ./dist/tailscaled.$GOARCH)"
+echo "File size: $(du -h ./dist/tailscaled.$GOARCH | cut -f1)"
