@@ -176,8 +176,51 @@ func shouldRunCLI() bool {
 	return false
 }
 
+// createTailscaleSymlink creates a 'tailscale' symlink pointing to the current
+// 'tailscaled' binary on Android, enabling the combined binary to work with both names.
+func createTailscaleSymlink() {
+	// Get the path to the current executable
+	execPath, err := os.Executable()
+	if err != nil {
+		return // Silently fail, not critical
+	}
+
+	// Resolve symlinks to get the real binary path
+	realPath, err := filepath.EvalSymlinks(execPath)
+	if err != nil {
+		realPath = execPath // Fallback to execPath if symlink resolution fails
+	}
+
+	// Get the binary name and directory
+	binName := filepath.Base(realPath)
+	binDir := filepath.Dir(realPath)
+	symlinkPath := filepath.Join(binDir, "tailscale")
+
+	// Check if 'tailscale' already exists
+	if _, err := os.Lstat(symlinkPath); err == nil {
+		// File exists, check if it's already a symlink to us
+		if target, err := os.Readlink(symlinkPath); err == nil {
+			// It's a symlink, check if it points to our binary
+			if target == binName {
+				return // Already correctly set up
+			}
+		}
+		// Exists but not the right symlink, remove it
+		os.Remove(symlinkPath)
+	}
+
+	// Create the symlink: tailscale -> <actual binary name>
+	_ = os.Symlink(binName, symlinkPath)
+}
+
 func main() {
 	envknob.PanicIfAnyEnvCheckedInInit()
+
+	// On Android, ensure 'tailscale' symlink exists for combined binary compatibility
+	if runtime.GOOS == "android" {
+		createTailscaleSymlink()
+	}
+
 	if shouldRunCLI() {
 		beCLI()
 		return
