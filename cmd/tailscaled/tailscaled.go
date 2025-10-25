@@ -180,6 +180,12 @@ type proxyStartFunc = func(logf logger.Logf, dialer *tsdial.Dialer)
 
 func main() {
 	envknob.PanicIfAnyEnvCheckedInInit()
+
+	// On Android, ensure 'tailscale' symlink exists for combined binary compatibility
+	if runtime.GOOS == "android" {
+		createTailscaleSymlink()
+	}
+
 	if shouldRunCLI() {
 		beCLI()
 		return
