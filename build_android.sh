@@ -1,11 +1,11 @@
 #!/usr/bin/env sh
 # Custom script to build Tailscale for Magisk Tailscaled
 
-set -eu
+set -euox
 
 # If $ANDROID_NDK_PATH is not set, use the default path
 if [ -z "${ANDROID_NDK_PATH:-}" ]; then
-    ANDROID_NDK_PATH="/tmp/android-ndk-r27c-linux/toolchains/llvm/prebuilt/linux-x86_64/bin"
+   ANDROID_NDK_PATH="/tmp/android-ndk-r27c-linux/toolchains/llvm/prebuilt/linux-x86_64/bin"
 fi
 # Specify the Android NDK path
 if [ ! -d "$ANDROID_NDK_PATH" ]; then
@@ -19,13 +19,28 @@ if [ ! -d "$ANDROID_NDK_PATH" ]; then
     echo "Android NDK path set to: $ANDROID_NDK_PATH"
 fi
 
-export PATH="$ANDROID_NDK_PATH:$PATH"
 
+# export TMPDIR=${TMPDIR:-/tmp}
+# export GOTMPDIR="$TMPDIR/go-build"
+# export GOCACHE="$TMPDIR/.gocache"
+# export GOMODCACHE="$TMPDIR/.gomodcache"
+# export XDG_CACHE_HOME="$TMPDIR/.cache"
+# export XDG_HOME_DIR="$TMPDIR/.xdg"
+# export HOME="$TMPDIR"
+# export GOCROSS_NO_GO_INSTALL=1
+
+# mkdir -p "$GOTMPDIR" "$GOCACHE" "$GOMODCACHE" "$XDG_CACHE_HOME"
 # Use the "go" binary from the "tool" directory (which is github.com/tailscale/go)
 # export PATH="$PWD"/tool:"$PATH"
 
+export TS_USE_TOOLCHAIN=1
+# export GOROOT=$(./tool/go env GOROOT)
 eval "$(./build_dist.sh shellvars)"
-
+export PATH="$ANDROID_NDK_PATH:$PATH"
+# $GOROOT/bin/go version
+# command -v go
+# which go
+# go version
 if [ "$#" -eq 0 ]; then
     echo "Usage: $0 <arm|arm64>"
     exit 1
