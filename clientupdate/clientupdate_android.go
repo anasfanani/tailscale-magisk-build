@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+
+	"tailscale.com/util/cmpver"
 )
 
 const androidGitHubRepoURL = "https://api.github.com/repos/anasfanani/tailscale-magisk-build/releases"
@@ -31,8 +33,11 @@ func (up *Updater) updateAndroid() error {
 	repoURL := androidGitHubRepoURL
 	if up.Version != "" {
 		repoURL = fmt.Sprintf(repoURL+"/tags/v%s-android", up.Version)
+	} else if up.Track == UnstableTrack {
+		// For unstable track, fetch all releases to get the latest (including pre-releases)
+		repoURL = androidGitHubRepoURL
 	} else {
-		repoURL = fmt.Sprintf(repoURL + "/latest")
+		repoURL = repoURL + "/latest"
 	}
 
 	release, ver, err := fetchAndroidRelease(repoURL, up.Track)
@@ -40,8 +45,8 @@ func (up *Updater) updateAndroid() error {
 		return err
 	}
 
-	// Confirm the update with the user
-	if !up.confirm(ver) {
+	// Confirm the update with the user (allow downgrades when specific version is requested)
+	if !confirmAndroidUpdate(up, ver) {
 		return nil
 	}
 
@@ -67,6 +72,33 @@ func (up *Updater) updateAndroid() error {
 
 	up.Logf("Please restart the tailscaled service to apply the update.")
 	return nil
+}
+
+// confirmAndroidUpdate confirms the update with the user, allowing downgrades when a specific version is requested
+func confirmAndroidUpdate(up *Updater, ver string) bool {
+	// Allow downgrades when a specific version is requested
+	if up.Version != "" {
+		if up.Confirm != nil {
+			return up.Confirm(ver)
+		}
+		return true
+	}
+
+	// Only check version when we're not switching tracks.
+	if up.Track == "" || up.Track == CurrentTrack {
+		switch c := cmpver.Compare(up.currentVersion, ver); {
+		case c == 0:
+			up.Logf("already running %v version %v; no update needed", up.Track, ver)
+			return false
+		case c > 0:
+			up.Logf("installed %v version %v is newer than the latest available version %v; no update needed", up.Track, up.currentVersion, ver)
+			return false
+		}
+	}
+	if up.Confirm != nil {
+		return up.Confirm(ver)
+	}
+	return true
 }
 
 // androidDirectories returns the download and extract directories for Android updates
@@ -135,8 +167,35 @@ func fetchAndroidRelease(repoURL, track string) (release struct {
 		return release, "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return release, "", fmt.Errorf("failed to decode release metadata: %w", err)
+	// Check if we're fetching all releases (for unstable track)
+	if strings.HasSuffix(repoURL, "/releases") {
+		// Fetch all releases and find the latest one (including pre-releases)
+		var releases []struct {
+			TagName string `json:"tag_name"`
+			Assets  []struct {
+				Name string `json:"name"`
+				URL  string `json:"browser_download_url"`
+			} `json:"assets"`
+			Prerelease bool `json:"prerelease"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+			return release, "", fmt.Errorf("failed to decode releases metadata: %w", err)
+		}
+
+		if len(releases) == 0 {
+			return release, "", fmt.Errorf("no releases found")
+		}
+
+		// Get the first release (latest)
+		release.TagName = releases[0].TagName
+		release.Assets = releases[0].Assets
+		release.Prerelease = releases[0].Prerelease
+	} else {
+		// Single release (latest or specific tag)
+		if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+			return release, "", fmt.Errorf("failed to decode release metadata: %w", err)
+		}
 	}
 
 	// If fetching latest and it's a pre-release, skip it for stable track
