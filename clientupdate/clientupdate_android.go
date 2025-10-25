@@ -29,18 +29,30 @@ func (up *Updater) updateAndroid() error {
 		return err
 	}
 
+	// Determine the actual track based on current version if not explicitly set
+	// This fixes the issue where CurrentTrack incorrectly identifies -pre builds as stable
+	// when the minor version is even (e.g., 1.84.3-pre has minor=84 which is even)
+	track := up.Track
+	if track == "" || track == CurrentTrack {
+		if strings.Contains(up.currentVersion, "-pre") || strings.Contains(up.currentVersion, "-dev") {
+			track = UnstableTrack
+		} else {
+			track = StableTrack
+		}
+	}
+
 	// Fetch the release information
 	repoURL := androidGitHubRepoURL
 	if up.Version != "" {
 		repoURL = fmt.Sprintf(repoURL+"/tags/v%s-android", up.Version)
-	} else if up.Track == UnstableTrack {
+	} else if track == UnstableTrack {
 		// For unstable track, fetch all releases to get the latest (including pre-releases)
 		repoURL = androidGitHubRepoURL
 	} else {
 		repoURL = repoURL + "/latest"
 	}
 
-	release, ver, err := fetchAndroidRelease(repoURL, up.Track)
+	release, ver, err := fetchAndroidRelease(repoURL, track)
 	if err != nil {
 		return err
 	}
@@ -84,14 +96,26 @@ func confirmAndroidUpdate(up *Updater, ver string) bool {
 		return true
 	}
 
-	// Only check version when we're not switching tracks.
-	if up.Track == "" || up.Track == CurrentTrack {
+	// Determine the current track based on the current version
+	currentTrack := StableTrack
+	if strings.Contains(up.currentVersion, "-pre") || strings.Contains(up.currentVersion, "-dev") {
+		currentTrack = UnstableTrack
+	}
+
+	// Determine the requested track (default to current track if not specified)
+	requestedTrack := up.Track
+	if requestedTrack == "" {
+		requestedTrack = currentTrack
+	}
+
+	// Only check version when we're not switching tracks
+	if requestedTrack == currentTrack {
 		switch c := cmpver.Compare(up.currentVersion, ver); {
 		case c == 0:
-			up.Logf("already running %v version %v; no update needed", up.Track, ver)
+			up.Logf("already running %v version %v; no update needed", currentTrack, ver)
 			return false
 		case c > 0:
-			up.Logf("installed %v version %v is newer than the latest available version %v; no update needed", up.Track, up.currentVersion, ver)
+			up.Logf("installed %v version %v is newer than the latest available version %v; no update needed", currentTrack, up.currentVersion, ver)
 			return false
 		}
 	}
@@ -204,7 +228,13 @@ func fetchAndroidRelease(repoURL, track string) (release struct {
 	}
 
 	ver = strings.TrimPrefix(release.TagName, "v")
-	ver = strings.TrimSuffix(ver, "-android")
+	// For pre-releases, convert -android-pre to -pre
+	if strings.HasSuffix(ver, "-android-pre") {
+		ver = strings.TrimSuffix(ver, "-android-pre")
+		ver = ver + "-pre"
+	} else {
+		ver = strings.TrimSuffix(ver, "-android")
+	}
 
 	return release, ver, nil
 }
@@ -222,7 +252,10 @@ func findAndroidAsset(release struct {
 		return "", fmt.Errorf("unsupported architecture: %s", runtime.GOARCH)
 	}
 
-	assetsName := fmt.Sprintf(`tailscale_%s_%s.tgz`, ver, runtime.GOARCH)
+	// Strip the -pre suffix from version for asset name matching
+	// GitHub release assets are named without -pre (e.g., tailscale_1.84.3_arm64.tgz)
+	assetVer := strings.TrimSuffix(ver, "-pre")
+	assetsName := fmt.Sprintf(`tailscale_%s_%s.tgz`, assetVer, runtime.GOARCH)
 	for _, asset := range release.Assets {
 		matched, err := regexp.MatchString(`^`+assetsName+`$`, asset.Name)
 		if err != nil {
@@ -252,7 +285,9 @@ func downloadAndroidAsset(assetURL, downloadDir, ver string) (downloadPath strin
 		return "", fmt.Errorf("failed to create download directory: %w", err)
 	}
 
-	assetsName := fmt.Sprintf(`tailscale_%s_%s.tgz`, ver, runtime.GOARCH)
+	// Strip the -pre suffix from version for asset name (matches GitHub release asset naming)
+	assetVer := strings.TrimSuffix(ver, "-pre")
+	assetsName := fmt.Sprintf(`tailscale_%s_%s.tgz`, assetVer, runtime.GOARCH)
 	downloadPath = filepath.Join(downloadDir, assetsName)
 	out, err := os.Create(downloadPath)
 	if err != nil {

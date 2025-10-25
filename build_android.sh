@@ -1,7 +1,7 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 # Custom script to build Tailscale for Magisk Tailscaled
 
-set -euox
+set -euox pipefail
 
 # If $ANDROID_NDK_PATH is not set, use the default path
 if [ -z "${ANDROID_NDK_PATH:-}" ]; then
@@ -41,9 +41,35 @@ export PATH="$ANDROID_NDK_PATH:$PATH"
 # command -v go
 # which go
 # go version
+
+# Parse arguments
+PRE_RELEASE=""
+POSITIONAL_ARGS=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --pre)
+            PRE_RELEASE="1"
+            shift
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Restore positional parameters
+set -- "${POSITIONAL_ARGS[@]}"
+
 if [ "$#" -eq 0 ]; then
-    echo "Usage: $0 <arm|arm64>"
+    echo "Usage: $0 [--pre] <arm|arm64>"
     exit 1
+fi
+
+# Add -pre suffix to version if --pre flag is set
+if [ -n "$PRE_RELEASE" ]; then
+    VERSION_SHORT="${VERSION_SHORT}-pre"
 fi
 
 # Set the target architecture and platform

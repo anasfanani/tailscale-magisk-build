@@ -42,11 +42,19 @@ jobs:
         - name: Build arm
           run: |
             export ANDROID_NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-            ./build_android.sh arm
+            if [[ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]]; then
+              ./build_android.sh --pre arm
+            else
+              ./build_android.sh arm
+            fi
         - name: Build arm64
           run: |
             export ANDROID_NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-            ./build_android.sh arm64
+            if [[ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]]; then
+              ./build_android.sh --pre arm64
+            else
+              ./build_android.sh arm64
+            fi
         
         - name: Install UPX
           uses: crazy-max/ghaction-upx@v3
