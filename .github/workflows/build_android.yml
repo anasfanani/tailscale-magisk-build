@@ -46,16 +46,16 @@ jobs:
 
         - name: Compress binaries with UPX
           run: |
-            upx --lzma --best ./dist/tailscale.combined.arm
-            upx --lzma --best ./dist/tailscale.combined.arm64
+            upx --lzma --best ./dist/tailscaled.arm
+            upx --lzma --best ./dist/tailscaled.arm64
         
         - name: Compress artifacts
           id: compress_artifacts
           run: |
             eval "$(./build_dist.sh shellvars)"
             echo "VERSION_SHORT=$VERSION_SHORT" >> $GITHUB_OUTPUT
-            tar -czf dist/tailscale.combined.arm64.${VERSION_SHORT}.tar.gz -C dist --transform='s/tailscale.combined.arm64/tailscale.combined/' tailscale.combined.arm64
-            tar -czf dist/tailscale.combined.arm.${VERSION_SHORT}.tar.gz -C dist --transform='s/tailscale.combined.arm/tailscale.combined/' tailscale.combined.arm
+            tar -czf dist/tailscale_${VERSION_SHORT}_arm64.tgz -C dist --transform='s/tailscaled.arm64/tailscaled/' tailscaled.arm64
+            tar -czf dist/tailscale_${VERSION_SHORT}_arm.tgz -C dist --transform='s/tailscaled.arm/tailscaled/' tailscaled.arm
             ls -lh dist
 
         - name: Upload artifacts
@@ -63,21 +63,21 @@ jobs:
           with:
             name: release-artifacts
             path: |
-              dist/*.tar.gz
+              dist/*.tgz
 
         - name: Upload artifacts for arm
           uses: actions/upload-artifact@v4
           with:
-            name: tailscale.combined.arm.${{ steps.compress_artifacts.outputs.VERSION_SHORT }}
+            name: tailscaled.arm.${{ steps.compress_artifacts.outputs.VERSION_SHORT }}
             path: |
-              dist/tailscale.combined.arm
+              dist/tailscaled.arm
         
         - name: Upload artifacts for arm64
           uses: actions/upload-artifact@v4
           with:
-            name: tailscale.combined.arm64.${{ steps.compress_artifacts.outputs.VERSION_SHORT }}
+            name: tailscaled.arm64.${{ steps.compress_artifacts.outputs.VERSION_SHORT }}
             path: |
-              dist/tailscale.combined.arm64
+              dist/tailscaled.arm64
 
         - name: Create Release
           uses: "marvinpinto/action-automatic-releases@latest"
@@ -85,4 +85,4 @@ jobs:
             repo_token: "${{ secrets.GITHUB_TOKEN }}"
             prerelease: false
             files: |
-              dist/*.tar.gz
+              dist/*.tgz
