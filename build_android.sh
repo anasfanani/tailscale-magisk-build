@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Custom script to build Tailscale for Magisk Tailscaled
 
-set -euox pipefail
+set -euo pipefail
 
 # If $ANDROID_NDK_PATH is not set, use the default path
 if [ -z "${ANDROID_NDK_PATH:-}" ]; then
@@ -101,7 +101,7 @@ export CGO_ENABLED=1
 ldflags="-X tailscale.com/version.longStamp=${VERSION_LONG} -X tailscale.com/version.shortStamp=${VERSION_SHORT} -X tailscale.com/version.gitCommitStamp=${VERSION_GIT_HASH}"
 ldflags="$ldflags -w -s"
 # Build the binary
-go build -tags="ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube,ts_omit_completion,ts_omit_wakeonlan,ts_omit_capture" \
+./tool/go build -tags="ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube,ts_omit_completion,ts_omit_wakeonlan,ts_omit_capture,ts_omit_systray,ts_omit_drive,ts_omit_debugeventbus,ts_omit_debug,ts_omit_portmapper,ts_omit_tailnetlock,ts_omit_syspolicy,ts_omit_appconnectors,ts_omit_identityfederation,ts_omit_taildrop" \
     --ldflags="$ldflags" \
     -o ./dist/tailscaled.$GOARCH \
     -trimpath ./cmd/tailscaled

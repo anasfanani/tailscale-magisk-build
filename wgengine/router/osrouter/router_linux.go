@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !android
+//go:build linux
 
 package osrouter
 
@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,6 +128,10 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon
 		r.logf("portUpdate(port=%v, network=%s)", pu.UDPPort, pu.EndpointNetwork)
 		if err := r.updateMagicsockPort(pu.UDPPort, pu.EndpointNetwork); err != nil {
 			r.logf("updateMagicsockPort(port=%v, network=%s) failed: %v", pu.UDPPort, pu.EndpointNetwork, err)
+		}
+		// Check VPN state on port updates (network changes)
+		if err := r.adjustPriorityForVPN(); err != nil {
+			r.logf("adjustPriorityForVPN failed: %v", err)
 		}
 	})
 	r.eventClient = ec
@@ -279,6 +284,36 @@ func (r *linuxRouter) useIPCommand() bool {
 	return !ok
 }
 
+// adjustPriorityForVPN dynamically adjusts routing priority based on VPN state
+func (r *linuxRouter) adjustPriorityForVPN() error {
+	// Check if tun0 exists and is up
+	link, err := netlink.LinkByName("tun0")
+	vpnActive := err == nil && link.Attrs().Flags&net.FlagUp != 0
+	
+	newPriority := 5200  // Default: Tailscale on top
+	if vpnActive {
+		newPriority = 13000  // VPN active: VPN on top
+	}
+	
+	if r.ipPolicyPrefBase != newPriority {
+		r.logf("VPN state changed: adjusting routing priority %d -> %d", r.ipPolicyPrefBase, newPriority)
+		
+		if err := r.delIPRules(); err != nil {
+			r.logf("adjustPriorityForVPN: failed to delete rules: %v", err)
+			return err
+		}
+		
+		r.ipPolicyPrefBase = newPriority
+		
+		if err := r.addIPRules(); err != nil {
+			r.logf("adjustPriorityForVPN: failed to add rules: %v", err)
+			return err
+		}
+	}
+	
+	return nil
+}
+
 // fwmaskWorks reports whether we can use 'ip rule...fwmark <mark>/<mask>'.
 // This is computed lazily on first use. By default, we don't run the "ip"
 // command, so never actually runs this. But the "ip" command is used in tests
@@ -412,6 +447,12 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 	var errs []error
 	if cfg == nil {
 		cfg = &shutdownConfig
+	}
+
+	// Dynamically adjust priority based on VPN state
+	if err := r.adjustPriorityForVPN(); err != nil {
+		r.logf("failed to adjust priority for VPN: %v", err)
+		errs = append(errs, err)
 	}
 
 	if cfg.NetfilterKind != r.netfilterKind {
@@ -1296,11 +1337,23 @@ var ubntIPRules = []netlink.Rule{
 	},
 }
 
+var androidIPRules = []netlink.Rule{
+	// Packets from us, not tagged with our fwmark
+	{
+		Priority: 70,
+		Invert:   true,
+		Mark:     tsconst.LinuxBypassMarkNum,
+		Table:    tailscaleRouteTable.Num,
+	},
+}
+
 // ipRules returns the appropriate list of ip rules to be used by Tailscale. See
 // comments on baseIPRules and ubntIPRules for more details.
 func ipRules() []netlink.Rule {
 	if getDistroFunc() == distro.UBNT {
 		return ubntIPRules
+	} else if runtime.GOOS == "android" {
+		return androidIPRules
 	}
 	return baseIPRules
 }
