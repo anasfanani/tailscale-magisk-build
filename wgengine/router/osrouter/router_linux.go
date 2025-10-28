@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !android
+//go:build linux
 
 package osrouter
 
@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1296,11 +1297,33 @@ var ubntIPRules = []netlink.Rule{
 	},
 }
 
+var androidIPRules = []netlink.Rule{
+	// Priority 7300 (12500): Tailscale CGNAT range (100.64.0.0/10) always uses table 52, before VPN rules
+	// This ensures peer-to-peer traffic doesn't go through other VPNs
+	{
+		Priority: 7300, // 5200 + 7300 = 12500
+		Dst:      netipx.PrefixIPNet(netip.MustParsePrefix("100.64.0.0/10")),
+		Table:    tailscaleRouteTable.Num,
+	},
+	// Priority 13001: after Android VPN rules at 13000, before default network (14999+)
+	// When VPN active: VPN rules at 13000 catch traffic first (VPN wins)
+	// When VPN off: Tailscale catches traffic as fallback
+	{
+		Priority: 7801, // 5200 + 7801 = 13001
+		Invert:   true,
+		Mark:     tsconst.LinuxBypassMarkNum,
+		Mask:     tsconst.LinuxFwmarkMaskNum,
+		Table:    tailscaleRouteTable.Num,
+	},
+}
+
 // ipRules returns the appropriate list of ip rules to be used by Tailscale. See
 // comments on baseIPRules and ubntIPRules for more details.
 func ipRules() []netlink.Rule {
 	if getDistroFunc() == distro.UBNT {
 		return ubntIPRules
+	} else if runtime.GOOS == "android" {
+		return androidIPRules
 	}
 	return baseIPRules
 }

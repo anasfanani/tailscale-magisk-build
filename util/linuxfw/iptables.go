@@ -214,6 +214,9 @@ func clearRules(proto iptables.Protocol, logf logger.Logf) error {
 	if err := delTSHook(ipt, "filter", "FORWARD", logf); err != nil {
 		errs = append(errs, err)
 	}
+	if err := delTSHook(ipt, "mangle", "PREROUTING", logf); err != nil {
+		errs = append(errs, err)
+	}
 	if err := delTSHook(ipt, "nat", "POSTROUTING", logf); err != nil {
 		errs = append(errs, err)
 	}
@@ -222,6 +225,9 @@ func clearRules(proto iptables.Protocol, logf logger.Logf) error {
 		errs = append(errs, err)
 	}
 	if err := delChain(ipt, "filter", "ts-forward"); err != nil {
+		errs = append(errs, err)
+	}
+	if err := delChain(ipt, "mangle", "ts-prerouting"); err != nil {
 		errs = append(errs, err)
 	}
 
