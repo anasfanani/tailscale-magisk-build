@@ -81,17 +81,17 @@ const (
 
 // getTailscaleFwmarkMaskNeg returns the negation of TailscaleFwmarkMask in bytes.
 func getTailscaleFwmarkMaskNeg() []byte {
-	return []byte{0xff, 0x00, 0xff, 0xff}
+	return []byte{0xe1, 0xff, 0xff, 0xff}
 }
 
 // getTailscaleFwmarkMask returns the TailscaleFwmarkMask in bytes.
 func getTailscaleFwmarkMask() []byte {
-	return []byte{0x00, 0xff, 0x00, 0x00}
+	return []byte{0x1e, 0x00, 0x00, 0x00}
 }
 
 // getTailscaleSubnetRouteMark returns the TailscaleSubnetRouteMark in bytes.
 func getTailscaleSubnetRouteMark() []byte {
-	return []byte{0x00, 0x04, 0x00, 0x00}
+	return []byte{0x08, 0x00, 0x00, 0x00}
 }
 
 // checkIPv6ForTest can be set in tests.
