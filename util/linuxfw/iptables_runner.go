@@ -152,6 +152,9 @@ func (i *iptablesRunner) AddHooks() error {
 		if err := divert(ipt, "filter", "FORWARD"); err != nil {
 			return err
 		}
+		if err := divert(ipt, "mangle", "PREROUTING"); err != nil {
+			return err
+		}
 	}
 
 	for _, ipt := range i.getNATTables() {
@@ -184,6 +187,9 @@ func (i *iptablesRunner) AddChains() error {
 			return err
 		}
 		if err := create(ipt, "filter", "ts-forward"); err != nil {
+			return err
+		}
+		if err := create(ipt, "mangle", "ts-prerouting"); err != nil {
 			return err
 		}
 	}
@@ -261,6 +267,18 @@ func (i *iptablesRunner) addBase4(tunname string) error {
 	args = []string{"-o", tunname, "-j", "ACCEPT"}
 	if err := i.ipt4.Append("filter", "ts-forward", args...); err != nil {
 		return fmt.Errorf("adding %v in v4/filter/ts-forward: %w", args, err)
+	}
+
+	// Mark packets from tun device with bypass mark so they don't loop back
+	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", bypassMark + "/" + fwmarkMask}
+	if err := i.ipt4.Append("mangle", "ts-prerouting", args...); err != nil {
+		return fmt.Errorf("adding %v in v4/mangle/ts-prerouting: %w", args, err)
+	}
+
+	// Allow hotspot clients to access Tailscale network
+	args = []string{"-o", tunname, "-j", "MASQUERADE"}
+	if err := i.ipt4.Append("nat", "ts-postrouting", args...); err != nil {
+		return fmt.Errorf("adding %v in v4/nat/ts-postrouting: %w", args, err)
 	}
 
 	return nil
@@ -367,6 +385,20 @@ func (i *iptablesRunner) addBase6(tunname string) error {
 		return fmt.Errorf("adding %v in v6/filter/ts-forward: %w", args, err)
 	}
 
+	// Mark packets from tun device with bypass mark so they don't loop back
+	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", bypassMark + "/" + fwmarkMask}
+	if err := i.ipt6.Append("mangle", "ts-prerouting", args...); err != nil {
+		return fmt.Errorf("adding %v in v6/mangle/ts-prerouting: %w", args, err)
+	}
+
+	// Allow hotspot clients to access Tailscale network
+	if i.v6NATAvailable {
+		args = []string{"-o", tunname, "-j", "MASQUERADE"}
+		if err := i.ipt6.Append("nat", "ts-postrouting", args...); err != nil {
+			return fmt.Errorf("adding %v in v6/nat/ts-postrouting: %w", args, err)
+		}
+	}
+
 	return nil
 }
 
@@ -377,6 +409,9 @@ func (i *iptablesRunner) DelChains() error {
 			return err
 		}
 		if err := delChain(ipt, "filter", "ts-forward"); err != nil {
+			return err
+		}
+		if err := delChain(ipt, "mangle", "ts-prerouting"); err != nil {
 			return err
 		}
 	}
@@ -412,6 +447,9 @@ func (i *iptablesRunner) DelBase() error {
 		if err := del(ipt, "filter", "ts-forward"); err != nil {
 			return err
 		}
+		if err := del(ipt, "mangle", "ts-prerouting"); err != nil {
+			return err
+		}
 	}
 	for _, ipt := range i.getNATTables() {
 		if err := del(ipt, "nat", "ts-postrouting"); err != nil {
@@ -430,6 +468,9 @@ func (i *iptablesRunner) DelHooks(logf logger.Logf) error {
 			return err
 		}
 		if err := delTSHook(ipt, "filter", "FORWARD", logf); err != nil {
+			return err
+		}
+		if err := delTSHook(ipt, "mangle", "PREROUTING", logf); err != nil {
 			return err
 		}
 	}

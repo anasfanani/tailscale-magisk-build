@@ -33,16 +33,16 @@ func androidLookup(usernameOrUID string, wantShell bool) (*user.User, string, er
 		}
 	}
 
-	// Get UID
-	uid := getAndroidCommandOutput(ctx, "id", "-u", "0")
+	// Try to get info for requested user first
+	uid := getAndroidCommandOutput(ctx, "id", "-u", usernameOrUID, "")
+	if uid == "" {
+		// User doesn't exist, fallback to current user
+		uid = getAndroidCommandOutput(ctx, "id", "-u", "0")
+		usernameOrUID = "root"
+	}
 
-	// Get GID
-	gid := getAndroidCommandOutput(ctx, "id", "-g", "0")
-
-	// Get username
-	username := getAndroidCommandOutput(ctx, "id", "-n", "u", "root")
-
-	// Get home directory
+	gid := getAndroidCommandOutput(ctx, "id", "-g", usernameOrUID, "0")
+	username := getAndroidCommandOutput(ctx, "id", "-un", usernameOrUID, usernameOrUID)
 	homeDir := getAndroidHomeDir("/")
 
 	return &user.User{
