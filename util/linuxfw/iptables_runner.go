@@ -269,10 +269,16 @@ func (i *iptablesRunner) addBase4(tunname string) error {
 		return fmt.Errorf("adding %v in v4/filter/ts-forward: %w", args, err)
 	}
 
-	// Mark packets from tun device with bypass mark so they don't loop back
-	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", bypassMark + "/" + fwmarkMask}
+	// For Android: mark in PREROUTING so routing decision can use the mark
+	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", subnetRouteMark + "/" + fwmarkMask}
 	if err := i.ipt4.Append("mangle", "ts-prerouting", args...); err != nil {
 		return fmt.Errorf("adding %v in v4/mangle/ts-prerouting: %w", args, err)
+	}
+
+	// MASQUERADE exit node traffic going to physical interfaces
+	args = []string{"-i", tunname, "!", "-o", tunname, "-j", "MASQUERADE"}
+	if err := i.ipt4.Append("nat", "ts-postrouting", args...); err != nil {
+		return fmt.Errorf("adding %v in v4/nat/ts-postrouting: %w", args, err)
 	}
 
 	// Allow hotspot clients to access Tailscale network
@@ -385,10 +391,18 @@ func (i *iptablesRunner) addBase6(tunname string) error {
 		return fmt.Errorf("adding %v in v6/filter/ts-forward: %w", args, err)
 	}
 
-	// Mark packets from tun device with bypass mark so they don't loop back
-	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", bypassMark + "/" + fwmarkMask}
+	// Mark packets from subnetRouter, need enable IP6 NAT zcat /proc/config.gz | grep IP6_NF_NAT 2>/dev/null
+	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", subnetRouteMark + "/" + fwmarkMask}
 	if err := i.ipt6.Append("mangle", "ts-prerouting", args...); err != nil {
 		return fmt.Errorf("adding %v in v6/mangle/ts-prerouting: %w", args, err)
+	}
+
+	// MASQUERADE exit node traffic going to physical interfaces
+	if i.v6NATAvailable {
+		args = []string{"-i", tunname, "!", "-o", tunname, "-j", "MASQUERADE"}
+		if err := i.ipt6.Append("nat", "ts-postrouting", args...); err != nil {
+			return fmt.Errorf("adding %v in v6/nat/ts-postrouting: %w", args, err)
+		}
 	}
 
 	// Allow hotspot clients to access Tailscale network
