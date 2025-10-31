@@ -23,15 +23,14 @@ var AppSharedDir syncs.AtomicValue[string]
 // or the empty string if there's no reasonable default.
 func DefaultTailscaledSocket() string {
 	if runtime.GOOS == "android" {
-		if os.Geteuid() == 0 {
-			if fi, err := os.Stat("/data/adb/tailscale"); err == nil && fi.IsDir() {
-				return "/data/adb/tailscale/tailscaled.sock"
+		prefix := os.Getenv("PREFIX")
+		if prefix == "" {
+			if os.Geteuid() == 0 {
+				return filepath.Join("data", "adb", "tailscale", "tmp", "tailscaled.sock")
 			}
+			return filepath.Join(os.TempDir(), "tailscale", "tailscaled.sock")
 		}
-		if wd, err := os.Getwd(); err == nil {
-			return filepath.Join(wd, "tailscaled.sock")
-		}
-		return filepath.Join(os.TempDir(), "tailscaled.sock")
+		return filepath.Join(prefix, "var", "run", "tailscaled.sock")
 	}
 	if runtime.GOOS == "windows" {
 		return `\\.\pipe\ProtectedPrefix\Administrators\Tailscale\tailscaled`
