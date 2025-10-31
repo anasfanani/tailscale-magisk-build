@@ -40,6 +40,16 @@ import (
 var DevMode bool
 
 func DefaultCertDir(leafDir string) string {
+	if runtime.GOOS == "android" {
+		prefix := os.Getenv("PREFIX")
+		if prefix == "" {
+			if os.Geteuid() == 0 {
+				return filepath.Join("data", "adb", "tailscale", "certs")
+			}
+			return filepath.Join(os.TempDir(), "tailscale", "certs")
+		}
+		return filepath.Join(prefix, "var", "lib", "tailscale", "certs")
+	}
 	cacheDir, err := os.UserCacheDir()
 	if err == nil {
 		return filepath.Join(cacheDir, "tailscale", leafDir)
