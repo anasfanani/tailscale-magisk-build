@@ -482,7 +482,7 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 
 	// Issue 11405: enable IP forwarding on gokrazy.
 	advertisingRoutes := len(cfg.SubnetRoutes) > 0
-	if getDistroFunc() == distro.Gokrazy && advertisingRoutes {
+	if getDistroFunc() == distro.Gokrazy || runtime.GOOS == "android" && advertisingRoutes {
 		r.enableIPForwarding()
 	}
 
@@ -1297,24 +1297,60 @@ var ubntIPRules = []netlink.Rule{
 	},
 }
 
-var androidIPRules = []netlink.Rule{
-	// Priority 7300 (12500): Tailscale CGNAT range (100.64.0.0/10) always uses table 52, before VPN rules
-	// This ensures peer-to-peer traffic doesn't go through other VPNs
-	{
-		Priority: 7300, // 5200 + 7300 = 12500
-		Dst:      netipx.PrefixIPNet(netip.MustParsePrefix("100.64.0.0/10")),
-		Table:    tailscaleRouteTable.Num,
-	},
-	// Priority 13001: after Android VPN rules at 13000, before default network (14999+)
-	// When VPN active: VPN rules at 13000 catch traffic first (VPN wins)
-	// When VPN off: Tailscale catches traffic as fallback
-	{
-		Priority: 7801, // 5200 + 7801 = 13001
-		Invert:   true,
-		Mark:     tsconst.LinuxBypassMarkNum,
-		Mask:     tsconst.LinuxFwmarkMaskNum,
-		Table:    tailscaleRouteTable.Num,
-	},
+// detectAndroidDefaultTable returns the routing table number for the current
+// default route on Android. Returns 0 if detection fails.
+func detectAndroidDefaultTable() int {
+	routes, err := netlink.RouteGet(net.IPv4(8, 8, 8, 8))
+	if err != nil || len(routes) == 0 {
+		return 0
+	}
+	if routes[0].Table > 0 {
+		return routes[0].Table
+	}
+	return 0
+}
+
+// getAndroidIPRules returns Android-specific IP rules, including a dynamic
+// exit node rule that uses the current default network's routing table.
+func getAndroidIPRules() []netlink.Rule {
+	rules := []netlink.Rule{
+		// Priority 7300 (12500): Tailscale CGNAT range (100.64.0.0/10) always uses table 52, before VPN rules
+		// This ensures peer-to-peer traffic doesn't go through other VPNs
+		{
+			Priority: 7300, // 5200 + 7300 = 12500
+			Dst:      netipx.PrefixIPNet(netip.MustParsePrefix("100.64.0.0/10")),
+			Table:    tailscaleRouteTable.Num,
+		},
+		{
+			Priority: 7300, // 5200 + 7300 = 12500
+			Dst:      netipx.PrefixIPNet(netip.MustParsePrefix("fd7a:115c:a1e0::/48")),
+			Table:    tailscaleRouteTable.Num,
+		},
+		// Priority 13001: after Android VPN rules at 13000, before default network (14999+)
+		// When VPN active: VPN rules at 13000 catch traffic first (VPN wins)
+		// When VPN off: Tailscale catches traffic as fallback
+		{
+			Priority: 7801, // 5200 + 7801 = 13001
+			Invert:   true,
+			Mark:     tsconst.LinuxBypassMarkNum,
+			Mask:     tsconst.LinuxFwmarkMaskNum,
+			Table:    tailscaleRouteTable.Num,
+		},
+	}
+
+	// Add exit node rule: route traffic FROM Tailscale network to internet
+	// using the current default network's routing table
+	if table := detectAndroidDefaultTable(); table > 0 {
+		// Traffic from tailscale0 is marked with LinuxSubnetRouteMark in ts-forward
+		rules = append(rules, netlink.Rule{
+			Priority: 7801,                            // 5200 + 7801 = 13001
+			Mark:     tsconst.LinuxSubnetRouteMarkNum, // 0x8000000
+			Mask:     tsconst.LinuxFwmarkMaskNum,
+			Table:    table,
+		})
+	}
+
+	return rules
 }
 
 // ipRules returns the appropriate list of ip rules to be used by Tailscale. See
@@ -1323,7 +1359,7 @@ func ipRules() []netlink.Rule {
 	if getDistroFunc() == distro.UBNT {
 		return ubntIPRules
 	} else if runtime.GOOS == "android" {
-		return androidIPRules
+		return getAndroidIPRules()
 	}
 	return baseIPRules
 }
