@@ -37,7 +37,7 @@ func statePath() string {
 		prefix := os.Getenv("PREFIX")
 		if prefix == "" {
 			if os.Geteuid() == 0 {
-				return filepath.Join("data", "adb", "tailscale", "tmp", "tailscaled.state")
+				return "/data/adb/tailscale/tailscaled.state"
 			}
 			return filepath.Join(os.TempDir(), "tailscale", "tailscaled.state")
 		}

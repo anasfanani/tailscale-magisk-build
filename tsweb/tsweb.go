@@ -44,7 +44,7 @@ func DefaultCertDir(leafDir string) string {
 		prefix := os.Getenv("PREFIX")
 		if prefix == "" {
 			if os.Geteuid() == 0 {
-				return filepath.Join("data", "adb", "tailscale", "certs")
+				return "/data/adb/tailscale/certs"
 			}
 			return filepath.Join(os.TempDir(), "tailscale", "certs")
 		}

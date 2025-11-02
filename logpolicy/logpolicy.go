@@ -252,17 +252,18 @@ func LogsDir(logf logger.Logf) string {
 		}
 	}
 
-	cacheDir, err := os.UserCacheDir()
 	if runtime.GOOS == "android" {
 		prefix := os.Getenv("PREFIX")
 		if prefix == "" {
 			if os.Geteuid() == 0 {
-				return filepath.Join("data", "adb", "tailscale", "log")
+				return "/data/adb/tailscale/log"
 			}
 			return filepath.Join(os.TempDir(), "tailscale", "log")
 		}
 		return filepath.Join(prefix, "var", "log", "tailscale")
 	}
+
+	cacheDir, err := os.UserCacheDir()
 	if err == nil {
 		d := filepath.Join(cacheDir, "Tailscale")
 		logf("logpolicy: using UserCacheDir, %q", d)

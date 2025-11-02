@@ -11,7 +11,7 @@ fi
 if [ ! -d "$ANDROID_NDK_PATH" ]; then
     echo "Android NDK path not found: $ANDROID_NDK_PATH" # ANDROID_NDK_PATH="/tmp/android-ndk-r27c-linux/toolchains/llvm/prebuilt/linux-x86_64/bin"
     # exit 1
-    curl -L https://dl.google.com/android/repository/android-ndk-r27c-linux.zip -o /tmp/android-ndk-r27c-linux.zip
+    curl -# -L https://dl.google.com/android/repository/android-ndk-r27c-linux.zip -o /tmp/android-ndk-r27c-linux.zip
     unzip -q /tmp/android-ndk-r27c-linux.zip -d /tmp
     mv /tmp/android-ndk-r27c /tmp/android-ndk-r27c-linux
     rm /tmp/android-ndk-r27c-linux.zip
@@ -119,7 +119,6 @@ REMOVE=(
     drive
     debugeventbus
     debug
-    portmapper
     debugportmapper
     tailnetlock
     syspolicy
@@ -156,11 +155,14 @@ echo "Build completed: $(file ./dist/tailscaled.$GOARCH)"
 if [ -n "$USE_UPX" ]; then
     if ! command -v upx &> /dev/null; then
         echo "UPX not found, downloading..."
-        curl -L https://github.com/upx/upx/releases/download/v5.0.2/upx-5.0.2-amd64_linux.tar.xz -o /tmp/upx.tar.xz
+        curl -# -L https://github.com/upx/upx/releases/download/v5.0.2/upx-5.0.2-amd64_linux.tar.xz -o /tmp/upx.tar.xz
         tar -xf /tmp/upx.tar.xz -C /tmp
         sudo mv /tmp/upx-5.0.2-amd64_linux/upx /usr/local/bin/
         rm -rf /tmp/upx.tar.xz /tmp/upx-5.0.2-amd64_linux
         echo "UPX installed"
+    fi
+    if ! command -v file &> /dev/null; then
+        sudo apt install file -y
     fi
     echo "File size before compression: $(du -h ./dist/tailscaled.$GOARCH | cut -f1)"
     echo "Compressing with UPX..."

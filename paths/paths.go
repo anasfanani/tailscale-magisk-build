@@ -26,7 +26,7 @@ func DefaultTailscaledSocket() string {
 		prefix := os.Getenv("PREFIX")
 		if prefix == "" {
 			if os.Geteuid() == 0 {
-				return filepath.Join("data", "adb", "tailscale", "tmp", "tailscaled.sock")
+				return "/data/adb/tailscale/tailscaled.sock"
 			}
 			return filepath.Join(os.TempDir(), "tailscale", "tailscaled.sock")
 		}
@@ -102,7 +102,7 @@ func DefaultTailscaledStateDir() string {
 // when it's absent.
 func MakeAutomaticStateDir() bool {
 	switch runtime.GOOS {
-	case "plan9":
+	case "plan9", "android":
 		return true
 	case "linux":
 		if distro.Get() == distro.JetKVM {
