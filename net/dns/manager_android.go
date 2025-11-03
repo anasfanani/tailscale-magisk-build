@@ -37,16 +37,18 @@ func (m *androidManager) SetDNS(cfg OSConfig) error {
 		}
 		m.hijacked = true
 		m.logf("dns: hijack enabled")
-	} else if !shouldHijack && m.hijacked {
-		// Disable DNS hijacking
+	} else if !shouldHijack {
+		// Always clean up rules when DNS is disabled, regardless of tracked state
 		if err := setDNSRules(false, false); err != nil {
 			m.logf("dns: failed to remove rules: %v", err)
 		}
 		if err := setDNSRules(true, false); err != nil {
 			m.logf("dns: ipv6 rules removal failed (non-fatal): %v", err)
 		}
-		m.hijacked = false
-		m.logf("dns: hijack disabled")
+		if m.hijacked {
+			m.hijacked = false
+			m.logf("dns: hijack disabled")
+		}
 	}
 	return nil
 }

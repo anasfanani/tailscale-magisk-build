@@ -480,9 +480,9 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 	r.statefulFiltering = cfg.StatefulFiltering
 	r.updateStatefulFilteringWithDockerWarning(cfg)
 
-	// Issue 11405: enable IP forwarding on gokrazy.
+	// Issue 11405: enable IP forwarding on gokrazy and Android when advertising routes.
 	advertisingRoutes := len(cfg.SubnetRoutes) > 0
-	if getDistroFunc() == distro.Gokrazy || runtime.GOOS == "android" && advertisingRoutes {
+	if (getDistroFunc() == distro.Gokrazy || runtime.GOOS == "android") && advertisingRoutes {
 		r.enableIPForwarding()
 	}
 
