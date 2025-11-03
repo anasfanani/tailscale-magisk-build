@@ -846,7 +846,9 @@ func (ss *sshSession) launchProcess() error {
 			cmd.Dir = home
 		}
 		for _, kv := range os.Environ() {
-			cmd.Env = append(cmd.Env, kv)
+			if !strings.HasPrefix(kv, "TS_") {
+				cmd.Env = append(cmd.Env, kv)
+			}
 		}
 	}
 	for _, kv := range ss.Environ() {
