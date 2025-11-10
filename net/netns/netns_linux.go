@@ -111,6 +111,12 @@ func controlC(network, address string, c syscall.RawConn) error {
 }
 
 func setBypassMark(fd uintptr) error {
+	// Skip when no default route, this will prevent connect: network is unreachable
+	// Example case: force use HTTP_PROXY / HTTPS_PROXY in device without default route / internet route.
+	_, err := netmon.DefaultRouteInterface()
+	if err != nil {
+		return nil
+	}
 	if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, tsconst.LinuxBypassMarkNum); err != nil {
 		return fmt.Errorf("setting SO_MARK bypass: %w", err)
 	}

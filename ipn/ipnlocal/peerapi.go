@@ -58,9 +58,9 @@ func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Lis
 	// But since we started intercepting it with netstack, it's not even important that
 	// we have a real kernel-level listener. So just create a dummy listener on Android
 	// and let netstack intercept it.
-	if runtime.GOOS == "android" {
-		return newFakePeerAPIListener(ip), nil
-	}
+	// if runtime.GOOS == "android" {
+	// 	return newFakePeerAPIListener(ip), nil
+	// }
 
 	ipStr := ip.String()
 

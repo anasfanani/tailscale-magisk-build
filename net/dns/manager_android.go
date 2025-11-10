@@ -94,10 +94,13 @@ func setDNSRules(ipv6 bool, add bool) error {
 		// Redirect hotspot DNS to Tailscale (exclude tun interfaces)
 		{"nat", "PREROUTING", []string{"!", "-i", "tun+", "-p", "udp", "--dport", "53", "-j", "DNAT", "--to-destination", dnsIP + ":53"}},
 	}
-
+	
 	for _, rule := range rules {
 		if add {
-			ipt.Append(rule.table, rule.chain, rule.args...)
+			err := ipt.Append(rule.table, rule.chain, rule.args...)
+			if err != nil {
+				return err
+			}
 		} else {
 			ipt.Delete(rule.table, rule.chain, rule.args...)
 		}

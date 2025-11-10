@@ -6659,7 +6659,14 @@ func exitNodeCanProxyDNS(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg
 	}
 	for _, p := range peers {
 		if p.StableID() == exitNodeID && peerCanProxyDNS(p) {
-			return peerAPIBase(nm, p) + "/dns-query", true
+			base := peerAPIBase(nm, p)
+			// When peerCanProxyDNS report as true but no peerAPIBase return empty
+			// Example: exit-node peerapi empty because force relogin with different auth url ( need to restart daemon )
+			if base == "" {
+				return "", false
+			}
+			dohURL = base + "/dns-query"
+			return dohURL, true
 		}
 	}
 	return "", false
