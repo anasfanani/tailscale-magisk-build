@@ -117,10 +117,6 @@ REMOVE=(
     capture
     systray
     drive
-    debugeventbus
-    debug
-    debugportmapper
-    tailnetlock
     syspolicy
     appconnectors
     identityfederation
