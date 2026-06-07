@@ -129,6 +129,7 @@ var (
 // spam like:
 func (e *userspaceEngine) isOSNetworkProbe(dst netip.AddrPort) bool {
 	// iOS had log spam like:
+	// TODO: android also, but IPV6
 	// open-conn-track: timeout opening (100.115.73.60:52501 => 17.125.252.5:443); no associated peer node
 	if runtime.GOOS == "ios" && dst.Port() == 443 && appleIPRange.Contains(dst.Addr()) {
 		if _, ok := e.PeerForIP(dst.Addr()); !ok {

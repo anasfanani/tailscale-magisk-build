@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/wlynxg/anet"
 	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
@@ -174,6 +175,10 @@ func (i Interface) Addrs() ([]net.Addr, error) {
 	}
 	if i.Interface == nil {
 		return nil, nil
+	}
+	// use the netmon package to get the addresses
+	if runtime.GOOS == "android" {
+		return anet.InterfaceAddrs()
 	}
 
 	return i.Interface.Addrs()
@@ -535,6 +540,9 @@ func (s *State) AnyInterfaceUp() bool {
 	if runtime.GOOS == "js" || runtime.GOOS == "tamago" {
 		return true
 	}
+	if envknob.Bool("TS_ASSUME_NETWORK_UP_FOR_TEST") {
+		return true
+	}
 	return s != nil && (s.HaveV4 || s.HaveV6)
 }
 
@@ -842,6 +850,18 @@ func GetInterfaceList() (InterfaceList, error) {
 func netInterfaces() ([]Interface, error) {
 	if altNetInterfaces != nil {
 		return altNetInterfaces()
+	}
+	// Use the netmon package to get the addresses
+	if runtime.GOOS == "android" {
+		ifs, err := anet.Interfaces()
+		if err != nil {
+			return nil, err
+		}
+		ret := make([]Interface, len(ifs))
+		for i := range ifs {
+			ret[i].Interface = &ifs[i]
+		}
+		return ret, nil
 	}
 	ifs, err := net.Interfaces()
 	if err != nil {

@@ -18,6 +18,7 @@ import (
 // supported for the current os/distro.
 func CanRunTailscaleSSH() error {
 	switch runtime.GOOS {
+	case "android":
 	case "linux":
 		if distro.Get() == distro.Synology && !envknob.UseWIPCode() {
 			return errors.New("The Tailscale SSH server does not run on Synology.")

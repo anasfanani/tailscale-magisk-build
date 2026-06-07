@@ -1,0 +1,105 @@
+name: "tagged-release"
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*-android"
+      - "v*-android-pre"
+permissions:
+  contents: write
+jobs:
+  build:
+      runs-on: ubuntu-latest
+      steps:
+        - name: Determine release type
+          id: release_type
+          run: |
+            if [[ "${{ github.ref_name }}" == *"-pre" ]]; then
+              echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            else
+              echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            fi
+        - name: Checkout code
+          uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+          
+        - name: Set up Go
+          uses: actions/setup-go@v5
+          with:
+            go-version-file: 'go.mod'
+            check-latest: true
+          id: go
+        - run: go version
+
+        - name: Install Android NDK
+          id: setup-ndk
+          uses: nttld/setup-ndk@v1
+          with:
+            ndk-version: r27c
+            add-to-path: false
+        
+        - name: Build arm
+          run: |
+            export ANDROID_NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            if [[ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]]; then
+              ./build_android.sh --pre arm
+            else
+              ./build_android.sh arm
+            fi
+        - name: Build arm64
+          run: |
+            export ANDROID_NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            if [[ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]]; then
+              ./build_android.sh --pre arm64
+            else
+              ./build_android.sh arm64
+            fi
+        
+        - name: Install UPX
+          uses: crazy-max/ghaction-upx@v3
+          with:
+            install-only: true
+
+        - name: Compress binaries with UPX
+          run: |
+            upx --lzma --best ./dist/tailscaled.arm
+            upx --lzma --best ./dist/tailscaled.arm64
+        
+        - name: Compress artifacts
+          id: compress_artifacts
+          run: |
+            eval "$(./build_dist.sh shellvars)"
+            echo "VERSION_SHORT=$VERSION_SHORT" >> $GITHUB_OUTPUT
+            tar -czf dist/tailscale_${VERSION_SHORT}_arm64.tgz -C dist --transform='s/tailscaled.arm64/tailscaled/' tailscaled.arm64
+            tar -czf dist/tailscale_${VERSION_SHORT}_arm.tgz -C dist --transform='s/tailscaled.arm/tailscaled/' tailscaled.arm
+            ls -lh dist
+
+        - name: Upload artifacts
+          uses: actions/upload-artifact@v4
+          with:
+            name: release-artifacts
+            path: |
+              dist/*.tgz
+
+        - name: Upload artifacts for arm
+          uses: actions/upload-artifact@v4
+          with:
+            name: tailscaled.arm.${{ steps.compress_artifacts.outputs.VERSION_SHORT }}
+            path: |
+              dist/tailscaled.arm
+        
+        - name: Upload artifacts for arm64
+          uses: actions/upload-artifact@v4
+          with:
+            name: tailscaled.arm64.${{ steps.compress_artifacts.outputs.VERSION_SHORT }}
+            path: |
+              dist/tailscaled.arm64
+
+        - name: Create Release
+          uses: "marvinpinto/action-automatic-releases@latest"
+          with:
+            repo_token: "${{ secrets.GITHUB_TOKEN }}"
+            prerelease: ${{ steps.release_type.outputs.is_prerelease }}
+            files: |
+              dist/*.tgz

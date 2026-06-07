@@ -66,9 +66,48 @@ import (
 	"tailscale.com/wgengine/router"
 )
 
+// createTailscaleSymlink creates a 'tailscale' symlink pointing to the current
+// 'tailscaled' binary on Android, enabling the combined binary to work with both names.
+func createTailscaleSymlink() {
+	// Get the path to the current executable
+	execPath, err := os.Executable()
+	if err != nil {
+		return // Silently fail, not critical
+	}
+
+	// Resolve symlinks to get the real binary path
+	realPath, err := filepath.EvalSymlinks(execPath)
+	if err != nil {
+		realPath = execPath // Fallback to execPath if symlink resolution fails
+	}
+
+	// Get the binary name and directory
+	binName := filepath.Base(realPath)
+	binDir := filepath.Dir(realPath)
+	symlinkPath := filepath.Join(binDir, "tailscale")
+
+	// Check if 'tailscale' already exists
+	if _, err := os.Lstat(symlinkPath); err == nil {
+		// File exists, check if it's already a symlink to us
+		if target, err := os.Readlink(symlinkPath); err == nil {
+			// It's a symlink, check if it points to our binary
+			if target == binName {
+				return // Already correctly set up
+			}
+		}
+		// Exists but not the right symlink, remove it
+		os.Remove(symlinkPath)
+	}
+
+	// Create the symlink: tailscale -> <actual binary name>
+	_ = os.Symlink(binName, symlinkPath)
+}
+
 // defaultTunName returns the default tun device name for the platform.
 func defaultTunName() string {
 	switch runtime.GOOS {
+	case "android":
+		return "tailscale0,userspace-networking"
 	case "openbsd":
 		return "tun"
 	case "windows":
@@ -180,6 +219,12 @@ type proxyStartFunc = func(logf logger.Logf, dialer *tsdial.Dialer)
 
 func main() {
 	envknob.PanicIfAnyEnvCheckedInInit()
+
+	// On Android, ensure 'tailscale' symlink exists for combined binary compatibility
+	if runtime.GOOS == "android" {
+		createTailscaleSymlink()
+	}
+
 	if shouldRunCLI() {
 		beCLI()
 		return
@@ -206,7 +251,7 @@ func main() {
 		flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
 	}
 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
-	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
+	flag.BoolVar(&args.disableLogs, "no-logs-no-support", true, "disable log uploads; this also disables any technical support")
 	flag.StringVar(&args.confFile, "config", "", "path to config file, or 'vm:user-data' to use the VM's user-data (EC2)")
 	if buildfeatures.HasTPM {
 		flag.Var(&args.hardwareAttestation, "hardware-attestation", `use hardware-backed keys to bind node identity to this device when supported

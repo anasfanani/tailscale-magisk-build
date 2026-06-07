@@ -19,6 +19,9 @@ import (
 	"tailscale.com/version/distro"
 )
 
+// overrideLookupFunc is set by custom platform-specific implementations.
+var overrideLookupFunc func(string, bool) (*user.User, string, error)
+
 // LookupByUIDWithShell is like os/user.LookupId but handles a few edge cases
 // like gokrazy and non-cgo lookups, and returns the user shell. The user shell
 // lookup is best-effort and may be empty.
@@ -66,6 +69,11 @@ func lookup(usernameOrUID string, std lookupStd, wantShell bool) (*user.User, st
 		}
 		u, err := std(usernameOrUID)
 		return u, shell, err
+	}
+
+	// Android-specific lookup
+	if runtime.GOOS == "android" && overrideLookupFunc != nil {
+		return overrideLookupFunc(usernameOrUID, wantShell)
 	}
 
 	// No getent on Gokrazy. So hard-code the login shell.

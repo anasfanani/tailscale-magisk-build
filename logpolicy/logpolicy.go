@@ -252,6 +252,17 @@ func LogsDir(logf logger.Logf) string {
 		}
 	}
 
+	if runtime.GOOS == "android" {
+		if fi, err := os.Stat("/data/adb/tailscale"); err == nil && fi.IsDir() {
+			return "/data/adb/tailscale/log"
+		}
+		prefix := os.Getenv("PREFIX")
+		if prefix == "" {
+			return filepath.Join(os.TempDir(), "tailscale", "log")
+		}
+		return filepath.Join(prefix, "var", "log", "tailscale")
+	}
+
 	cacheDir, err := os.UserCacheDir()
 	if err == nil {
 		d := filepath.Join(cacheDir, "Tailscale")
