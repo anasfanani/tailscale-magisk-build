@@ -11,6 +11,7 @@ import (
 	"tailscale.com/health"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/syspolicy/policyclient"
 )
 
@@ -19,13 +20,13 @@ type androidManager struct {
 	hijacked bool
 }
 
-func NewOSConfigurator(logf logger.Logf, _ *health.Tracker, _ policyclient.Client, _ *controlknobs.Knobs, _ string) (OSConfigurator, error) {
+func NewOSConfigurator(logf logger.Logf, _ *health.Tracker, _ *eventbus.Bus, _ policyclient.Client, _ *controlknobs.Knobs, _ string) (OSConfigurator, error) {
 	return &androidManager{logf: logf}, nil
 }
 
 func (m *androidManager) SetDNS(cfg OSConfig) error {
 	shouldHijack := len(cfg.Nameservers) > 0
-	
+
 	if shouldHijack && !m.hijacked {
 		// Enable DNS hijacking
 		if err := setDNSRules(false, true); err != nil {
@@ -94,7 +95,7 @@ func setDNSRules(ipv6 bool, add bool) error {
 		// Redirect hotspot DNS to Tailscale (exclude tun interfaces)
 		{"nat", "PREROUTING", []string{"!", "-i", "tun+", "-p", "udp", "--dport", "53", "-j", "DNAT", "--to-destination", dnsIP + ":53"}},
 	}
-	
+
 	for _, rule := range rules {
 		if add {
 			err := ipt.Append(rule.table, rule.chain, rule.args...)
