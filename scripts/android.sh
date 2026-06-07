@@ -34,7 +34,7 @@ set_arch() {
 }
 
 get_build_tags() {
-    local remove="aws,bird,tap,kube,completion,wakeonlan,capture,systray,drive,syspolicy,appconnectors,identityfederation,taildrop,captiveportal"
+    local remove="aws,bird,tap,kube,completion,completion_scripts,wakeonlan,capture,systray,drive,syspolicy,appconnectors,identityfederation,captiveportal,usermetrics,logtail,netlog,linuxdnsfight,syspolicy"
     GOOS= GOARCH= ./tool/go run ./cmd/featuretags --remove "$remove" --add "cli"
 }
 
