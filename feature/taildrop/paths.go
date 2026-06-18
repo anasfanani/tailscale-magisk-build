@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"tailscale.com/version/distro"
 )
@@ -25,6 +26,14 @@ func (e *Extension) SetFileOps(fileOps FileOps) {
 }
 
 func (e *Extension) setPlatformDefaultDirectFileRoot() {
+	if runtime.GOOS == "android" {
+		dir := "/sdcard/Download/Taildrop"
+		if err := os.MkdirAll(dir, 0o700); err == nil {
+			e.directFileRoot = dir
+		}
+		return
+	}
+
 	dg := distro.Get()
 
 	switch dg {
