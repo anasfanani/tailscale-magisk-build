@@ -272,6 +272,12 @@ func (i *iptablesRunner) addBase4(tunname string) error {
 		return fmt.Errorf("adding %v in v4/nat/ts-postrouting: %w", args, err)
 	}
 
+	// Clamp MSS for forwarded TCP to avoid TLS failures with double-VPN/low MTU tunnels
+	args = []string{"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"}
+	if err := i.ipt4.Append("mangle", "ts-prerouting", args...); err != nil {
+		return fmt.Errorf("adding %v in v4/mangle/ts-prerouting: %w", args, err)
+	}
+
 	return nil
 }
 
@@ -396,6 +402,12 @@ func (i *iptablesRunner) addBase6(tunname string) error {
 		if err := i.ipt6.Append("nat", "ts-postrouting", args...); err != nil {
 			return fmt.Errorf("adding %v in v6/nat/ts-postrouting: %w", args, err)
 		}
+	}
+
+	// Clamp MSS for forwarded TCP to avoid TLS failures with double-VPN/low MTU tunnels
+	args = []string{"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"}
+	if err := i.ipt6.Append("mangle", "ts-prerouting", args...); err != nil {
+		return fmt.Errorf("adding %v in v6/mangle/ts-prerouting: %w", args, err)
 	}
 
 	return nil

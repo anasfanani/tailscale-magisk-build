@@ -37,7 +37,7 @@ func New(logf logger.Logf, tunName string) (tun.Device, string, error) {
 	var dev tun.Device
 	var err error
 	if strings.HasPrefix(tunName, "tap:") {
-		if runtime.GOOS != "linux" {
+		if runtime.GOOS != "linux" && runtime.GOOS != "android" {
 			return nil, "", errors.New("tap only works on Linux")
 		}
 		if !CreateTAP.IsSet() { // if the ts_omit_tap tag is used

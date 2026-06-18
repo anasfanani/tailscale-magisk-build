@@ -1430,6 +1430,17 @@ func getAndroidIPRules() []netlink.Rule {
 			Dst:      netipx.PrefixIPNet(netip.MustParsePrefix("fd7a:115c:a1e0::/48")),
 			Table:    tailscaleRouteTable.Num,
 		},
+
+		// Priority 13001: lookup main table for reply traffic marked with SubnetRouteMark.
+		// Un-NATed replies to hotspot clients need the downstream subnet route
+		// (e.g. 10.45.158.0/24 dev wlan2) which the kernel adds to the main table.
+		{
+			Priority: 7801,                            // 5200 + 7801 = 13001
+			Mark:     tsconst.LinuxSubnetRouteMarkNum, // 0x8000000
+			Mask:     tsconst.LinuxFwmarkMaskNum,      // 0x1e000000
+			Table:    mainRouteTable.Num,              // 254
+		},
+
 		// Priority 13001: after Android VPN rules at 13000, before default network (14999+)
 		// When VPN active: VPN rules at 13000 catch traffic first (VPN wins)
 		// When VPN off: Tailscale catches traffic as fallback

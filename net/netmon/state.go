@@ -178,7 +178,7 @@ func (i Interface) Addrs() ([]net.Addr, error) {
 	}
 	// use the netmon package to get the addresses
 	if runtime.GOOS == "android" {
-		return anet.InterfaceAddrs()
+		return anet.InterfaceAddrsByInterface(i.Interface)
 	}
 
 	return i.Interface.Addrs()
