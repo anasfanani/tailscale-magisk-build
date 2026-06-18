@@ -38,33 +38,28 @@ jobs:
           with:
             ndk-version: r27c
             add-to-path: false
-        
-        - name: Build arm
-          run: |
-            export ANDROID_NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-            if [[ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]]; then
-              ./build_android.sh --pre arm
-            else
-              ./build_android.sh arm
-            fi
-        - name: Build arm64
-          run: |
-            export ANDROID_NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-            if [[ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]]; then
-              ./build_android.sh --pre arm64
-            else
-              ./build_android.sh arm64
-            fi
-        
+
         - name: Install UPX
           uses: crazy-max/ghaction-upx@v3
           with:
             install-only: true
 
-        - name: Compress binaries with UPX
+        - name: Build arm
           run: |
-            upx --lzma --best ./dist/tailscaled.arm
-            upx --lzma --best ./dist/tailscaled.arm64
+            export ANDROID_NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            if [[ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]]; then
+              ./scripts/android.sh build --pre --upx arm
+            else
+              ./scripts/android.sh build --upx arm
+            fi
+        - name: Build arm64
+          run: |
+            export ANDROID_NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            if [[ "${{ steps.release_type.outputs.is_prerelease }}" == "true" ]]; then
+              ./scripts/android.sh build --pre --upx arm64
+            else
+              ./scripts/android.sh build --upx arm64
+            fi
         
         - name: Compress artifacts
           id: compress_artifacts
@@ -97,9 +92,10 @@ jobs:
               dist/tailscaled.arm64
 
         - name: Create Release
-          uses: "marvinpinto/action-automatic-releases@latest"
+          uses: softprops/action-gh-release@v3
           with:
-            repo_token: "${{ secrets.GITHUB_TOKEN }}"
+            token: "${{ secrets.GITHUB_TOKEN }}"
             prerelease: ${{ steps.release_type.outputs.is_prerelease }}
+            generate_release_notes: true
             files: |
               dist/*.tgz
