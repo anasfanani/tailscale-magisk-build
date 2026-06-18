@@ -131,7 +131,7 @@ cmd_compat() {
 
     # Find base commit and squash android patch
     local base_commit
-    base_commit=$(git log --oneline | grep "VERSION.txt: this is ${from}" | head -1 | cut -d' ' -f1)
+    base_commit=$(git log --oneline | grep "VERSION.txt: this is v\?${from#v}" | head -1 | cut -d' ' -f1)
     if [ -z "$base_commit" ]; then
         echo "Cannot find base commit for $from"
         rm -rf "$tmp"
@@ -238,7 +238,7 @@ cmd_update() {
 
     # Find base commit
     local base_commit
-    base_commit=$(git log --oneline | grep "VERSION.txt: this is ${from}" | head -1 | cut -d' ' -f1)
+    base_commit=$(git log --oneline | grep "VERSION.txt: this is v\?${from#v}" | head -1 | cut -d' ' -f1)
     if [ -z "$base_commit" ]; then
         echo "Cannot find base commit for $from"; exit 1
     fi
